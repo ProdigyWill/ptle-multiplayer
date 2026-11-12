@@ -837,10 +837,10 @@ static void HandleHotkeys( EIHarry* harry )
 GET_METHOD( 0x4B55F0, void, EIHarry_Teleport, EIHarry*, Matrix4f*, bool, float );
 
 GET_METHOD( 0x5EBA90, void, ScheduleWorldLoad, void*, uint32_t, bool );
-// Level to test in, or 0 to stay in the randomizer's start area (set in
-// Game\config\Randomizer\config.ini, currently Native Village).
+// Level to test in, or 0 to stay wherever the game starts. 0x7567D75A is the
+// developers' "0-sound" (Sound Range Test Level) : flat and empty.
 // Turtle Monument (0x239A2165) has hostile monkeys that get in the way.
-static const uint32_t AUTOTEST_LEVEL = 0;
+static const uint32_t AUTOTEST_LEVEL = 0x7567D75A;
 static volatile LONG g_settled = 0;           // 1 = cutscene/book dismissed, game runs.
 
 static bool g_autotest = false;
@@ -1162,7 +1162,7 @@ static void AutotestStep( EIHarry* harry )
 			break;
 		}
 		if ( now - phaseStart < 3000 ) break;
-		mp_log( "[AT] Going to Turtle Monument (from level 0x%.8X).\n", Gizmod::getCurrentLevelCRC() );
+		mp_log( "[AT] Going to level 0x%.8X (from level 0x%.8X).\n", AUTOTEST_LEVEL, Gizmod::getCurrentLevelCRC() );
 		ScheduleWorldLoad( (void*) 0x917028, AUTOTEST_LEVEL, false );
 		phase = -2; phaseStart = now; lastLevel = Gizmod::getCurrentLevelCRC();
 		break;
