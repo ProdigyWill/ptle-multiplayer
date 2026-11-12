@@ -40,6 +40,8 @@
 #include "utils/func.h"
 
 
+#define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
+
 GET_METHOD( 0x626670, void, AddToWorld, ERLevel*, EInstance* );
 GET_METHOD( 0x6268D0, void, ERLevel_SetupEntity, ERLevel*, EInstance*, EInstance* );
 GET_METHOD( 0x412850, void, EIBeast_LoadBeastAsset, EIBeast* );
@@ -375,10 +377,15 @@ GET_METHOD( 0x60FFA0, void, EICharacter_SetRot, EICharacter*, Vector3f* );
 // puppet stands beside Harry instead of inside him).
 static Vector3f g_puppetOffset = { 0.0F, 0.0F, 0.0F };
 
+// Autotest : hold the puppet at a fixed spot (collision test).
+static bool g_puppetPinned = false;
+static Vector3f g_puppetPin = { 0.0F, 0.0F, 0.0F };
+
 static bool GetPuppetTargetPosition( Vector3f* out )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
 	if ( !t ) return false;
+	if ( g_puppetPinned ) { *out = g_puppetPin; return true; }
 	out->x = t->position.x + g_puppetOffset.x;
 	out->y = t->position.y + g_puppetOffset.y;
 	out->z = t->position.z + g_puppetOffset.z;
@@ -394,7 +401,6 @@ static bool GetPuppetTargetPosition( Vector3f* out )
 // The beast tick (0x414F80) reads its world position from +0x360, the translation
 // row of a matrix at +0x330, and stores it at +0x370 ("previous position") when
 // done. +0x330 is the beast's real world transform.
-#define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
 static const uint32_t BEAST_SCALE       = 0x14C;
 static const uint32_t BEAST_WORLD       = 0x330;   // Matrix4f.
 static const uint32_t BEAST_PREV_POS    = 0x370;   // Vector3f.
@@ -691,8 +697,23 @@ static void PrePositionPuppet( EIEvilHarryP* p )
 	}
 }
 
+// Body collision. The beast's "collision off" routine (0x418840, used when it dies
+// or goes limp) clears the byte at +0x4C4 and its "on" routine (0x418910) sets it
+// back; with it at 0 Harry walks straight through. (The collision layer masks at
+// +0x230/+0x564/+0x574/+0x584 made no difference, cleared or not.)
+// The puppet is only a visual, so it is never solid.
+static const uint32_t BEAST_BODY_SOLID = 0x4C4;   // uint8_t.
+static bool g_puppetSolid = false;                 // Autotest flips it to compare.
+
+static void ApplyPuppetCollision( EIEvilHarryP* p )
+{
+	FIELD( p, uint8_t, BEAST_BODY_SOLID ) = g_puppetSolid ? 1 : 0;
+}
+
 static void DrivePuppet( EIEvilHarryP* p )
 {
+	ApplyPuppetCollision( p );
+
 	Vector3f pos;
 	if ( !GetPuppetTargetPosition( &pos ) ) return;
 
@@ -1170,7 +1191,7 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedExchange( &g_autotestDone, 2 );
 			return;
 		}
-		phase = 2; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Circle first : the walk moves the camera.
+		phase = 6; phaseStart = now; step = -1; snapped = false; circleAngle = 0.0F;   // Collision first (open space), then circle, walk, jumps.
 		break;
 
 	case 1:   // Walk Harry with the keyboard; the puppet replays it ~1s later.
@@ -1300,6 +1321,87 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		break;
+
+	case 6:   // Collision : walk Harry into the puppet held just ahead of him, solid vs not.
+	{
+		static int trial = 0;
+		static Vector3f start, s_collideDir;
+		static bool s_collideFar = false;
+		DWORD t = now - phaseStart;
+		if ( step == -1 ) {   // Back away from the gate into the open space behind Harry.
+			if ( t == 0 || !snapped ) {
+				InterlockedExchange( &g_holdMs, 600 );
+				InterlockedExchange( &g_holdKey, 'S' );
+				snapped = true;
+			}
+			if ( t >= 2500 ) { step = 0; phaseStart = now; }
+			break;
+		}
+		if ( step == 0 ) {
+			// TRIAL_FAR = control run with the puppet out of the way.
+			static const uint32_t TRIAL_FAR = 0xFFFFFFFF;
+			static const uint32_t TRIALS[] = { TRIAL_FAR, 1, 0, 1, 0 };   // 1 = solid (the game's default), 0 = our puppet.
+			static const int NUM_TRIALS = sizeof(TRIALS) / sizeof(TRIALS[0]);
+			if ( trial >= NUM_TRIALS ) {
+				g_puppetPinned = false; g_puppetSolid = false;
+				phase = 2; phaseStart = now; step = 0; snapped = false;   // Circle next : the walk moves the camera.
+				break;
+			}
+			s_collideFar = (TRIALS[trial] == TRIAL_FAR);
+			g_puppetSolid = !s_collideFar && TRIALS[trial] == 1;
+			start = harry->m_position;
+			InterlockedExchange( &g_holdMs, 250 );   // Short step to get the walking direction.
+			InterlockedExchange( &g_holdKey, (trial % 2) ? 'S' : 'W' );   // Out into the field, then back.
+			step = 1; phaseStart = now; snapped = false;
+		}
+		else if ( step == 1 && t >= 1200 ) {
+			static Vector3f dir;
+			float dx = harry->m_position.x - start.x, dy = harry->m_position.y - start.y;
+			float len = sqrtf( dx * dx + dy * dy );
+			if ( len < 0.1F ) { mp_log( "[AT] Harry didn't move, skipping trial %d.\n", trial ); trial++; step = 0; break; }
+			dir.x = dx / len; dir.y = dy / len; dir.z = 0.0F;
+			start = harry->m_position;
+			g_puppetPin.x = start.x + dir.x * 2.0F; g_puppetPin.y = start.y + dir.y * 2.0F; g_puppetPin.z = start.z;
+			g_puppetPinned = true;
+			mp_log( "[AT] Collision trial %d : puppet %s, walking into it.\n", trial,
+				s_collideFar ? "out of the way" : g_puppetSolid ? "solid" : "not solid" );
+			s_collideDir = dir;
+			step = 2; phaseStart = now;
+		}
+		else if ( step == 2 && t >= 500 ) {
+			InterlockedExchange( &g_holdMs, 500 );
+			InterlockedExchange( &g_holdKey, (trial % 2) ? 'S' : 'W' );
+			step = 3; phaseStart = now; snapped = false;
+		}
+		else if ( step == 3 ) {
+			// Keep the puppet 1 unit in front of Harry, along his movement.
+			static Vector3f lastPos;
+			if ( t > 0 ) {
+				float vx = harry->m_position.x - lastPos.x, vy = harry->m_position.y - lastPos.y;
+				float vl = sqrtf( vx * vx + vy * vy );
+				if ( vl > 0.01F ) { s_collideDir.x = vx / vl; s_collideDir.y = vy / vl; }
+			}
+			lastPos = harry->m_position;
+			float ahead = s_collideFar ? -15.0F : 1.0F;   // Control : far behind him.
+			g_puppetPin.x = harry->m_position.x + s_collideDir.x * ahead;
+			g_puppetPin.y = harry->m_position.y + s_collideDir.y * ahead;
+			g_puppetPin.z = harry->m_position.z;
+			if ( !snapped && t >= 250 ) {
+				char name[40];
+				sprintf_s( name, "07_collide_%d_%s", trial, s_collideFar ? "none" : g_puppetSolid ? "solid" : "ghost" );
+				RequestSnapshot( name );
+				snapped = true;
+			}
+			if ( t >= 1500 ) {
+				float dx = harry->m_position.x - start.x, dy = harry->m_position.y - start.y;
+				mp_log( "[AT] Collision trial %d (%s) : Harry moved %.2f (about 8.7 with no puppet, about 3.9 when blocked).\n",
+					trial, s_collideFar ? "NO PUPPET" : g_puppetSolid ? "puppet ahead, solid" : "puppet ahead, NOT solid", sqrtf( dx * dx + dy * dy ) );
+				g_puppetPinned = false;
+				trial++; step = 0; phaseStart = now;
+			}
+		}
+		break;
+	}
 
 	case 3:   // Back to idle once it stops.
 		if ( now - phaseStart < 3000 ) break;
