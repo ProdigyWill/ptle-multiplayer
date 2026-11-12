@@ -672,9 +672,27 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 }
 
 // Writes the beast's world transform : facing g_heading, at the target position.
-static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSnapshot* )
+// Rolling as a ball : Harry's display matrix (m_transformMatrix) is raised 1.2
+// above his position and spins about his side axis, while his position and
+// rigid-body matrix stay upright. Detected by that raise.
+static const float BALL_RAISE_MIN = 0.5F;
+
+static bool IsBallMode( const PlayerSnapshot* t )
+{
+	return t && t->transform.data[3][2] - t->position.z > BALL_RAISE_MIN;
+}
+
+static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSnapshot* t )
 {
 	Matrix4f& world = FIELD( p, Matrix4f, BEAST_WORLD );
+	if ( IsBallMode( t ) ) {
+		// Take Harry's spinning, raised matrix as is (same skeleton, same forward axis).
+		world = t->transform;
+		world.data[3][0] = pos.x + (t->transform.data[3][0] - t->position.x);
+		world.data[3][1] = pos.y + (t->transform.data[3][1] - t->position.y);
+		world.data[3][2] = pos.z + (t->transform.data[3][2] - t->position.z);
+		return;
+	}
 	float a = g_heading - g_forwardLocalAngle;
 	float c = cosf( a ), s = sinf( a );
 	world.data[0][0] =  c;   world.data[0][1] = s;     world.data[0][2] = 0.0F;  world.data[0][3] = 0.0F;
@@ -732,9 +750,9 @@ static void DrivePuppet( EIEvilHarryP* p )
 	for ( int r = 0; r < 3; r++ )
 		for ( int c = 0; c < 3; c++ )
 			p->m_transformMatrix.data[r][c] = world.data[r][c];
-	p->m_transformMatrix.data[3][0] = pos.x;
-	p->m_transformMatrix.data[3][1] = pos.y;
-	p->m_transformMatrix.data[3][2] = pos.z;
+	p->m_transformMatrix.data[3][0] = world.data[3][0];   // Raised when rolling.
+	p->m_transformMatrix.data[3][1] = world.data[3][1];
+	p->m_transformMatrix.data[3][2] = world.data[3][2];
 	FIELD( p, Vector3f, BEAST_PREV_POS ) = pos;
 }
 
@@ -849,6 +867,8 @@ static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
 static volatile LONG g_snapPending = 0;
 static volatile LONG g_holdKey = 0;           // Virtual key the autotest thread should hold...
 static volatile LONG g_holdMs = 0;            // ...for this long.
+static volatile LONG g_holdKey2 = 0;          // Second key held at the same time (e.g. crouch + walk).
+static volatile LONG g_holdMs2 = 0;
 static volatile LONG g_tapKey = 0;            // Virtual key the autotest thread should tap.
 static char g_snapName[64];
 
@@ -1038,8 +1058,8 @@ static DWORD WINAPI AutotestThread( void* )
 
 	// The scripted part runs on the game thread (AutotestStep). Service screenshots
 	// and key holds.
-	WORD heldKey = 0;
-	DWORD releaseAt = 0;
+	WORD heldKey = 0, heldKey2 = 0;
+	DWORD releaseAt = 0, releaseAt2 = 0;
 	while ( g_autotestDone == 0 ) {
 		LONG tap = InterlockedExchange( &g_tapKey, 0 );
 		if ( tap ) {
@@ -1061,6 +1081,17 @@ static DWORD WINAPI AutotestThread( void* )
 		if ( heldKey && (GetTickCount() >= releaseAt || !GameHasFocus()) ) {
 			SendKey( heldKey, false );
 			heldKey = 0;
+		}
+
+		LONG k2 = InterlockedExchange( &g_holdKey2, 0 );
+		if ( k2 && !heldKey2 && EnsureGameFocus( wnd ) ) {
+			SendKey( (WORD) k2, true );
+			heldKey2 = (WORD) k2;
+			releaseAt2 = GetTickCount() + g_holdMs2;
+		}
+		if ( heldKey2 && (GetTickCount() >= releaseAt2 || !GameHasFocus()) ) {
+			SendKey( heldKey2, false );
+			heldKey2 = 0;
 		}
 
 		if ( GetTickCount() - start > AUTOTEST_TOTAL_TIMEOUT_MS ) {
@@ -1191,7 +1222,7 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedExchange( &g_autotestDone, 2 );
 			return;
 		}
-		phase = 6; phaseStart = now; step = -1; snapped = false; circleAngle = 0.0F;   // Collision first (open space), then circle, walk, jumps.
+		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps.
 		break;
 
 	case 1:   // Walk Harry with the keyboard; the puppet replays it ~1s later.
@@ -1321,6 +1352,41 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		break;
+
+	case 7:   // Roll : hold crouch (numpad 8), then walk forward; log Harry's matrices.
+	{
+		static DWORD lastLog = 0;
+		DWORD t = now - phaseStart;
+		if ( step == 0 ) {
+			InterlockedExchange( &g_holdMs2, 3500 );
+			InterlockedExchange( &g_holdKey2, VK_NUMPAD8 );   // Crouch.
+			mp_log( "[AT] Roll : holding crouch, then W.\n" );
+			step = 1; snapped = false;
+		}
+		else if ( step == 1 && t >= 400 ) {
+			InterlockedExchange( &g_holdMs, 2500 );
+			InterlockedExchange( &g_holdKey, 'W' );
+			step = 2;
+		}
+		if ( now - lastLog >= 100 && t < 4500 ) {
+			const Matrix4f& m = harry->m_transformMatrix;
+			const Matrix4f& rb = harry->m_rigidBodyMatrix;
+			const PlayerSnapshot* tg = GetPuppetTarget();
+			mp_log( "[AT] roll t=%4u clip 0x%.8X ground %d pos (%.2f %.2f %.2f) | xf r0 (%.2f %.2f %.2f) r1 (%.2f %.2f %.2f) r2 (%.2f %.2f %.2f) t (%.2f %.2f %.2f) | rb r0 (%.2f %.2f %.2f) r2 (%.2f %.2f %.2f) t (%.2f %.2f %.2f) | puppet z %.2f\n",
+				t, tg ? tg->clipCRC : 0, harry->m_onGround, harry->m_position.x, harry->m_position.y, harry->m_position.z,
+				m.data[0][0], m.data[0][1], m.data[0][2], m.data[1][0], m.data[1][1], m.data[1][2], m.data[2][0], m.data[2][1], m.data[2][2],
+				m.data[3][0], m.data[3][1], m.data[3][2],
+				rb.data[0][0], rb.data[0][1], rb.data[0][2], rb.data[2][0], rb.data[2][1], rb.data[2][2], rb.data[3][0], rb.data[3][1], rb.data[3][2],
+				g_puppet ? FIELD( g_puppet, Matrix4f, BEAST_WORLD ).data[3][2] : 0.0F );
+			lastLog = now;
+		}
+		if ( (!snapped && t >= 1500) || (snapped && t >= 2300 && t < 2360) ) {
+			RequestSnapshot( snapped ? "08_roll_b" : "08_roll_a" );
+			snapped = true;
+		}
+		if ( t >= 6000 ) { phase = 6; phaseStart = now; step = -1; snapped = false; }
+		break;
+	}
 
 	case 6:   // Collision : walk Harry into the puppet held just ahead of him, solid vs not.
 	{
