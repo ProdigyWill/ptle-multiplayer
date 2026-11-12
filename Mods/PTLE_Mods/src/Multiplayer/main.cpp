@@ -9,12 +9,13 @@
 //
 // Hotkeys (only while the game window has focus) :
 //   F5 : spawn the puppet in the current level.
-//   F6 : cycle the state the puppet is forced into (-1 = let its AI run).
-//        Each press logs the state name, to find a harmless idle state.
+//   F6 : cycle the puppet's animation : automatic (idle when still, run when
+//        moving, facing its direction of travel), then idle/rest states by hand.
 //   F7 : cycle the replay delay (0.25s .. 3s).
 // --------------------------------------------------------------------------------
 
 #include <Windows.h>
+#include <math.h>
 #include <ShlObj.h>
 #include <share.h>
 #include <stdarg.h>
@@ -217,6 +218,8 @@ static void LogStateMachine( EIBeast* beast )
 	}
 }
 
+static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry );
+
 static void SpawnPuppet( EIHarry* harry )
 {
 	if ( g_puppet ) {
@@ -265,6 +268,7 @@ static void SpawnPuppet( EIHarry* harry )
 	// silhouette. Start calm and lit instead.
 	g_forcedState = FindStateIndex( p, "idle left" );
 	mp_log( "[MP] Puppet starts in state %d (idle left).\n", g_forcedState );
+	InitLocomotion( p, harry );
 
 	mp_log( "[MP] Puppet spawned at 0x%.8X (m_beastTypeName offset 0x%X, expected 0x%X).\n",
 		p, (unsigned) offsetof(EIBeast, m_beastTypeName), (unsigned) EXPECTED_BEASTNAME_OFFSET );
@@ -334,15 +338,186 @@ static const uint32_t BEAST_SCALE       = 0x14C;
 static const uint32_t BEAST_WORLD       = 0x330;   // Matrix4f.
 static const uint32_t BEAST_PREV_POS    = 0x370;   // Vector3f.
 
-// Writes the beast's world transform : Harry's orientation, target position.
-static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSnapshot* t )
+// --------------------------------------------------------------------------------
+// Locomotion : the puppet's animation and facing come from how its target moves
+// (later : how the remote player moves). x/y is the ground plane, z is up.
+// --------------------------------------------------------------------------------
+static const float MP_PI = 3.14159265F;
+
+static bool  g_autoLocomotion = true;   // F6 switches to hand-forced states.
+static int   g_idleState = -1;
+static int   g_runLayer = -1;                // Animation layers (see below).
+static int   g_idleLayer = -1;
+static float g_velX = 0.0F, g_velY = 0.0F;   // Smoothed, units per tick.
+static float g_moveSpeed = 0.0F;
+static float g_heading = 0.0F;               // Direction of travel, atan2( y, x ).
+static bool  g_moving = false;
+static bool  g_haveLastTarget = false;
+static Vector3f g_lastTarget;
+
+static const float RUN_START_SPEED = 0.05F;  // Units per tick (hysteresis).
+static const float RUN_STOP_SPEED  = 0.02F;
+static const float TELEPORT_DIST   = 5.0F;   // Bigger jumps aren't movement.
+
+// Angle of the model's forward axis in its own frame (0 = +X, pi/2 = +Y).
+// +Y made it run backwards, so the model faces local -Y.
+static float g_forwardLocalAngle = -MP_PI / 2.0F;
+
+static void ResetLocomotion()
+{
+	g_velX = g_velY = g_moveSpeed = 0.0F;
+	g_moving = false;
+	g_haveLastTarget = false;
+}
+
+static void UpdateLocomotion( EIEvilHarryP* p )
+{
+	Vector3f pos;
+	if ( !GetPuppetTargetPosition( &pos ) ) return;
+
+	if ( g_haveLastTarget ) {
+		float dx = pos.x - g_lastTarget.x;
+		float dy = pos.y - g_lastTarget.y;
+		if ( dx * dx + dy * dy > TELEPORT_DIST * TELEPORT_DIST ) dx = dy = 0.0F;
+
+		g_velX = g_velX * 0.75F + dx * 0.25F;
+		g_velY = g_velY * 0.75F + dy * 0.25F;
+		g_moveSpeed = sqrtf( g_velX * g_velX + g_velY * g_velY );
+		if ( g_moveSpeed > 0.01F ) g_heading = atan2f( g_velY, g_velX );
+	}
+	g_lastTarget = pos;
+	g_haveLastTarget = true;
+
+	bool wasMoving = g_moving;
+	if ( g_moving && g_moveSpeed < RUN_STOP_SPEED ) g_moving = false;
+	else if ( !g_moving && g_moveSpeed > RUN_START_SPEED ) g_moving = true;
+	if ( g_moving != wasMoving ) {
+		mp_log( "[MP] Puppet %s (speed %.3f/tick, heading %.0f deg).\n",
+			g_moving ? "starts moving" : "stops", g_moveSpeed, g_heading * 180.0F / MP_PI );
+	}
+
+	// The state machine always stays in a calm idle state : forcing boss-fight
+	// states like "runner" crashes (they expect setup we don't do). Running is
+	// done by switching animation layers instead (ApplyLocomotionAnim).
+	if ( g_autoLocomotion ) {
+		g_forcedState = g_idleState;
+	}
+}
+
+// Beast animation layers (from the beast's own PlayAnim, 0x41A820). The animation
+// controller holds one layer per state-machine state (layer = EBeastState +0x38,
+// set to the state's index), then the "locomotion" layers from the beast's
+// quickdata at [+0x52C] : +0 move (CRC at +0x494), +1 idle (CRC at +0x498),
+// +2 turn left, +3 turn right. [+0x530] is the layer currently playing.
+GET_METHOD( 0x61D0D0, void, AnimCtrl_FadeTo,  EAnimController*, int, float );
+GET_METHOD( 0x61D8A0, void, AnimCtrl_Restart, EAnimController*, int );
+
+static const uint32_t BEAST_ANIMCTRL     = 0xB4;
+static const uint32_t BEAST_ANIM_MOVE    = 0x494;   // CRC.
+static const uint32_t BEAST_ANIM_IDLE    = 0x498;   // CRC.
+static const uint32_t BEAST_LOCO_BASE    = 0x52C;   // int.
+static const uint32_t BEAST_CUR_LAYER    = 0x530;   // int.
+static const uint32_t BEAST_STATE_LAYER  = 0x38;    // In EBeastState (0x58 bytes).
+
+static int GetStateAnimLayer( EIBeast* p, int state )
+{
+	EBeastStateMachine* sm = p->GetStateMachine();
+	if ( !sm || !sm->m_states || state < 0 || state >= (int) sm->m_numStates ) return -1;
+	return FIELD( &sm->m_states[state], int, BEAST_STATE_LAYER );
+}
+
+// Crossfades to an animation layer, like the beast's PlayAnim does.
+static void PlayAnimLayer( EIEvilHarryP* p, int layer )
+{
+	EAnimController* ctrl = &FIELD( p, EAnimController, BEAST_ANIMCTRL );
+	int current = FIELD( p, int, BEAST_CUR_LAYER );
+	if ( layer < 0 || layer == current ) return;
+
+	if ( current >= 0 ) AnimCtrl_FadeTo( ctrl, current, 0.0F );
+	AnimCtrl_Restart( ctrl, layer );
+	AnimCtrl_FadeTo( ctrl, layer, 1.0F );
+	FIELD( p, int, BEAST_CUR_LAYER ) = layer;
+}
+
+static void ApplyLocomotionAnim( EIEvilHarryP* p )
+{
+	static int overridden = 0;
+	int wanted = g_moving ? g_runLayer : g_idleLayer;
+	int current = FIELD( p, int, BEAST_CUR_LAYER );
+	if ( wanted < 0 || wanted == current ) return;
+
+	// The idle state may re-play its own animation; count it to spot fights.
+	if ( (current == g_idleLayer || current == g_runLayer) == false ) {
+		if ( ++overridden <= 5 ) mp_log( "[MP] Puppet anim layer was %d, playing %d.\n", current, wanted );
+	}
+	PlayAnimLayer( p, wanted );
+}
+
+static void SetRunAnimation( EIEvilHarryP* p, const char* stateName )
+{
+	if ( !stateName ) {
+		int base = FIELD( p, int, BEAST_LOCO_BASE );
+		g_runLayer = FIELD( p, uint32_t, BEAST_ANIM_MOVE ) ? base : -1;
+		mp_log( "[MP] Run animation : quickdata move anim, layer %d.\n", g_runLayer );
+	}
+	else {
+		g_runLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+		mp_log( "[MP] Run animation : \"%s\" state's anim, layer %d.\n", stateName, g_runLayer );
+	}
+}
+
+// Standing animation. 0 = the beast's quickdata idle (locomotion layer +1); the
+// "idle left/right" states' animation is the wall-climbing idle (pickaxes out).
+static void SetIdleAnimation( EIEvilHarryP* p, const char* stateName )
+{
+	if ( !stateName ) {
+		int base = FIELD( p, int, BEAST_LOCO_BASE );
+		g_idleLayer = FIELD( p, uint32_t, BEAST_ANIM_IDLE ) ? base + 1 : -1;
+		mp_log( "[MP] Idle animation : quickdata idle anim, layer %d.\n", g_idleLayer );
+	}
+	else {
+		g_idleLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+		mp_log( "[MP] Idle animation : \"%s\" state's anim, layer %d.\n", stateName, g_idleLayer );
+	}
+}
+
+static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
+{
+	ResetLocomotion();
+	g_autoLocomotion = true;
+	g_idleState = FindStateIndex( p, "idle left" );
+	g_idleLayer = GetStateAnimLayer( p, g_idleState );
+
+	mp_log( "[MP] Beast anims : move CRC 0x%.8X, idle CRC 0x%.8X, locomotion base layer %d, current layer %d, idle layer %d, runner layer %d.\n",
+		FIELD( p, uint32_t, BEAST_ANIM_MOVE ), FIELD( p, uint32_t, BEAST_ANIM_IDLE ),
+		FIELD( p, int, BEAST_LOCO_BASE ), FIELD( p, int, BEAST_CUR_LAYER ),
+		g_idleLayer, GetStateAnimLayer( p, FindStateIndex( p, "runner" ) ) );
+
+	SetIdleAnimation( p, 0 );
+	if ( g_idleLayer < 0 ) g_idleLayer = GetStateAnimLayer( p, g_idleState );
+
+	// The quickdata move animation if the beast has one (Evil Harry doesn't), else
+	// the "chase player" state's : the most natural upright run of the candidates
+	// ("runner" is hunched, "superrun" is a dive).
+	SetRunAnimation( p, 0 );
+	if ( g_runLayer < 0 ) SetRunAnimation( p, "chase player" );
+
+	// Face where Harry faces. Walking showed his rigid body's row 1 (local +Y)
+	// points where he moves; m_transformMatrix is turned 180 degrees from that.
+	const Matrix4f& m = harry->m_rigidBodyMatrix;
+	g_heading = atan2f( m.data[1][1], m.data[1][0] );
+	mp_log( "[MP] Locomotion : idle state %d, heading %.0f deg.\n", g_idleState, g_heading * 180.0F / MP_PI );
+}
+
+// Writes the beast's world transform : facing g_heading, at the target position.
+static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSnapshot* )
 {
 	Matrix4f& world = FIELD( p, Matrix4f, BEAST_WORLD );
-	if ( t ) {
-		for ( int r = 0; r < 3; r++ )
-			for ( int c = 0; c < 4; c++ )
-				world.data[r][c] = t->transform.data[r][c];
-	}
+	float a = g_heading - g_forwardLocalAngle;
+	float c = cosf( a ), s = sinf( a );
+	world.data[0][0] =  c;   world.data[0][1] = s;     world.data[0][2] = 0.0F;  world.data[0][3] = 0.0F;
+	world.data[1][0] = -s;   world.data[1][1] = c;     world.data[1][2] = 0.0F;  world.data[1][3] = 0.0F;
+	world.data[2][0] = 0.0F; world.data[2][1] = 0.0F;  world.data[2][2] = 1.0F;  world.data[2][3] = 0.0F;
 	world.data[3][0] = pos.x;
 	world.data[3][1] = pos.y;
 	world.data[3][2] = pos.z;
@@ -372,13 +547,17 @@ static void DrivePuppet( EIEvilHarryP* p )
 	EICharacter_SetPos( p, &pos, true );   // Spatial structure, bounds, collision.
 	EICharacter_SetRot( p, &rot );         // Rebuilds rotation + scale of the matrix.
 
-	// Translation row of the transform matrix.
+	// The beast's own world transform (what its tick and AI work from).
+	SetBeastWorld( p, pos, t );
+
+	// Same orientation and position in the header transform.
+	const Matrix4f& world = FIELD( p, Matrix4f, BEAST_WORLD );
+	for ( int r = 0; r < 3; r++ )
+		for ( int c = 0; c < 3; c++ )
+			p->m_transformMatrix.data[r][c] = world.data[r][c];
 	p->m_transformMatrix.data[3][0] = pos.x;
 	p->m_transformMatrix.data[3][1] = pos.y;
 	p->m_transformMatrix.data[3][2] = pos.z;
-
-	// The beast's own world transform (what its tick and AI work from).
-	SetBeastWorld( p, pos, t );
 	FIELD( p, Vector3f, BEAST_PREV_POS ) = pos;
 }
 
@@ -444,26 +623,20 @@ static void HandleHotkeys( EIHarry* harry )
 		// they expect context set up by the boss fight.
 		static const char* const CANDIDATES[] = { "idle left", "idle right", "rest left", "rest right" };
 		static const int NUM_CANDIDATES = sizeof(CANDIDATES) / sizeof(CANDIDATES[0]);
-		static int choice = -1;   // -1 = AI runs freely.
+		static int choice = -1;   // -1 = automatic (idle / run from movement).
 
 		EBeastStateMachine* sm = g_puppet->GetStateMachine();
 		choice++;
 		if ( choice >= NUM_CANDIDATES ) choice = -1;
 
-		g_forcedState = -1;
-		if ( choice >= 0 && sm && sm->m_states ) {
-			for ( int i = 0; i < (int) sm->m_numStates; i++ ) {
-				const char* name = sm->m_states[i].m_name;
-				const char* dot = name ? strchr( name, '.' ) : 0;
-				if ( dot && strcmp( dot + 1, CANDIDATES[choice] ) == 0 ) {
-					g_forcedState = i;
-					break;
-				}
-			}
-		}
+		g_autoLocomotion = (choice < 0);
+		g_forcedState = (choice >= 0) ? FindStateIndex( g_puppet, CANDIDATES[choice] ) : g_idleState;
 
-		if ( g_forcedState < 0 ) {
-			mp_log( "[MP] Puppet AI state : free (not forced)%s.\n", choice >= 0 ? " - candidate not found" : "" );
+		if ( choice < 0 ) {
+			mp_log( "[MP] Puppet animation : automatic (idle / run).\n" );
+		}
+		else if ( g_forcedState < 0 ) {
+			mp_log( "[MP] Puppet state \"%s\" not found.\n", CANDIDATES[choice] );
 		}
 		else {
 			mp_log( "[MP] Puppet forced state : %d (%s)\n", g_forcedState, sm->m_states[g_forcedState].m_name );
@@ -487,12 +660,18 @@ static void HandleHotkeys( EIHarry* harry )
 GET_METHOD( 0x4B55F0, void, EIHarry_Teleport, EIHarry*, Matrix4f*, bool, float );
 
 GET_METHOD( 0x5EBA90, void, ScheduleWorldLoad, void*, uint32_t, bool );
-static const uint32_t AUTOTEST_LEVEL = 0x239A2165;   // Turtle Monument : open, easy to see.
+// Level to test in, or 0 to stay in the randomizer's start area (set in
+// Game\config\Randomizer\config.ini, currently Native Village).
+// Turtle Monument (0x239A2165) has hostile monkeys that get in the way.
+static const uint32_t AUTOTEST_LEVEL = 0;
+static volatile LONG g_settled = 0;           // 1 = cutscene/book dismissed, game runs.
 
 static bool g_autotest = false;
 static bool g_skipPuppetAI = false;           // true = don't run Evil Harry's own tick (no animation).
 static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
 static volatile LONG g_snapPending = 0;
+static volatile LONG g_holdKey = 0;           // Virtual key the autotest thread should hold...
+static volatile LONG g_holdMs = 0;            // ...for this long.
 static char g_snapName[64];
 
 static const DWORD AUTOTEST_MENU_TIMEOUT_MS  = 180000;
@@ -557,6 +736,16 @@ static void TakeSnapshot( const char* name )
 	DeleteObject( dib );
 	DeleteDC( mem );
 	ReleaseDC( 0, screen );
+}
+
+static void SendKey( WORD vk, bool down )
+{
+	INPUT in; ZeroMemory( &in, sizeof(in) );
+	in.type = INPUT_KEYBOARD;
+	in.ki.wScan = (WORD) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC );
+	in.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+	if ( vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT ) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+	SendInput( 1, &in, sizeof(INPUT) );
 }
 
 static void TapKey( WORD vk )
@@ -628,8 +817,52 @@ static DWORD WINAPI AutotestThread( void* )
 	}
 	mp_log( "[AT] Gameplay reached after %d Enter presses (%.1fs).\n", presses, (GetTickCount() - start) / 1000.0F );
 
-	// The scripted part runs on the game thread (AutotestStep). Service screenshots.
+	// Make sure the game runs freely before the script starts : while a menu or the
+	// journal is open Harry doesn't tick, so a stalled tick count means press Esc.
+	// (The randomizer's start area plays no cutscene; others are auto-skipped.)
+	Sleep( 3000 );
+	for ( int attempt = 0; ; attempt++ ) {
+		LONG t0 = g_harryTicks;
+		Sleep( 1000 );
+		LONG rate = g_harryTicks - t0;
+		mp_log( "[AT] Harry ticks in the last second : %ld.\n", rate );
+		if ( rate >= 30 ) break;
+		if ( attempt >= 5 ) {
+			TakeSnapshot( "fail_not_settled" );
+			mp_log( "[AT] FAIL : game still not running freely.\n" );
+			ExitProcess( 2 );
+		}
+		char name[32];
+		sprintf_s( name, "settle_stalled_%d", attempt );
+		TakeSnapshot( name );
+		if ( GameHasFocus() ) { TapKey( VK_ESCAPE ); mp_log( "[AT] Game looks paused, pressed Esc.\n" ); }
+		Sleep( 1500 );
+	}
+	TakeSnapshot( "settle_2_free" );
+	InterlockedExchange( &g_settled, 1 );
+	mp_log( "[AT] Game runs freely, starting the test script.\n" );
+
+	// The scripted part runs on the game thread (AutotestStep). Service screenshots
+	// and key holds.
+	WORD heldKey = 0;
+	DWORD releaseAt = 0;
 	while ( g_autotestDone == 0 ) {
+		LONG k = InterlockedExchange( &g_holdKey, 0 );
+		if ( k && !heldKey ) {
+			if ( GameHasFocus() ) {
+				SendKey( (WORD) k, true );
+				heldKey = (WORD) k;
+				releaseAt = GetTickCount() + g_holdMs;
+			}
+			else {
+				mp_log( "[AT] Game isn't the active window, not holding key 0x%X.\n", k );
+			}
+		}
+		if ( heldKey && (GetTickCount() >= releaseAt || !GameHasFocus()) ) {
+			SendKey( heldKey, false );
+			heldKey = 0;
+		}
+
 		if ( GetTickCount() - start > AUTOTEST_TOTAL_TIMEOUT_MS ) {
 			TakeSnapshot( "fail_total_timeout" );
 			mp_log( "[AT] FAIL : test script timed out.\n" );
@@ -641,6 +874,7 @@ static DWORD WINAPI AutotestThread( void* )
 		Sleep( 30 );
 	}
 
+	if ( heldKey ) SendKey( heldKey, false );
 	if ( InterlockedExchange( &g_snapPending, 0 ) ) TakeSnapshot( g_snapName );
 	mp_log( "[AT] %s\n", g_autotestDone == 1 ? "RESULT : PASS" : "RESULT : FAIL" );
 	Sleep( 300 );
@@ -652,7 +886,9 @@ static void LogTelemetry( EIHarry* harry, const char* tag )
 {
 	if ( g_puppet ) {
 		const Matrix4f& w = FIELD( g_puppet, Matrix4f, BEAST_WORLD );
-		mp_log( "[AT] %s beast world (%.1f, %.1f, %.1f)\n", tag, w.data[3][0], w.data[3][1], w.data[3][2] );
+		mp_log( "[AT] %s beast world (%.1f, %.1f, %.1f), anim layer %d, moving %d, speed %.3f, heading %.0f\n", tag,
+			w.data[3][0], w.data[3][1], w.data[3][2], FIELD( g_puppet, int, BEAST_CUR_LAYER ),
+			(int) g_moving, g_moveSpeed, g_heading * 180.0F / MP_PI );
 		const Vector3f& r = FIELD( g_puppet, Vector3f, BEAST_SCALE );
 		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f) puppet (%.1f, %.1f, %.1f) scale (%.2f, %.2f, %.2f) matrix (%.1f, %.1f, %.1f) state %d\n", tag,
 			harry->m_position.x, harry->m_position.y, harry->m_position.z,
@@ -669,9 +905,20 @@ static void LogTelemetry( EIHarry* harry, const char* tag )
 // Runs every Harry tick on the game thread while in autotest mode.
 static void AutotestStep( EIHarry* harry )
 {
-	static const float HOPS[][2] = { { 8, 0 }, { 0, 8 }, { -8, 0 }, { 0, -8 } };
-	static const int NUM_HOPS = 4;
-	static const int NUM_STATE_PRESSES = 5;   // 4 calm states, then back to free AI.
+	static const LONG WALK_KEYS[] = { 'W', 'A', 'S', 'D' };   // Arrow keys don't move Harry.
+	static const char* const WALK_KEY_NAMES[] = { "w", "a", "s", "d" };
+	static const int NUM_WALK_KEYS = 4;
+	static const LONG WALK_HOLD_MS = 1500;
+	static const char* const RUN_CANDIDATES[] = { 0, "runner", "chase player", "run to spot to ice pick", "superrun to spot to ice pick" };
+	static const int NUM_RUN_CANDIDATES = 5;
+	static const char* const IDLE_CANDIDATES[] = { 0, "rest left", "rest right", "i win", "gloat hit", "admire hit" };
+	static const int NUM_IDLE_CANDIDATES = 6;
+	static const float CIRCLE_RADIUS = 8.0F;
+	static const float CIRCLE_SPEED  = 0.15F;   // Units per tick.
+	static float circleAngle = 0.0F;
+	static DWORD lastWalkLog = 0;
+	static Vector3f lastHarryPos;
+	static LONG lastHarryTicks = 0;
 
 	static int phase = -1;
 	static uint32_t lastLevel = 0;
@@ -704,6 +951,12 @@ static void AutotestStep( EIHarry* harry )
 	switch ( phase )
 	{
 	case -1:  // Go to an open level (same call as the Gizmod "Go to" menu).
+		if ( !g_settled ) { phaseStart = now; break; }
+		if ( AUTOTEST_LEVEL == 0 ) {
+			mp_log( "[AT] Testing in the start level 0x%.8X.\n", Gizmod::getCurrentLevelCRC() );
+			phase = 0; phaseStart = now - 5000;   // Already settled : shorter wait.
+			break;
+		}
 		if ( now - phaseStart < 3000 ) break;
 		mp_log( "[AT] Going to Turtle Monument (from level 0x%.8X).\n", Gizmod::getCurrentLevelCRC() );
 		ScheduleWorldLoad( (void*) 0x917028, AUTOTEST_LEVEL, false );
@@ -734,60 +987,104 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedExchange( &g_autotestDone, 2 );
 			return;
 		}
-		phase = 1; phaseStart = now; step = 0; snapped = false;
+		phase = 2; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Circle first : the walk moves the camera.
 		break;
 
-	case 1:   // Hop Harry around a square; the puppet should trail behind.
+	case 1:   // Walk Harry with the keyboard; the puppet replays it ~1s later.
 		if ( now - phaseStart >= 500 && !snapped && step == 0 ) {
 			RequestSnapshot( "02_after_spawn" );
 			snapped = true;
 		}
-		if ( now - phaseStart >= 2500 ) {
-			if ( step < NUM_HOPS ) {
-				// Harry stays still (teleports throw the camera around); the
-				// puppet steps around him instead.
-				g_puppetOffset.x = HOPS[step][0];
-				g_puppetOffset.y = HOPS[step][1];
-				mp_log( "[AT] Hop %d : puppet offset from Harry now (%.0f, %.0f).\n", step, HOPS[step][0], HOPS[step][1] );
-				step++;
-				phaseStart = now; snapped = false;
-			}
-			else {
-				phase = 2; phaseStart = now; step = 0; snapped = false;
-				g_skipPuppetAI = false;
-				mp_log( "[AT] State test runs with the puppet's AI tick enabled.\n" );
-			}
+		if ( now - phaseStart >= 1000 && step == 0 ) {
+			step = 1; phaseStart = now; snapped = false;
+			InterlockedExchange( &g_holdMs, WALK_HOLD_MS );
+			InterlockedExchange( &g_holdKey, WALK_KEYS[0] );
+			mp_log( "[AT] Walk 0 : holding %s.\n", WALK_KEY_NAMES[0] );
 		}
-		else if ( step > 0 && !snapped && now - phaseStart >= 2300 ) {
-			char name[32];
-			sprintf_s( name, "03_hop_%d", step - 1 );
-			RequestSnapshot( name );
-			snapped = true;
+		else if ( step > 0 ) {
+			int k = step - 1;
+			if ( now - lastWalkLog >= 100 ) {
+				// Harry's speed and direction vs his matrices : calibrates the forward axis.
+				float dx = harry->m_position.x - lastHarryPos.x, dy = harry->m_position.y - lastHarryPos.y;
+				float ticks = (float) (g_harryTicks - lastHarryTicks);
+				if ( ticks > 0 && dx * dx + dy * dy > 0.0001F ) {
+					const Matrix4f& m = harry->m_transformMatrix;
+					const Matrix4f& rb = harry->m_rigidBodyMatrix;
+					mp_log( "[AT] walk %s : speed %.3f/tick, move %.0f deg, transform row0 %.0f row1 %.0f, rigidbody row0 %.0f row1 %.0f, euler (%.2f, %.2f, %.2f)\n",
+						WALK_KEY_NAMES[k], sqrtf( dx * dx + dy * dy ) / ticks, atan2f( dy, dx ) * 180.0F / MP_PI,
+						atan2f( m.data[0][1], m.data[0][0] ) * 180.0F / MP_PI, atan2f( m.data[1][1], m.data[1][0] ) * 180.0F / MP_PI,
+						atan2f( rb.data[0][1], rb.data[0][0] ) * 180.0F / MP_PI, atan2f( rb.data[1][1], rb.data[1][0] ) * 180.0F / MP_PI,
+						harry->m_rotationEuler.x, harry->m_rotationEuler.y, harry->m_rotationEuler.z );
+				}
+				lastHarryPos = harry->m_position; lastHarryTicks = g_harryTicks; lastWalkLog = now;
+			}
+			if ( !snapped && now - phaseStart >= 1300 ) {
+				char name[32];
+				sprintf_s( name, "03_walk_%d_%s", k, WALK_KEY_NAMES[k] );
+				RequestSnapshot( name );   // Harry stopping, puppet still running behind.
+				snapped = true;
+			}
+			if ( now - phaseStart >= 3500 ) {
+				if ( step < NUM_WALK_KEYS ) {
+					InterlockedExchange( &g_holdMs, WALK_HOLD_MS );
+					InterlockedExchange( &g_holdKey, WALK_KEYS[step] );
+					mp_log( "[AT] Walk %d : holding %s.\n", step, WALK_KEY_NAMES[step] );
+					step++; phaseStart = now; snapped = false;
+				}
+				else {
+					phase = 3; phaseStart = now;
+				}
+			}
 		}
 		break;
 
-	case 2:   // Cycle the calm F6 states.
-		if ( step == 0 || now - phaseStart >= 3000 ) {
-			if ( step >= NUM_STATE_PRESSES ) {
-				phase = 3; phaseStart = now;
+	case 2:   // Circle the puppet around Harry once per run-state candidate.
+		if ( step == 0 || now - phaseStart >= 4500 ) {
+			if ( step >= NUM_RUN_CANDIDATES ) {
+				g_puppetOffset.x = 6.0F; g_puppetOffset.y = 0.0F;
+				mp_log( "[AT] Circle done, puppet stands still again.\n" );
+				phase = 4; phaseStart = now; step = 0; snapped = false;
 				break;
 			}
-			InterlockedIncrement( &g_reqState );   // Same as pressing F6.
-			step++;
-			phaseStart = now; snapped = false;
+			mp_log( "[AT] Circle %d : %s.\n", step, RUN_CANDIDATES[step] ? RUN_CANDIDATES[step] : "quickdata move anim" );
+			SetRunAnimation( g_puppet, RUN_CANDIDATES[step] );
+			if ( g_runLayer < 0 ) { phaseStart = now - 4500; step++; break; }   // Not available, skip.
+			step++; phaseStart = now; snapped = false;
 		}
-		else if ( !snapped && now - phaseStart >= 2500 ) {
-			char name[32];
-			sprintf_s( name, "04_state_press_%d", step );
+		circleAngle += CIRCLE_SPEED / CIRCLE_RADIUS;
+		g_puppetOffset.x = CIRCLE_RADIUS * cosf( circleAngle );
+		g_puppetOffset.y = CIRCLE_RADIUS * sinf( circleAngle );
+		if ( (!snapped && now - phaseStart >= 2000) || (snapped && now - phaseStart >= 4000 && now - phaseStart < 4000 + 60) ) {
+			char name[40];
+			sprintf_s( name, "04_circle_%d_%c", step - 1, snapped ? 'b' : 'a' );
 			RequestSnapshot( name );
 			snapped = true;
 		}
 		break;
 
-	case 3:
-		if ( now - phaseStart < 1000 ) break;
+	case 4:   // Standing still beside Harry : show each idle candidate.
+		if ( step == 0 || now - phaseStart >= 3000 ) {
+			if ( step >= NUM_IDLE_CANDIDATES ) {
+				SetIdleAnimation( g_puppet, 0 );
+				phase = 1; phaseStart = now; step = 0; snapped = false;
+				break;
+			}
+			mp_log( "[AT] Idle %d : %s.\n", step, IDLE_CANDIDATES[step] ? IDLE_CANDIDATES[step] : "quickdata idle anim" );
+			SetIdleAnimation( g_puppet, IDLE_CANDIDATES[step] );
+			step++; phaseStart = now; snapped = false;
+		}
+		else if ( !snapped && now - phaseStart >= 2500 ) {
+			char name[40];
+			sprintf_s( name, "05_idle_%d", step - 1 );
+			RequestSnapshot( name );
+			snapped = true;
+		}
+		break;
+
+	case 3:   // Back to idle once it stops.
+		if ( now - phaseStart < 3000 ) break;
 		LogTelemetry( harry, "final" );
-		RequestSnapshot( "05_final" );
+		RequestSnapshot( "05_stopped" );
 		InterlockedExchange( &g_autotestDone, 1 );
 		break;
 	}
@@ -830,6 +1127,8 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 	static int lastLoggedState = -2;
 	static int lastRequested = -2;
 
+	UpdateLocomotion( self );
+
 	if ( g_forcedState >= 0 && self->m_stateIndexCurrent != g_forcedState ) {
 		if ( lastRequested != g_forcedState ) {
 			mp_log( "[MP] Requesting state %d (current %d)...\n", g_forcedState, self->m_stateIndexCurrent );
@@ -841,6 +1140,7 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 
 	PrePositionPuppet( self );
 	g_origEvilHarryTick( self );   // Animations, state machine.
+	if ( g_autoLocomotion ) ApplyLocomotionAnim( self );
 
 	if ( self->m_stateIndexCurrent != lastLoggedState ) {
 		mp_log( "[MP] Puppet is now in state %d.\n", self->m_stateIndexCurrent );
