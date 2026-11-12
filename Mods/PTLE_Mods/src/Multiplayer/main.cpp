@@ -250,6 +250,19 @@ static void SpawnPuppet( EIHarry* harry )
 
 	mp_log( "[MP] Puppet spawned at 0x%.8X (m_beastTypeName offset 0x%X, expected 0x%X).\n",
 		p, (unsigned) offsetof(EIBeast, m_beastTypeName), (unsigned) EXPECTED_BEASTNAME_OFFSET );
+	mp_log( "[MP] Harry at (%.2f, %.2f, %.2f). header offsets : EICharacter::m_position 0x%X, m_transformMatrix 0x%X, EIBeast::m_position 0x%X, m_rotation 0x%X\n",
+		harry->m_position.x, harry->m_position.y, harry->m_position.z,
+		(unsigned) offsetof(EICharacter, m_position), (unsigned) offsetof(EICharacter, m_transformMatrix),
+		(unsigned) offsetof(EIBeast, m_position), (unsigned) offsetof(EIBeast, m_rotation) );
+
+	// Raw dump of the transform-related area, before we touch anything.
+	const uint32_t ranges[][2] = { { 0x120, 0x1B0 }, { 0x2F0, 0x350 } };
+	for ( int r = 0; r < 2; r++ ) {
+		for ( uint32_t o = ranges[r][0]; o < ranges[r][1]; o += 16 ) {
+			float* f = (float*) ((uint8_t*) p + o);
+			mp_log( "[MP]   +0x%03X : %10.3f %10.3f %10.3f %10.3f\n", o, f[0], f[1], f[2], f[3] );
+		}
+	}
 	LogStateMachine( p );
 }
 
@@ -268,15 +281,60 @@ static void ForgetPuppet()
 	ResetHistory();
 }
 
-static void DrivePuppet( EIEvilHarryP* p )
+// The game's own setters (writing the fields directly isn't enough : the model kept
+// rendering at the spawn point). SetPos also moves the instance in the level's
+// spatial structure (0x62B470), rebuilds the transform (vtable +0x124) and updates
+// the collision object at +0x270. SetRot writes +0x140 and calls vtable +0x120.
+GET_METHOD( 0x60FEA0, void, EICharacter_SetPos, EICharacter*, Vector3f*, bool );
+GET_METHOD( 0x60FFA0, void, EICharacter_SetRot, EICharacter*, Vector3f* );
+
+// Extra offset added to the puppet's position (the autotest uses it so the
+// puppet stands beside Harry instead of inside him).
+static Vector3f g_puppetOffset = { 0.0F, 0.0F, 0.0F };
+
+static bool GetPuppetTargetPosition( Vector3f* out )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
-	if ( !t ) return;
+	if ( !t ) return false;
+	out->x = t->position.x + g_puppetOffset.x;
+	out->y = t->position.y + g_puppetOffset.y;
+	out->z = t->position.z + g_puppetOffset.z;
+	return true;
+}
 
-	p->m_transformMatrix = t->transform;
-	p->EICharacter::m_position = t->position;
-	p->EIBeast::m_position = t->position;
-	p->m_rotationEuler = t->rotationEuler;
+// Raw field access. Spawn-time dump (Mama-Oullo Tower) showed : +0x134 position,
+// +0x140 rotation, +0x14C scale (1,1,1), +0x160 transform matrix with its
+// translation row at +0x190, +0x2FC EIBeast position, +0x310 quaternion.
+// (0x414B10, vtable +0x120, rebuilds the matrix rotation and applies the scale;
+// it does NOT set the translation.)
+#define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
+static const uint32_t BEAST_SCALE = 0x14C;
+
+// Before the beast's own tick : make it think it already is at the target.
+static void PrePositionPuppet( EIEvilHarryP* p )
+{
+	Vector3f pos;
+	if ( GetPuppetTargetPosition( &pos ) ) {
+		p->EIBeast::m_position = pos;
+	}
+}
+
+static void DrivePuppet( EIEvilHarryP* p )
+{
+	Vector3f pos;
+	if ( !GetPuppetTargetPosition( &pos ) ) return;
+
+	const PlayerSnapshot* t = GetPuppetTarget();
+	Vector3f rot = t->rotationEuler;
+
+	p->EIBeast::m_position = pos;
+	EICharacter_SetPos( p, &pos, true );   // Spatial structure, bounds, collision.
+	EICharacter_SetRot( p, &rot );         // Rebuilds rotation + scale of the matrix.
+
+	// Translation row of the transform matrix.
+	p->m_transformMatrix.data[3][0] = pos.x;
+	p->m_transformMatrix.data[3][1] = pos.y;
+	p->m_transformMatrix.data[3][2] = pos.z;
 }
 
 
@@ -383,7 +441,11 @@ static void HandleHotkeys( EIHarry* harry )
 // --------------------------------------------------------------------------------
 GET_METHOD( 0x4B55F0, void, EIHarry_Teleport, EIHarry*, Matrix4f*, bool, float );
 
+GET_METHOD( 0x5EBA90, void, ScheduleWorldLoad, void*, uint32_t, bool );
+static const uint32_t AUTOTEST_LEVEL = 0x239A2165;   // Turtle Monument : open, easy to see.
+
 static bool g_autotest = false;
+static bool g_skipPuppetAI = true;            // Evil Harry's own tick (boss AI) drags it toward the camera.
 static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
 static volatile LONG g_snapPending = 0;
 static char g_snapName[64];
@@ -544,9 +606,11 @@ static DWORD WINAPI AutotestThread( void* )
 static void LogTelemetry( EIHarry* harry, const char* tag )
 {
 	if ( g_puppet ) {
-		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f) puppet (%.1f, %.1f, %.1f) matrix (%.1f, %.1f, %.1f) state %d\n", tag,
+		const Vector3f& r = FIELD( g_puppet, Vector3f, BEAST_SCALE );
+		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f) puppet (%.1f, %.1f, %.1f) scale (%.2f, %.2f, %.2f) matrix (%.1f, %.1f, %.1f) state %d\n", tag,
 			harry->m_position.x, harry->m_position.y, harry->m_position.z,
 			g_puppet->EICharacter::m_position.x, g_puppet->EICharacter::m_position.y, g_puppet->EICharacter::m_position.z,
+			r.x, r.y, r.z,
 			g_puppet->m_transformMatrix.data[3][0], g_puppet->m_transformMatrix.data[3][1], g_puppet->m_transformMatrix.data[3][2],
 			g_puppet->m_stateIndexCurrent );
 	}
@@ -558,11 +622,12 @@ static void LogTelemetry( EIHarry* harry, const char* tag )
 // Runs every Harry tick on the game thread while in autotest mode.
 static void AutotestStep( EIHarry* harry )
 {
-	static const float HOPS[][2] = { { 15, 0 }, { 15, 15 }, { 0, 15 }, { 0, 0 } };
+	static const float HOPS[][2] = { { 8, 0 }, { 0, 8 }, { -8, 0 }, { 0, -8 } };
 	static const int NUM_HOPS = 4;
 	static const int NUM_STATE_PRESSES = 5;   // 4 calm states, then back to free AI.
 
-	static int phase = 0;
+	static int phase = -1;
+	static uint32_t lastLevel = 0;
 	static DWORD phaseStart = 0, lastTelemetry = 0, firstTick = 0;
 	static int step = 0;
 	static bool snapped = false;
@@ -591,11 +656,31 @@ static void AutotestStep( EIHarry* harry )
 
 	switch ( phase )
 	{
+	case -1:  // Go to an open level (same call as the Gizmod "Go to" menu).
+		if ( now - phaseStart < 3000 ) break;
+		mp_log( "[AT] Going to Turtle Monument (from level 0x%.8X).\n", Gizmod::getCurrentLevelCRC() );
+		ScheduleWorldLoad( (void*) 0x917028, AUTOTEST_LEVEL, false );
+		phase = -2; phaseStart = now; lastLevel = Gizmod::getCurrentLevelCRC();
+		break;
+
+	case -2:  // Wait for it to load.
+		if ( Gizmod::getCurrentLevelCRC() == AUTOTEST_LEVEL ) {
+			mp_log( "[AT] Arrived in level 0x%.8X.\n", AUTOTEST_LEVEL );
+			phase = 0; phaseStart = now;
+		}
+		else if ( now - phaseStart > 60000 ) {
+			mp_log( "[AT] FAIL : still in level 0x%.8X after 60s.\n", Gizmod::getCurrentLevelCRC() );
+			InterlockedExchange( &g_autotestDone, 2 );
+		}
+		break;
+
 	case 0:   // Let the level settle (cutscenes are auto-skipped).
 		if ( now - phaseStart < 8000 ) break;
 		LogTelemetry( harry, "before spawn" );
 		RequestSnapshot( "01_before_spawn" );
 		base = harry->m_rigidBodyMatrix;
+		g_skipPuppetAI = true;
+		mp_log( "[AT] Hop test runs with the puppet's AI tick disabled.\n" );
 		SpawnPuppet( harry );
 		if ( !g_puppet ) {
 			mp_log( "[AT] FAIL : puppet did not spawn.\n" );
@@ -612,17 +697,18 @@ static void AutotestStep( EIHarry* harry )
 		}
 		if ( now - phaseStart >= 2500 ) {
 			if ( step < NUM_HOPS ) {
-				Matrix4f m = base;
-				m.data[3][0] += HOPS[step][0];
-				m.data[3][1] += HOPS[step][1];
-				m.data[3][2] += 2.0F;
-				EIHarry_Teleport( harry, &m, false, 1.0F );
-				mp_log( "[AT] Hop %d : teleported Harry by (%.0f, %.0f).\n", step, HOPS[step][0], HOPS[step][1] );
+				// Harry stays still (teleports throw the camera around); the
+				// puppet steps around him instead.
+				g_puppetOffset.x = HOPS[step][0];
+				g_puppetOffset.y = HOPS[step][1];
+				mp_log( "[AT] Hop %d : puppet offset from Harry now (%.0f, %.0f).\n", step, HOPS[step][0], HOPS[step][1] );
 				step++;
 				phaseStart = now; snapped = false;
 			}
 			else {
 				phase = 2; phaseStart = now; step = 0; snapped = false;
+				g_skipPuppetAI = false;
+				mp_log( "[AT] State test runs with the puppet's AI tick enabled.\n" );
 			}
 		}
 		else if ( step > 0 && !snapped && now - phaseStart >= 2300 ) {
@@ -688,6 +774,12 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 		return;
 	}
 
+	if ( g_skipPuppetAI ) {
+		// No AI, no animation : just place it.
+		DrivePuppet( self );
+		return;
+	}
+
 	static int lastLoggedState = -2;
 	static int lastRequested = -2;
 
@@ -700,6 +792,7 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 		self->m_nextState = g_forcedState;
 	}
 
+	PrePositionPuppet( self );
 	g_origEvilHarryTick( self );   // Animations, state machine.
 
 	if ( self->m_stateIndexCurrent != lastLoggedState ) {
@@ -745,6 +838,7 @@ public:
 		char env[8] = { 0, };
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
 			g_autotest = true;
+			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			EnableAutoSkipCutscenes();
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
 		}
