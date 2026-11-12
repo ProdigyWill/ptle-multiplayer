@@ -71,6 +71,7 @@ static Logger* logger() { return Gizmod::getInstance()->getLogger(); }
 // --------------------------------------------------------------------------------
 static FILE* g_logFile = 0;
 static CRITICAL_SECTION g_logLock;
+static char g_logDir[MAX_PATH] = { 0, };
 
 static void OpenLogFile()
 {
@@ -83,6 +84,7 @@ static void OpenLogFile()
 	CreateDirectoryA( path, 0 );
 	strcat_s( path, "\\logs" );
 	CreateDirectoryA( path, 0 );
+	strcpy_s( g_logDir, path );
 	strcat_s( path, "\\multiplayer.log" );
 
 	g_logFile = _fsopen( path, "w", _SH_DENYWR );
@@ -374,6 +376,293 @@ static void HandleHotkeys( EIHarry* harry )
 
 
 // --------------------------------------------------------------------------------
+// Autotest mode (environment variable PTLE_MP_AUTOTEST=1, set by
+// tools\run-autotest.ps1). Presses Enter through the menus, auto-skips
+// cutscenes, then runs a scripted test on the game thread, takes screenshots
+// into logs\shots\ and exits the game. Normal launches are unaffected.
+// --------------------------------------------------------------------------------
+GET_METHOD( 0x4B55F0, void, EIHarry_Teleport, EIHarry*, Matrix4f*, bool, float );
+
+static bool g_autotest = false;
+static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
+static volatile LONG g_snapPending = 0;
+static char g_snapName[64];
+
+static const DWORD AUTOTEST_MENU_TIMEOUT_MS  = 180000;
+static const DWORD AUTOTEST_TOTAL_TIMEOUT_MS = 360000;
+
+static void RequestSnapshot( const char* name )
+{
+	strcpy_s( g_snapName, name );
+	InterlockedExchange( &g_snapPending, 1 );
+}
+
+// Grabs the game window's client area from the screen into logs\shots\<name>.bmp.
+static void TakeSnapshot( const char* name )
+{
+	HWND wnd = *((HWND*) HWND_GAME_WINDOW);
+	if ( !wnd || !g_logDir[0] ) return;
+
+	RECT rc;
+	GetClientRect( wnd, &rc );
+	POINT origin = { 0, 0 };
+	ClientToScreen( wnd, &origin );
+	int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	if ( w <= 0 || h <= 0 ) return;
+
+	HDC screen = GetDC( 0 );
+	HDC mem = CreateCompatibleDC( screen );
+	BITMAPINFO bi; ZeroMemory( &bi, sizeof(bi) );
+	bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = h;   // Bottom-up, as BMP files expect.
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 24;
+	bi.bmiHeader.biCompression = BI_RGB;
+	void* bits = 0;
+	HBITMAP dib = CreateDIBSection( screen, &bi, DIB_RGB_COLORS, &bits, 0, 0 );
+	HGDIOBJ old = SelectObject( mem, dib );
+	BitBlt( mem, 0, 0, w, h, screen, origin.x, origin.y, SRCCOPY | CAPTUREBLT );
+	GdiFlush();
+
+	char path[MAX_PATH];
+	sprintf_s( path, "%s\\shots", g_logDir );
+	CreateDirectoryA( path, 0 );
+	sprintf_s( path, "%s\\shots\\%s.bmp", g_logDir, name );
+
+	DWORD stride = ((w * 3) + 3) & ~3;
+	DWORD imageSize = stride * h;
+	BITMAPFILEHEADER fh; ZeroMemory( &fh, sizeof(fh) );
+	fh.bfType = 0x4D42;
+	fh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+	fh.bfSize = fh.bfOffBits + imageSize;
+
+	FILE* f = 0;
+	if ( fopen_s( &f, path, "wb" ) == 0 && f ) {
+		fwrite( &fh, sizeof(fh), 1, f );
+		fwrite( &bi.bmiHeader, sizeof(BITMAPINFOHEADER), 1, f );
+		fwrite( bits, imageSize, 1, f );
+		fclose( f );
+		mp_log( "[AT] Screenshot : shots\\%s.bmp\n", name );
+	}
+
+	SelectObject( mem, old );
+	DeleteObject( dib );
+	DeleteDC( mem );
+	ReleaseDC( 0, screen );
+}
+
+static void TapKey( WORD vk )
+{
+	INPUT in[2]; ZeroMemory( in, sizeof(in) );
+	WORD scan = (WORD) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC );
+	in[0].type = INPUT_KEYBOARD;
+	in[0].ki.wScan = scan;
+	in[0].ki.dwFlags = KEYEVENTF_SCANCODE;
+	in[1] = in[0];
+	in[1].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+
+	SendInput( 1, &in[0], sizeof(INPUT) );
+	Sleep( 100 );
+	SendInput( 1, &in[1], sizeof(INPUT) );
+}
+
+// Same patch as CheatLab's "Auto Skip Cutscene".
+static void EnableAutoSkipCutscenes()
+{
+	static float skipTime = 0.1F;
+	injector::MakeJMP( 0x42FE93, 0x42FF45 );
+	injector::WriteMemory( 0x42FE84, &skipTime, true );
+}
+
+static DWORD WINAPI AutotestThread( void* )
+{
+	DWORD start = GetTickCount();
+	mp_log( "[AT] Autotest mode on.\n" );
+
+	HWND wnd = 0;
+	while ( !(wnd = *((HWND*) HWND_GAME_WINDOW)) ) {
+		if ( GetTickCount() - start > 60000 ) {
+			mp_log( "[AT] FAIL : game window never appeared.\n" );
+			ExitProcess( 2 );
+		}
+		Sleep( 200 );
+	}
+	Sleep( 3000 );
+
+	// Menus : keep pressing Enter until Harry starts ticking.
+	int presses = 0;
+	while ( g_harryTicks == 0 ) {
+		if ( GetTickCount() - start > AUTOTEST_MENU_TIMEOUT_MS ) {
+			TakeSnapshot( "fail_menu_timeout" );
+			mp_log( "[AT] FAIL : never reached gameplay after %d Enter presses.\n", presses );
+			ExitProcess( 2 );
+		}
+		if ( presses % 2 == 0 ) {
+			char name[32];
+			sprintf_s( name, "menu_%02d", presses );
+			TakeSnapshot( name );
+		}
+		SetForegroundWindow( wnd );
+		Sleep( 100 );
+		if ( GameHasFocus() ) {
+			// Title screen wants Esc ("Press [Esc] to Begin"), menus want Enter.
+			// Esc again every 10 presses in case we fell back to the title.
+			WORD key = (presses % 10 == 0) ? VK_ESCAPE : VK_RETURN;
+			TapKey( key );
+			mp_log( "[AT] Pressed %s (#%d).\n", key == VK_ESCAPE ? "Esc" : "Enter", presses );
+			presses++;
+		}
+		else if ( presses % 5 == 0 ) {
+			// Never inject keys into another application.
+			mp_log( "[AT] Game isn't the active window, not pressing Enter (click the game window).\n" );
+		}
+		Sleep( 1500 );
+	}
+	mp_log( "[AT] Gameplay reached after %d Enter presses (%.1fs).\n", presses, (GetTickCount() - start) / 1000.0F );
+
+	// The scripted part runs on the game thread (AutotestStep). Service screenshots.
+	while ( g_autotestDone == 0 ) {
+		if ( GetTickCount() - start > AUTOTEST_TOTAL_TIMEOUT_MS ) {
+			TakeSnapshot( "fail_total_timeout" );
+			mp_log( "[AT] FAIL : test script timed out.\n" );
+			ExitProcess( 2 );
+		}
+		if ( InterlockedExchange( &g_snapPending, 0 ) ) {
+			TakeSnapshot( g_snapName );
+		}
+		Sleep( 30 );
+	}
+
+	if ( InterlockedExchange( &g_snapPending, 0 ) ) TakeSnapshot( g_snapName );
+	mp_log( "[AT] %s\n", g_autotestDone == 1 ? "RESULT : PASS" : "RESULT : FAIL" );
+	Sleep( 300 );
+	ExitProcess( g_autotestDone == 1 ? 0 : 2 );
+	return 0;
+}
+
+static void LogTelemetry( EIHarry* harry, const char* tag )
+{
+	if ( g_puppet ) {
+		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f) puppet (%.1f, %.1f, %.1f) matrix (%.1f, %.1f, %.1f) state %d\n", tag,
+			harry->m_position.x, harry->m_position.y, harry->m_position.z,
+			g_puppet->EICharacter::m_position.x, g_puppet->EICharacter::m_position.y, g_puppet->EICharacter::m_position.z,
+			g_puppet->m_transformMatrix.data[3][0], g_puppet->m_transformMatrix.data[3][1], g_puppet->m_transformMatrix.data[3][2],
+			g_puppet->m_stateIndexCurrent );
+	}
+	else {
+		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f), no puppet\n", tag, harry->m_position.x, harry->m_position.y, harry->m_position.z );
+	}
+}
+
+// Runs every Harry tick on the game thread while in autotest mode.
+static void AutotestStep( EIHarry* harry )
+{
+	static const float HOPS[][2] = { { 15, 0 }, { 15, 15 }, { 0, 15 }, { 0, 0 } };
+	static const int NUM_HOPS = 4;
+	static const int NUM_STATE_PRESSES = 5;   // 4 calm states, then back to free AI.
+
+	static int phase = 0;
+	static DWORD phaseStart = 0, lastTelemetry = 0, firstTick = 0;
+	static int step = 0;
+	static bool snapped = false;
+	static int ticksThisSecond = 0;
+	static DWORD secondStart = 0;
+	static Matrix4f base;
+
+	if ( g_autotestDone ) return;
+
+	DWORD now = GetTickCount();
+	if ( !firstTick ) { firstTick = now; secondStart = now; phaseStart = now; }
+
+	// Tick rate, logged once.
+	if ( secondStart ) {
+		ticksThisSecond++;
+		if ( now - secondStart >= 1000 ) {
+			mp_log( "[AT] Harry ticks per second : %d\n", ticksThisSecond );
+			secondStart = 0;
+		}
+	}
+
+	if ( g_puppet && now - lastTelemetry >= 500 ) {
+		LogTelemetry( harry, "tele" );
+		lastTelemetry = now;
+	}
+
+	switch ( phase )
+	{
+	case 0:   // Let the level settle (cutscenes are auto-skipped).
+		if ( now - phaseStart < 8000 ) break;
+		LogTelemetry( harry, "before spawn" );
+		RequestSnapshot( "01_before_spawn" );
+		base = harry->m_rigidBodyMatrix;
+		SpawnPuppet( harry );
+		if ( !g_puppet ) {
+			mp_log( "[AT] FAIL : puppet did not spawn.\n" );
+			InterlockedExchange( &g_autotestDone, 2 );
+			return;
+		}
+		phase = 1; phaseStart = now; step = 0; snapped = false;
+		break;
+
+	case 1:   // Hop Harry around a square; the puppet should trail behind.
+		if ( now - phaseStart >= 500 && !snapped && step == 0 ) {
+			RequestSnapshot( "02_after_spawn" );
+			snapped = true;
+		}
+		if ( now - phaseStart >= 2500 ) {
+			if ( step < NUM_HOPS ) {
+				Matrix4f m = base;
+				m.data[3][0] += HOPS[step][0];
+				m.data[3][1] += HOPS[step][1];
+				m.data[3][2] += 2.0F;
+				EIHarry_Teleport( harry, &m, false, 1.0F );
+				mp_log( "[AT] Hop %d : teleported Harry by (%.0f, %.0f).\n", step, HOPS[step][0], HOPS[step][1] );
+				step++;
+				phaseStart = now; snapped = false;
+			}
+			else {
+				phase = 2; phaseStart = now; step = 0; snapped = false;
+			}
+		}
+		else if ( step > 0 && !snapped && now - phaseStart >= 2300 ) {
+			char name[32];
+			sprintf_s( name, "03_hop_%d", step - 1 );
+			RequestSnapshot( name );
+			snapped = true;
+		}
+		break;
+
+	case 2:   // Cycle the calm F6 states.
+		if ( step == 0 || now - phaseStart >= 3000 ) {
+			if ( step >= NUM_STATE_PRESSES ) {
+				phase = 3; phaseStart = now;
+				break;
+			}
+			InterlockedIncrement( &g_reqState );   // Same as pressing F6.
+			step++;
+			phaseStart = now; snapped = false;
+		}
+		else if ( !snapped && now - phaseStart >= 2500 ) {
+			char name[32];
+			sprintf_s( name, "04_state_press_%d", step );
+			RequestSnapshot( name );
+			snapped = true;
+		}
+		break;
+
+	case 3:
+		if ( now - phaseStart < 1000 ) break;
+		LogTelemetry( harry, "final" );
+		RequestSnapshot( "05_final" );
+		InterlockedExchange( &g_autotestDone, 1 );
+		break;
+	}
+}
+
+
+
+// --------------------------------------------------------------------------------
 // Tick hooks. __fastcall receives "this" in ECX like __thiscall (EDX is unused),
 // so these can replace the vtable entries directly.
 // --------------------------------------------------------------------------------
@@ -388,6 +677,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 	if ( self != Gizmod::getHarry() ) return;
 
 	PushLocalSnapshot( self );
+	if ( g_autotest ) AutotestStep( self );
 	HandleHotkeys( self );
 }
 
@@ -451,6 +741,13 @@ public:
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
 
 		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
+
+		char env[8] = { 0, };
+		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
+			g_autotest = true;
+			EnableAutoSkipCutscenes();
+			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
+		}
 
 		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F5 spawn, F6 state, F7 delay.\n",
 			(uint32_t) g_origHarryTick, (uint32_t) g_origEvilHarryTick );
