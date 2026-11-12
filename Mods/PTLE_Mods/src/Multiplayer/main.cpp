@@ -348,15 +348,21 @@ static bool  g_autoLocomotion = true;   // F6 switches to hand-forced states.
 static int   g_idleState = -1;
 static int   g_runLayer = -1;                // Animation layers (see below).
 static int   g_idleLayer = -1;
+static int   g_sprintLayer = -1;
 static float g_velX = 0.0F, g_velY = 0.0F;   // Smoothed, units per tick.
 static float g_moveSpeed = 0.0F;
 static float g_heading = 0.0F;               // Direction of travel, atan2( y, x ).
 static bool  g_moving = false;
+static bool  g_sprinting = false;
+static float g_peakSpeed = 0.0F;             // Fastest speed of the current move (logged).
 static bool  g_haveLastTarget = false;
 static Vector3f g_lastTarget;
 
 static const float RUN_START_SPEED = 0.05F;  // Units per tick (hysteresis).
 static const float RUN_STOP_SPEED  = 0.02F;
+// Harry's normal run measured about 0.36/tick (peaks near 0.44 on slopes).
+static const float SPRINT_START_SPEED = 0.50F;
+static const float SPRINT_STOP_SPEED  = 0.45F;
 static const float TELEPORT_DIST   = 5.0F;   // Bigger jumps aren't movement.
 
 // Angle of the model's forward axis in its own frame (0 = +X, pi/2 = +Y).
@@ -367,6 +373,8 @@ static void ResetLocomotion()
 {
 	g_velX = g_velY = g_moveSpeed = 0.0F;
 	g_moving = false;
+	g_sprinting = false;
+	g_peakSpeed = 0.0F;
 	g_haveLastTarget = false;
 }
 
@@ -392,8 +400,21 @@ static void UpdateLocomotion( EIEvilHarryP* p )
 	if ( g_moving && g_moveSpeed < RUN_STOP_SPEED ) g_moving = false;
 	else if ( !g_moving && g_moveSpeed > RUN_START_SPEED ) g_moving = true;
 	if ( g_moving != wasMoving ) {
-		mp_log( "[MP] Puppet %s (speed %.3f/tick, heading %.0f deg).\n",
-			g_moving ? "starts moving" : "stops", g_moveSpeed, g_heading * 180.0F / MP_PI );
+		if ( g_moving ) {
+			mp_log( "[MP] Puppet starts moving (speed %.3f/tick, heading %.0f deg).\n", g_moveSpeed, g_heading * 180.0F / MP_PI );
+			g_peakSpeed = 0.0F;
+		}
+		else {
+			mp_log( "[MP] Puppet stops (top speed %.3f/tick).\n", g_peakSpeed );
+		}
+	}
+	if ( g_moving && g_moveSpeed > g_peakSpeed ) g_peakSpeed = g_moveSpeed;
+
+	bool wasSprinting = g_sprinting;
+	if ( !g_moving || (g_sprinting && g_moveSpeed < SPRINT_STOP_SPEED) ) g_sprinting = false;
+	else if ( !g_sprinting && g_moveSpeed > SPRINT_START_SPEED ) g_sprinting = true;
+	if ( g_sprinting != wasSprinting && g_moving ) {
+		mp_log( "[MP] Puppet %s (speed %.3f/tick).\n", g_sprinting ? "sprints" : "back to running", g_moveSpeed );
 	}
 
 	// The state machine always stays in a calm idle state : forcing boss-fight
@@ -442,12 +463,13 @@ static void PlayAnimLayer( EIEvilHarryP* p, int layer )
 static void ApplyLocomotionAnim( EIEvilHarryP* p )
 {
 	static int overridden = 0;
-	int wanted = g_moving ? g_runLayer : g_idleLayer;
+	int wanted = g_idleLayer;
+	if ( g_moving ) wanted = (g_sprinting && g_sprintLayer >= 0) ? g_sprintLayer : g_runLayer;
 	int current = FIELD( p, int, BEAST_CUR_LAYER );
 	if ( wanted < 0 || wanted == current ) return;
 
 	// The idle state may re-play its own animation; count it to spot fights.
-	if ( (current == g_idleLayer || current == g_runLayer) == false ) {
+	if ( (current == g_idleLayer || current == g_runLayer || current == g_sprintLayer) == false ) {
 		if ( ++overridden <= 5 ) mp_log( "[MP] Puppet anim layer was %d, playing %d.\n", current, wanted );
 	}
 	PlayAnimLayer( p, wanted );
@@ -501,6 +523,10 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 	// ("runner" is hunched, "superrun" is a dive).
 	SetRunAnimation( p, 0 );
 	if ( g_runLayer < 0 ) SetRunAnimation( p, "chase player" );
+
+	// Above sprint speed : the "superrun to spot to ice pick" state's clip.
+	g_sprintLayer = GetStateAnimLayer( p, FindStateIndex( p, "superrun to spot to ice pick" ) );
+	mp_log( "[MP] Sprint animation : layer %d (above %.2f/tick).\n", g_sprintLayer, SPRINT_START_SPEED );
 
 	// Face where Harry faces. Walking showed his rigid body's row 1 (local +Y)
 	// points where he moves; m_transformMatrix is turned 180 degrees from that.
@@ -909,12 +935,11 @@ static void AutotestStep( EIHarry* harry )
 	static const char* const WALK_KEY_NAMES[] = { "w", "a", "s", "d" };
 	static const int NUM_WALK_KEYS = 4;
 	static const LONG WALK_HOLD_MS = 1500;
-	static const char* const RUN_CANDIDATES[] = { 0, "runner", "chase player", "run to spot to ice pick", "superrun to spot to ice pick" };
-	static const int NUM_RUN_CANDIDATES = 5;
+	static const float CIRCLE_SPEEDS[] = { 0.30F, 0.65F };   // Run, then sprint (units per tick).
+	static const int NUM_CIRCLE_SPEEDS = 2;
 	static const char* const IDLE_CANDIDATES[] = { 0, "rest left", "rest right", "i win", "gloat hit", "admire hit" };
-	static const int NUM_IDLE_CANDIDATES = 6;
+	static const int NUM_IDLE_CANDIDATES = 6;   // Phase 4 (idle tour) is no longer scheduled.
 	static const float CIRCLE_RADIUS = 8.0F;
-	static const float CIRCLE_SPEED  = 0.15F;   // Units per tick.
 	static float circleAngle = 0.0F;
 	static DWORD lastWalkLog = 0;
 	static Vector3f lastHarryPos;
@@ -1038,20 +1063,19 @@ static void AutotestStep( EIHarry* harry )
 		}
 		break;
 
-	case 2:   // Circle the puppet around Harry once per run-state candidate.
+	case 2:   // Circle the puppet around Harry : one lap at run speed, one at sprint speed.
 		if ( step == 0 || now - phaseStart >= 4500 ) {
-			if ( step >= NUM_RUN_CANDIDATES ) {
+			if ( step >= NUM_CIRCLE_SPEEDS ) {
 				g_puppetOffset.x = 6.0F; g_puppetOffset.y = 0.0F;
 				mp_log( "[AT] Circle done, puppet stands still again.\n" );
-				phase = 4; phaseStart = now; step = 0; snapped = false;
+				phase = 1; phaseStart = now; step = 0; snapped = false;
 				break;
 			}
-			mp_log( "[AT] Circle %d : %s.\n", step, RUN_CANDIDATES[step] ? RUN_CANDIDATES[step] : "quickdata move anim" );
-			SetRunAnimation( g_puppet, RUN_CANDIDATES[step] );
-			if ( g_runLayer < 0 ) { phaseStart = now - 4500; step++; break; }   // Not available, skip.
+			mp_log( "[AT] Circle %d at %.2f/tick (%s expected).\n", step, CIRCLE_SPEEDS[step],
+				CIRCLE_SPEEDS[step] > SPRINT_START_SPEED ? "sprint" : "run" );
 			step++; phaseStart = now; snapped = false;
 		}
-		circleAngle += CIRCLE_SPEED / CIRCLE_RADIUS;
+		circleAngle += CIRCLE_SPEEDS[step - 1] / CIRCLE_RADIUS;
 		g_puppetOffset.x = CIRCLE_RADIUS * cosf( circleAngle );
 		g_puppetOffset.y = CIRCLE_RADIUS * sinf( circleAngle );
 		if ( (!snapped && now - phaseStart >= 2000) || (snapped && now - phaseStart >= 4000 && now - phaseStart < 4000 + 60) ) {
