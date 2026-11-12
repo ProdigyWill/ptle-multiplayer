@@ -146,6 +146,7 @@ struct PlayerSnapshot
 	Matrix4f transform;
 	Vector3f position;
 	Vector3f rotationEuler;
+	bool onGround;                               // EICharacter::m_onGround (CheatLab writes it too).
 };
 
 static const int HISTORY_SIZE = 256;
@@ -168,6 +169,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 	s.transform     = harry->m_transformMatrix;
 	s.position      = harry->m_position;
 	s.rotationEuler = harry->m_rotationEuler;
+	s.onGround      = harry->m_onGround;
 
 	g_historyHead = (g_historyHead + 1) % HISTORY_SIZE;
 	if ( g_historyCount < HISTORY_SIZE ) g_historyCount++;
@@ -357,6 +359,12 @@ static bool  g_sprinting = false;
 static float g_peakSpeed = 0.0F;             // Fastest speed of the current move (logged).
 static bool  g_haveLastTarget = false;
 static Vector3f g_lastTarget;
+static int   g_airLayer = -1;
+static bool  g_airborne = false;
+static int   g_airTicks = 0;
+static float g_airStartZ = 0.0F;
+static const int AIRBORNE_MIN_TICKS = 6;   // Slopes and bumps blip for up to ~5 ticks.
+static const float JUMP_RISE_SPEED  = 0.10F;   // Units per tick upward while off the ground.
 
 static const float RUN_START_SPEED = 0.05F;  // Units per tick (hysteresis).
 static const float RUN_STOP_SPEED  = 0.02F;
@@ -375,6 +383,8 @@ static void ResetLocomotion()
 	g_moving = false;
 	g_sprinting = false;
 	g_peakSpeed = 0.0F;
+	g_airborne = false;
+	g_airTicks = 0;
 	g_haveLastTarget = false;
 }
 
@@ -409,6 +419,28 @@ static void UpdateLocomotion( EIEvilHarryP* p )
 		}
 	}
 	if ( g_moving && g_moveSpeed > g_peakSpeed ) g_peakSpeed = g_moveSpeed;
+
+	// Airborne : the replayed player has been off the ground for a few ticks
+	// (ignores one-tick blips on bumps and slopes). Landing is immediate.
+	const PlayerSnapshot* t = GetPuppetTarget();
+	bool wasAirborne = g_airborne;
+	g_airTicks = (t && !t->onGround) ? g_airTicks + 1 : 0;
+	// A real jump rises fast from its first tick (~0.25/tick) : switch at once then,
+	// instead of waiting AIRBORNE_MIN_TICKS (which lands near the top of the jump).
+	static float prevZ = 0.0F;
+	float dz = pos.z - prevZ;
+	prevZ = pos.z;
+	if ( g_airTicks == 0 ) g_airborne = false;
+	else if ( g_airTicks >= AIRBORNE_MIN_TICKS || dz > JUMP_RISE_SPEED ) g_airborne = true;
+	if ( g_airborne != wasAirborne ) {
+		if ( g_airborne ) {
+			g_airStartZ = pos.z;
+			mp_log( "[MP] Puppet leaves the ground (z %.2f).\n", pos.z );
+		}
+		else {
+			mp_log( "[MP] Puppet lands (z %.2f, %.2f from take-off).\n", pos.z, pos.z - g_airStartZ );
+		}
+	}
 
 	bool wasSprinting = g_sprinting;
 	if ( !g_moving || (g_sprinting && g_moveSpeed < SPRINT_STOP_SPEED) ) g_sprinting = false;
@@ -464,12 +496,13 @@ static void ApplyLocomotionAnim( EIEvilHarryP* p )
 {
 	static int overridden = 0;
 	int wanted = g_idleLayer;
-	if ( g_moving ) wanted = (g_sprinting && g_sprintLayer >= 0) ? g_sprintLayer : g_runLayer;
+	if ( g_airborne && g_airLayer >= 0 ) wanted = g_airLayer;
+	else if ( g_moving ) wanted = (g_sprinting && g_sprintLayer >= 0) ? g_sprintLayer : g_runLayer;
 	int current = FIELD( p, int, BEAST_CUR_LAYER );
 	if ( wanted < 0 || wanted == current ) return;
 
 	// The idle state may re-play its own animation; count it to spot fights.
-	if ( (current == g_idleLayer || current == g_runLayer || current == g_sprintLayer) == false ) {
+	if ( (current == g_idleLayer || current == g_runLayer || current == g_sprintLayer || current == g_airLayer) == false ) {
 		if ( ++overridden <= 5 ) mp_log( "[MP] Puppet anim layer was %d, playing %d.\n", current, wanted );
 	}
 	PlayAnimLayer( p, wanted );
@@ -503,6 +536,12 @@ static void SetIdleAnimation( EIEvilHarryP* p, const char* stateName )
 	}
 }
 
+static void SetAirAnimation( EIEvilHarryP* p, const char* stateName )
+{
+	g_airLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+	mp_log( "[MP] Air animation : \"%s\" state's anim, layer %d.\n", stateName, g_airLayer );
+}
+
 static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 {
 	ResetLocomotion();
@@ -527,6 +566,9 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 	// Above sprint speed : the "superrun to spot to ice pick" state's clip.
 	g_sprintLayer = GetStateAnimLayer( p, FindStateIndex( p, "superrun to spot to ice pick" ) );
 	mp_log( "[MP] Sprint animation : layer %d (above %.2f/tick).\n", g_sprintLayer, SPRINT_START_SPEED );
+
+	// In the air (jumping, falling) : the "falling" state's clip.
+	SetAirAnimation( p, "falling" );
 
 	// Face where Harry faces. Walking showed his rigid body's row 1 (local +Y)
 	// points where he moves; m_transformMatrix is turned 180 degrees from that.
@@ -698,6 +740,7 @@ static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
 static volatile LONG g_snapPending = 0;
 static volatile LONG g_holdKey = 0;           // Virtual key the autotest thread should hold...
 static volatile LONG g_holdMs = 0;            // ...for this long.
+static volatile LONG g_tapKey = 0;            // Virtual key the autotest thread should tap.
 static char g_snapName[64];
 
 static const DWORD AUTOTEST_MENU_TIMEOUT_MS  = 180000;
@@ -797,6 +840,17 @@ static void EnableAutoSkipCutscenes()
 	injector::WriteMemory( 0x42FE84, &skipTime, true );
 }
 
+// Brings the game back in front (a click elsewhere steals focus mid-test) and
+// waits up to a second for it. Keys are only ever sent to the game itself.
+static bool EnsureGameFocus( HWND wnd )
+{
+	for ( int i = 0; i < 10 && !GameHasFocus(); i++ ) {
+		SetForegroundWindow( wnd );
+		Sleep( 100 );
+	}
+	return GameHasFocus();
+}
+
 static DWORD WINAPI AutotestThread( void* )
 {
 	DWORD start = GetTickCount();
@@ -873,9 +927,15 @@ static DWORD WINAPI AutotestThread( void* )
 	WORD heldKey = 0;
 	DWORD releaseAt = 0;
 	while ( g_autotestDone == 0 ) {
+		LONG tap = InterlockedExchange( &g_tapKey, 0 );
+		if ( tap ) {
+			if ( EnsureGameFocus( wnd ) ) TapKey( (WORD) tap );
+			else mp_log( "[AT] Game isn't the active window, not tapping key 0x%X.\n", tap );
+		}
+
 		LONG k = InterlockedExchange( &g_holdKey, 0 );
 		if ( k && !heldKey ) {
-			if ( GameHasFocus() ) {
+			if ( EnsureGameFocus( wnd ) ) {
 				SendKey( (WORD) k, true );
 				heldKey = (WORD) k;
 				releaseAt = GetTickCount() + g_holdMs;
@@ -935,6 +995,11 @@ static void AutotestStep( EIHarry* harry )
 	static const char* const WALK_KEY_NAMES[] = { "w", "a", "s", "d" };
 	static const int NUM_WALK_KEYS = 4;
 	static const LONG WALK_HOLD_MS = 1500;
+	static const char* const AIR_CANDIDATES[] = { "falling", "off screen drop", "knocked back" };
+	static const int  JUMP_CLIP[]    = { 0, 1, 2, 0 };
+	static const bool JUMP_RUNNING[] = { false, false, false, true };
+	static const int  NUM_JUMPS = 4;
+	static bool jumped = false;
 	static const float CIRCLE_SPEEDS[] = { 0.30F, 0.65F };   // Run, then sprint (units per tick).
 	static const int NUM_CIRCLE_SPEEDS = 2;
 	static const char* const IDLE_CANDIDATES[] = { 0, "rest left", "rest right", "i win", "gloat hit", "admire hit" };
@@ -1057,11 +1122,49 @@ static void AutotestStep( EIHarry* harry )
 					step++; phaseStart = now; snapped = false;
 				}
 				else {
-					phase = 3; phaseStart = now;
+					phase = 5; phaseStart = now; step = 0; snapped = false;
 				}
 			}
 		}
 		break;
+
+	case 5:   // Jumps : standing jumps with each air-clip candidate, then a running jump.
+	{
+		// Harry's own ground flag, to check m_onGround is real.
+		static bool harryWasOnGround = true;
+		if ( harry->m_onGround != harryWasOnGround ) {
+			mp_log( "[AT] Harry %s (z %.2f).\n", harry->m_onGround ? "is on the ground" : "is in the air", harry->m_position.z );
+			harryWasOnGround = harry->m_onGround;
+		}
+
+		if ( step == 0 || now - phaseStart >= 4000 ) {
+			if ( step >= NUM_JUMPS ) {
+				SetAirAnimation( g_puppet, AIR_CANDIDATES[0] );
+				phase = 3; phaseStart = now;
+				break;
+			}
+			SetAirAnimation( g_puppet, AIR_CANDIDATES[JUMP_CLIP[step]] );
+			if ( JUMP_RUNNING[step] ) {
+				InterlockedExchange( &g_holdMs, 2000 );
+				InterlockedExchange( &g_holdKey, 'W' );
+			}
+			mp_log( "[AT] Jump %d : %s jump, air clip \"%s\".\n", step, JUMP_RUNNING[step] ? "running" : "standing", AIR_CANDIDATES[JUMP_CLIP[step]] );
+			step++; phaseStart = now; snapped = false; jumped = false;
+		}
+		if ( !jumped && now - phaseStart >= (DWORD) (JUMP_RUNNING[step - 1] ? 500 : 0) ) {
+			InterlockedExchange( &g_tapKey, VK_NUMPAD2 );   // Jump (registry binding k0_8 = scan code 80, numpad 2).
+			jumped = true;
+		}
+		// The puppet replays ~1s behind : catch it mid-air.
+		int ms = (int) (now - phaseStart) - (JUMP_RUNNING[step - 1] ? 500 : 0);
+		if ( (!snapped && ms >= 1300) || (snapped && ms >= 1600 && ms < 1660) ) {
+			char name[40];
+			sprintf_s( name, "06_jump_%d_%c", step - 1, snapped ? 'b' : 'a' );
+			RequestSnapshot( name );
+			snapped = true;
+		}
+		break;
+	}
 
 	case 2:   // Circle the puppet around Harry : one lap at run speed, one at sprint speed.
 		if ( step == 0 || now - phaseStart >= 4500 ) {
