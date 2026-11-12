@@ -147,6 +147,8 @@ struct PlayerSnapshot
 	Vector3f position;
 	Vector3f rotationEuler;
 	bool onGround;                               // EICharacter::m_onGround (CheatLab writes it too).
+	uint32_t clipCRC;                            // Animation clip the player is playing (0 = unknown).
+	float clipWeight;
 };
 
 static const int HISTORY_SIZE = 256;
@@ -163,6 +165,54 @@ static void ResetHistory()
 	g_historyCount = 0;
 }
 
+// --------------------------------------------------------------------------------
+// Animation clips. EAnimController (+0xB4 in every character) keeps its layers in a
+// map at +0x2C keyed by layer index (lookup 0x6F3A50). A layer (0xA0 bytes) holds
+// its clip instance at +0x78 (clip CRC at +0x0C) and its weight at +0x4C.
+// 0x61CAD0( layer, clipCRC ) loads a clip into a layer (creating the layer).
+// --------------------------------------------------------------------------------
+GET_METHOD( 0x6F3A50, int,  AnimMap_Find,     void*, int, void** );
+GET_METHOD( 0x61CAD0, void, AnimCtrl_SetClip, EAnimController*, int, uint32_t );
+
+static const uint32_t CHAR_ANIMCTRL   = 0xB4;
+static const uint32_t ANIMCTRL_LAYERS = 0x2C;
+static const uint32_t LAYER_CLIP      = 0x78;
+static const uint32_t LAYER_WEIGHT    = 0x4C;
+static const uint32_t CLIP_CRC        = 0x0C;
+static const int      MAX_LAYER_SCAN  = 256;
+
+static uint8_t* GetAnimLayer( EICharacter* c, int key )
+{
+	void* layer = 0;
+	void* map = (uint8_t*) c + CHAR_ANIMCTRL + ANIMCTRL_LAYERS;
+	if ( !AnimMap_Find( map, key, &layer ) ) return 0;
+	return (uint8_t*) layer;
+}
+
+static uint32_t GetLayerClipCRC( uint8_t* layer )
+{
+	uint8_t* clip = *(uint8_t**) (layer + LAYER_CLIP);
+	return clip ? *(uint32_t*) (clip + CLIP_CRC) : 0;
+}
+
+// The clip a character is mostly showing : its highest-weight layer.
+static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight )
+{
+	uint32_t best = 0;
+	float bestWeight = 0.01F;
+	int bestLayer = -1;
+	for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
+		uint8_t* layer = GetAnimLayer( c, i );
+		if ( !layer ) continue;
+		float w = *(float*) (layer + LAYER_WEIGHT);
+		uint32_t crc = GetLayerClipCRC( layer );
+		if ( crc && w > bestWeight ) { best = crc; bestWeight = w; bestLayer = i; }
+	}
+	if ( outLayer ) *outLayer = bestLayer;
+	if ( outWeight ) *outWeight = bestWeight;
+	return best;
+}
+
 static void PushLocalSnapshot( EIHarry* harry )
 {
 	PlayerSnapshot& s = g_history[g_historyHead];
@@ -170,6 +220,15 @@ static void PushLocalSnapshot( EIHarry* harry )
 	s.position      = harry->m_position;
 	s.rotationEuler = harry->m_rotationEuler;
 	s.onGround      = harry->m_onGround;
+
+	int layer = -1;
+	s.clipCRC = GetPlayingClip( harry, &layer, &s.clipWeight );
+	static uint32_t lastClip = 0;
+	if ( s.clipCRC != lastClip ) {
+		mp_log( "[MP] Harry plays clip 0x%.8X (layer %d, weight %.2f, %s).\n",
+			s.clipCRC, layer, s.clipWeight, harry->m_onGround ? "ground" : "air" );
+		lastClip = s.clipCRC;
+	}
 
 	g_historyHead = (g_historyHead + 1) % HISTORY_SIZE;
 	if ( g_historyCount < HISTORY_SIZE ) g_historyCount++;
@@ -492,9 +551,36 @@ static void PlayAnimLayer( EIEvilHarryP* p, int layer )
 	FIELD( p, int, BEAST_CUR_LAYER ) = layer;
 }
 
+// Mirroring : the puppet plays the replayed player's own clip (Harry's jump, climb,
+// etc. : Evil Harry's state clips have no ordinary jump). Two spare layers take
+// turns so the old clip can fade out while the new one fades in.
+static bool g_mirrorClips = true;
+static const int MIRROR_LAYERS[2] = { 200, 201 };
+static int g_mirrorSlot = 0;
+static uint32_t g_mirrorClip = 0;
+
+static bool ApplyMirroredClip( EIEvilHarryP* p )
+{
+	const PlayerSnapshot* t = GetPuppetTarget();
+	if ( !g_mirrorClips || !t || !t->clipCRC ) return false;
+
+	int current = FIELD( p, int, BEAST_CUR_LAYER );
+	if ( t->clipCRC == g_mirrorClip && current == MIRROR_LAYERS[g_mirrorSlot] ) return true;
+
+	EAnimController* ctrl = &FIELD( p, EAnimController, BEAST_ANIMCTRL );
+	int next = (current == MIRROR_LAYERS[g_mirrorSlot]) ? 1 - g_mirrorSlot : g_mirrorSlot;
+	AnimCtrl_SetClip( ctrl, MIRROR_LAYERS[next], t->clipCRC );
+	PlayAnimLayer( p, MIRROR_LAYERS[next] );
+	g_mirrorSlot = next;
+	g_mirrorClip = t->clipCRC;
+	return true;
+}
+
 static void ApplyLocomotionAnim( EIEvilHarryP* p )
 {
 	static int overridden = 0;
+	if ( ApplyMirroredClip( p ) ) return;
+
 	int wanted = g_idleLayer;
 	if ( g_airborne && g_airLayer >= 0 ) wanted = g_airLayer;
 	else if ( g_moving ) wanted = (g_sprinting && g_sprintLayer >= 0) ? g_sprintLayer : g_runLayer;
@@ -546,6 +632,8 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 {
 	ResetLocomotion();
 	g_autoLocomotion = true;
+	g_mirrorClip = 0;
+	g_mirrorSlot = 0;
 	g_idleState = FindStateIndex( p, "idle left" );
 	g_idleLayer = GetStateAnimLayer( p, g_idleState );
 
@@ -845,7 +933,14 @@ static void EnableAutoSkipCutscenes()
 static bool EnsureGameFocus( HWND wnd )
 {
 	for ( int i = 0; i < 10 && !GameHasFocus(); i++ ) {
+		// Windows ignores SetForegroundWindow from a background thread unless it
+		// shares input with the current foreground window, so attach briefly.
+		DWORD fgThread = GetWindowThreadProcessId( GetForegroundWindow(), 0 );
+		DWORD me = GetCurrentThreadId();
+		bool attached = fgThread && fgThread != me && AttachThreadInput( me, fgThread, TRUE );
+		BringWindowToTop( wnd );
 		SetForegroundWindow( wnd );
+		if ( attached ) AttachThreadInput( me, fgThread, FALSE );
 		Sleep( 100 );
 	}
 	return GameHasFocus();
@@ -879,9 +974,7 @@ static DWORD WINAPI AutotestThread( void* )
 			sprintf_s( name, "menu_%02d", presses );
 			TakeSnapshot( name );
 		}
-		SetForegroundWindow( wnd );
-		Sleep( 100 );
-		if ( GameHasFocus() ) {
+		if ( EnsureGameFocus( wnd ) ) {
 			// Title screen wants Esc ("Press [Esc] to Begin"), menus want Enter.
 			// Esc again every 10 presses in case we fell back to the title.
 			WORD key = (presses % 10 == 0) ? VK_ESCAPE : VK_RETURN;
@@ -1223,9 +1316,18 @@ static void AutotestStep( EIHarry* harry )
 // Tick hooks. __fastcall receives "this" in ECX like __thiscall (EDX is unused),
 // so these can replace the vtable entries directly.
 // --------------------------------------------------------------------------------
+// The game's tick code doesn't preserve every register it should : Harry's tick
+// returns with EDI holding a return address (0x4B2DE6, after "call 0x547180").
+// Game code never relies on EDI, but our compiled hooks may keep "self" in it, so
+// "self" is kept in memory across the original call and read back afterwards.
+static EIHarry* volatile g_harryTickSelf = 0;
+static EIEvilHarryP* volatile g_evilTickSelf = 0;
+
 static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 {
+	g_harryTickSelf = self;
 	g_origHarryTick( self );
+	self = g_harryTickSelf;
 
 	if ( InterlockedIncrement( &g_harryTicks ) == 1 ) {
 		mp_log( "[MP] Harry tick hook is running (this 0x%.8X, global Harry 0x%.8X).\n", self, Gizmod::getHarry() );
@@ -1266,7 +1368,9 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 	}
 
 	PrePositionPuppet( self );
+	g_evilTickSelf = self;
 	g_origEvilHarryTick( self );   // Animations, state machine.
+	self = g_evilTickSelf;         // See g_harryTickSelf.
 	if ( g_autoLocomotion ) ApplyLocomotionAnim( self );
 
 	if ( self->m_stateIndexCurrent != lastLoggedState ) {
