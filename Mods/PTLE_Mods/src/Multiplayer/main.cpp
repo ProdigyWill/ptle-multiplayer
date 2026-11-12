@@ -188,6 +188,19 @@ static const PlayerSnapshot* GetPuppetTarget()
 // --------------------------------------------------------------------------------
 static EIEvilHarryP* g_puppet = 0;
 static int g_forcedState = -1;
+
+// Index of a state by its short name ("idle left" matches "evil harry.idle left").
+static int FindStateIndex( EIBeast* beast, const char* shortName )
+{
+	EBeastStateMachine* sm = beast->GetStateMachine();
+	if ( !sm || !sm->m_states ) return -1;
+	for ( int i = 0; i < (int) sm->m_numStates; i++ ) {
+		const char* name = sm->m_states[i].m_name;
+		const char* dot = name ? strchr( name, '.' ) : 0;
+		if ( dot && strcmp( dot + 1, shortName ) == 0 ) return i;
+	}
+	return -1;
+}
 static char g_puppetName[] = "evil harry";
 
 static void LogStateMachine( EIBeast* beast )
@@ -248,6 +261,11 @@ static void SpawnPuppet( EIHarry* harry )
 
 	g_puppet = p;
 
+	// Its default state (21, "get ready for boss fight") draws it as a black
+	// silhouette. Start calm and lit instead.
+	g_forcedState = FindStateIndex( p, "idle left" );
+	mp_log( "[MP] Puppet starts in state %d (idle left).\n", g_forcedState );
+
 	mp_log( "[MP] Puppet spawned at 0x%.8X (m_beastTypeName offset 0x%X, expected 0x%X).\n",
 		p, (unsigned) offsetof(EIBeast, m_beastTypeName), (unsigned) EXPECTED_BEASTNAME_OFFSET );
 	mp_log( "[MP] Harry at (%.2f, %.2f, %.2f). header offsets : EICharacter::m_position 0x%X, m_transformMatrix 0x%X, EIBeast::m_position 0x%X, m_rotation 0x%X\n",
@@ -307,8 +325,29 @@ static bool GetPuppetTargetPosition( Vector3f* out )
 // translation row at +0x190, +0x2FC EIBeast position, +0x310 quaternion.
 // (0x414B10, vtable +0x120, rebuilds the matrix rotation and applies the scale;
 // it does NOT set the translation.)
+//
+// The beast tick (0x414F80) reads its world position from +0x360, the translation
+// row of a matrix at +0x330, and stores it at +0x370 ("previous position") when
+// done. +0x330 is the beast's real world transform.
 #define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
-static const uint32_t BEAST_SCALE = 0x14C;
+static const uint32_t BEAST_SCALE       = 0x14C;
+static const uint32_t BEAST_WORLD       = 0x330;   // Matrix4f.
+static const uint32_t BEAST_PREV_POS    = 0x370;   // Vector3f.
+
+// Writes the beast's world transform : Harry's orientation, target position.
+static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSnapshot* t )
+{
+	Matrix4f& world = FIELD( p, Matrix4f, BEAST_WORLD );
+	if ( t ) {
+		for ( int r = 0; r < 3; r++ )
+			for ( int c = 0; c < 4; c++ )
+				world.data[r][c] = t->transform.data[r][c];
+	}
+	world.data[3][0] = pos.x;
+	world.data[3][1] = pos.y;
+	world.data[3][2] = pos.z;
+	world.data[3][3] = 1.0F;
+}
 
 // Before the beast's own tick : make it think it already is at the target.
 static void PrePositionPuppet( EIEvilHarryP* p )
@@ -316,6 +355,8 @@ static void PrePositionPuppet( EIEvilHarryP* p )
 	Vector3f pos;
 	if ( GetPuppetTargetPosition( &pos ) ) {
 		p->EIBeast::m_position = pos;
+		SetBeastWorld( p, pos, GetPuppetTarget() );
+		FIELD( p, Vector3f, BEAST_PREV_POS ) = pos;
 	}
 }
 
@@ -335,6 +376,10 @@ static void DrivePuppet( EIEvilHarryP* p )
 	p->m_transformMatrix.data[3][0] = pos.x;
 	p->m_transformMatrix.data[3][1] = pos.y;
 	p->m_transformMatrix.data[3][2] = pos.z;
+
+	// The beast's own world transform (what its tick and AI work from).
+	SetBeastWorld( p, pos, t );
+	FIELD( p, Vector3f, BEAST_PREV_POS ) = pos;
 }
 
 
@@ -445,7 +490,7 @@ GET_METHOD( 0x5EBA90, void, ScheduleWorldLoad, void*, uint32_t, bool );
 static const uint32_t AUTOTEST_LEVEL = 0x239A2165;   // Turtle Monument : open, easy to see.
 
 static bool g_autotest = false;
-static bool g_skipPuppetAI = true;            // Evil Harry's own tick (boss AI) drags it toward the camera.
+static bool g_skipPuppetAI = false;           // true = don't run Evil Harry's own tick (no animation).
 static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
 static volatile LONG g_snapPending = 0;
 static char g_snapName[64];
@@ -606,6 +651,8 @@ static DWORD WINAPI AutotestThread( void* )
 static void LogTelemetry( EIHarry* harry, const char* tag )
 {
 	if ( g_puppet ) {
+		const Matrix4f& w = FIELD( g_puppet, Matrix4f, BEAST_WORLD );
+		mp_log( "[AT] %s beast world (%.1f, %.1f, %.1f)\n", tag, w.data[3][0], w.data[3][1], w.data[3][2] );
 		const Vector3f& r = FIELD( g_puppet, Vector3f, BEAST_SCALE );
 		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f) puppet (%.1f, %.1f, %.1f) scale (%.2f, %.2f, %.2f) matrix (%.1f, %.1f, %.1f) state %d\n", tag,
 			harry->m_position.x, harry->m_position.y, harry->m_position.z,
@@ -679,8 +726,8 @@ static void AutotestStep( EIHarry* harry )
 		LogTelemetry( harry, "before spawn" );
 		RequestSnapshot( "01_before_spawn" );
 		base = harry->m_rigidBodyMatrix;
-		g_skipPuppetAI = true;
-		mp_log( "[AT] Hop test runs with the puppet's AI tick disabled.\n" );
+		g_skipPuppetAI = false;
+		mp_log( "[AT] Hop test runs with the puppet's AI tick ENABLED (animation test).\n" );
 		SpawnPuppet( harry );
 		if ( !g_puppet ) {
 			mp_log( "[AT] FAIL : puppet did not spawn.\n" );
