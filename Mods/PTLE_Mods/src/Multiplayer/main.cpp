@@ -13,7 +13,8 @@
 //        moving, facing its direction of travel), then idle/rest states by hand.
 //   F7 : cycle the replay delay (0.25s .. 3s).
 //   F8 : Evil Harry stays where he is (spawned where Harry stands if needed) and
-//        copies Harry in place : animations, items, facing. F8 again : he follows.
+//        copies Harry in place : animations, items, facing, jumps and climbs (up and
+//        down only). F8 again : he follows.
 // --------------------------------------------------------------------------------
 
 #include <Windows.h>
@@ -155,6 +156,7 @@ struct PlayerSnapshot
 	Vector3f position;
 	Vector3f rotationEuler;
 	bool onGround;                               // EICharacter::m_onGround (CheatLab writes it too).
+	float lift;                                  // Height above where he last stood (jumps, climbs), never below 0.
 	uint32_t clipCRC;                            // Animation clip the player is playing (0 = unknown).
 	float clipWeight;
 	int heldItem;                                // Item table index of the item in Harry's hand, or -1.
@@ -341,6 +343,9 @@ static void PushLocalSnapshot( EIHarry* harry )
 	s.position      = harry->m_position;
 	s.rotationEuler = harry->m_rotationEuler;
 	s.onGround      = harry->m_onGround;
+	static float groundZ = 0.0F;
+	if ( s.onGround ) groundZ = s.position.z;
+	s.lift = s.onGround ? 0.0F : max( 0.0F, s.position.z - groundZ );
 
 	int layer = -1;
 	s.clipCRC = GetPlayingClip( harry, &layer, &s.clipWeight );
@@ -532,7 +537,11 @@ static bool GetPuppetTargetPosition( Vector3f* out )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
 	if ( !t ) return false;
-	if ( g_puppetPinned ) { *out = g_puppetPin; return true; }
+	if ( g_puppetPinned ) {
+		*out = g_puppetPin;
+		if ( g_puppetStaysHere ) out->z += t->lift;   // F8 : still jumps and climbs, in place.
+		return true;
+	}
 	out->x = t->position.x + g_puppetOffset.x;
 	out->y = t->position.y + g_puppetOffset.y;
 	out->z = t->position.z + g_puppetOffset.z;
@@ -940,23 +949,27 @@ static const uint32_t RAFT_INFLATED = 0x108;          // uint8_t.
 static Matrix4f g_puppetItemPose[MAX_ITEM_BONES];     // The copy's bones (static : 16-byte aligned).
 
 // "anim" : offset of the item's animated model (an EAnimController), 0 if none.
+// "shown" : a byte its draw needs set (cleared as soon as Harry's is put away, so
+// the copy forces it), 0 if none. (The raft's, +0x108, can't be forced.)
 // The stink bomb isn't in the wheel menu, but costs nothing to cover.
-static const struct { int item; uint32_t vtable; uint32_t anim; } DRAWN_ITEMS[] = {
-	{ ITEM_TORCH,      0x89A200, 0    },
-	{ ITEM_TNT,        0x89A160, 0    },
-	{ ITEM_RAFT,       0x8949B0, 0xA4 },
-	{ ITEM_SLING,      0x8971D0, 0xA0 },
-	{ ITEM_SHIELD,     0x896F90, 0xA4 },
-	{ ITEM_GAS_MASK,   0x87CAD8, 0    },
-	{ ITEM_CANTEEN,    0x86DCB0, 0    },
-	{ ITEM_STINK_BOMB, 0x8994B8, 0    },
-	{ ITEM_PICKAXES,   0x88ED70, 0    },
+static const struct { int item; uint32_t vtable; uint32_t anim; uint32_t shown; } DRAWN_ITEMS[] = {
+	{ ITEM_TORCH,      0x89A200, 0,    0     },
+	{ ITEM_TNT,        0x89A160, 0,    0     },
+	{ ITEM_RAFT,       0x8949B0, 0xA4, 0     },
+	{ ITEM_SLING,      0x8971D0, 0xA0, 0x104 },
+	{ ITEM_SHIELD,     0x896F90, 0xA4, 0x108 },
+	{ ITEM_GAS_MASK,   0x87CAD8, 0,    0     },
+	{ ITEM_CANTEEN,    0x86DCB0, 0,    0     },
+	{ ITEM_STINK_BOMB, 0x8994B8, 0,    0     },
+	{ ITEM_PICKAXES,   0x88ED70, 0,    0     },
 };
 static const int NUM_DRAWN_ITEMS = sizeof(DRAWN_ITEMS) / sizeof(DRAWN_ITEMS[0]);
 static ItemDrawFunc g_origItemDraw[NUM_DRAWN_ITEMS];
 static RenderFunc g_origEvilHarryRender = 0;
 
 static int g_puppetItemDraws = 0;     // For the autotest.
+static int g_copyDrawsAlone = 0;      // For the autotest : copies drawn while Harry draws no item.
+static DWORD g_harryItemDrawTime = 0;
 
 static void NoteHarryItemDraw( int slot, void* item )
 {
@@ -986,6 +999,7 @@ static void NoteHarryItemDraw( int slot, void* item )
 	MatMul( world, inverse, &s->itemLocal );
 	s->itemState = FIELD( item, int, ITEM_STATE );
 	s->drawnSlot = slot;
+	g_harryItemDrawTime = GetTickCount();
 }
 
 // Swaps a Matrix4f field (maybe not 16-byte aligned) for "m * base", keeping the old one.
@@ -1033,12 +1047,17 @@ static void DrawItemAt( int slot, const PlayerSnapshot* t, const Matrix4f& base,
 	}
 	int savedState = FIELD( item, int, ITEM_STATE );
 	uint8_t savedActive = FIELD( item, uint8_t, ITEM_ACTIVE );
+	uint32_t shown = DRAWN_ITEMS[slot].shown;
+	uint8_t savedShown = shown ? FIELD( item, uint8_t, shown ) : 0;
 	FIELD( item, int, ITEM_STATE ) = t->itemState;
 	FIELD( item, uint8_t, ITEM_ACTIVE ) = 1;
+	if ( shown ) FIELD( item, uint8_t, shown ) = 1;
 
 	g_origItemDraw[slot]( item, context, arg );
 	g_puppetItemDraws++;
+	if ( GetTickCount() - g_harryItemDrawTime > 150 ) g_copyDrawsAlone++;
 
+	if ( shown ) FIELD( item, uint8_t, shown ) = savedShown;
 	FIELD( item, uint8_t, ITEM_ACTIVE ) = savedActive;
 	FIELD( item, int, ITEM_STATE ) = savedState;
 	if ( hands ) {
@@ -1779,6 +1798,7 @@ static void AutotestStep( EIHarry* harry )
 		static Vector3f pinned;
 		static float headingAtStart = 0.0F;
 		static bool sawMirror = false;
+		static float maxRise = 0.0F;
 		DWORD t = now - phaseStart;
 		if ( step == 0 ) {
 			InterlockedIncrement( &g_reqStay );   // As if F8 was pressed.
@@ -1789,27 +1809,30 @@ static void AutotestStep( EIHarry* harry )
 			pinned = g_puppet->EIBeast::m_position;
 			headingAtStart = g_heading;
 			sawMirror = false;
+			maxRise = 0.0F;
 			InterlockedExchange( &g_holdMs, 2000 );
 			InterlockedExchange( &g_holdKey, 'D' );   // Walk away, turning.
 			step = 2;
 		}
 		else if ( step == 2 ) {
 			if ( g_mirrorClip && g_mirrorClip != 0xB23CB6D0 ) sawMirror = true;   // Copying something besides standing.
-			if ( t >= 3500 ) {
+			maxRise = max( maxRise, g_puppet->EIBeast::m_position.z - pinned.z );
+			if ( t >= 2700 && t < 2750 ) InterlockedExchange( &g_tapKey, VK_NUMPAD2 );   // Jump : he should too, in place.
+			if ( t >= 4500 ) {
 				RequestSnapshot( "12_stay_here" );
 				Vector3f p = g_puppet->EIBeast::m_position;
 				float dx = p.x - pinned.x, dy = p.y - pinned.y, dh = harry->m_position.x - pinned.x, dhy = harry->m_position.y - pinned.y;
 				float moved = sqrtf( dx * dx + dy * dy ), harryAway = sqrtf( dh * dh + dhy * dhy );
 				float turned = fabsf( g_heading - headingAtStart ) * 180.0F / MP_PI;
-				bool ok = moved < 0.5F && harryAway > 3.0F && sawMirror && turned > 20.0F;
+				bool ok = moved < 0.5F && harryAway > 3.0F && sawMirror && turned > 20.0F && maxRise > 0.5F;
 				if ( !ok ) g_itemFailures++;
-				mp_log( "[AT] Stay here : Evil Harry moved %.2f, Harry is %.1f away, puppet copied a clip %s, turned %.0f deg : %s\n",
-					moved, harryAway, sawMirror ? "yes" : "no", turned, ok ? "ok" : "WRONG" );
+				mp_log( "[AT] Stay here : Evil Harry moved %.2f, Harry is %.1f away, puppet copied a clip %s, turned %.0f deg, jumped %.2f high : %s\n",
+					moved, harryAway, sawMirror ? "yes" : "no", turned, maxRise, ok ? "ok" : "WRONG" );
 				InterlockedIncrement( &g_reqStay );   // F8 again : follow.
 				step = 3;
 			}
 		}
-		else if ( step == 3 && t >= 4000 ) {
+		else if ( step == 3 && t >= 5000 ) {
 			bool ok = !g_puppetStaysHere && !g_puppetPinned;
 			if ( !ok ) g_itemFailures++;
 			mp_log( "[AT] F8 again : Evil Harry follows : %s\n", ok ? "ok" : "WRONG" );
@@ -1851,7 +1874,7 @@ static void AutotestStep( EIHarry* harry )
 			{ VK_UP,    false, EMPTY,         -1,            "empty slot" },
 		};
 		static const int NUM = sizeof(STEPS) / sizeof(STEPS[0]);
-		static int drawsAtStart = 0, posesAtStart = 0;
+		static int drawsAtStart = 0, posesAtStart = 0, aloneAtStart = 0;
 		DWORD t = now - phaseStart;
 		if ( step == 0 || t >= 4500 ) {
 			if ( step >= NUM ) { g_puppetOffset.x = 6.0F; phase = 10; phaseStart = now; step = 0; break; }
@@ -1869,11 +1892,22 @@ static void AutotestStep( EIHarry* harry )
 				InterlockedExchange( &g_holdKey2, VK_NUMPAD5 );   // Toggle item, held...
 			}
 			step++; phaseStart = now; snapped = false;
+			aloneAtStart = g_copyDrawsAlone;
 		}
 		else if ( t >= 250 && t < 300 && STEPS[step - 1].key && !STEPS[step - 1].move ) {
 			InterlockedExchange( &g_tapKey, STEPS[step - 1].key );   // ...while the arrow is tapped.
 		}
+		else if ( t >= 1300 && t < 1400 && !snapped && step >= 2 && STEPS[step - 1].expect < 0 && STEPS[step - 2].expect >= 0
+		          && STEPS[step - 2].expect != ITEM_RAFT && STEPS[step - 1].upItem == KEEP ) {
+			// Harry has put it away; Evil Harry, a second behind, still holds it.
+			char name[48];
+			sprintf_s( name, "09_item_%02d_%s_lag", step - 1, STEPS[step - 1].name );
+			for ( char* c = name; *c; c++ ) if ( *c == ' ' ) *c = '_';
+			RequestSnapshot( name );
+			snapped = true;
+		}
 		else if ( t >= 3000 && t < 3100 ) {   // After the delayed put-away animation (the raft takes longest).
+			snapped = false;
 			drawsAtStart = g_puppetItemDraws;
 			posesAtStart = g_puppetPoseCopies;
 		}
@@ -1887,10 +1921,14 @@ static void AutotestStep( EIHarry* harry )
 			int draws = g_puppetItemDraws - drawsAtStart;   // Puppet copies drawn over the last 0.9 s.
 			int poses = g_puppetPoseCopies - posesAtStart;
 			int want = STEPS[i].expect;
-			bool ok = held == want && !shown && (want >= 0 ? draws > 30 : draws == 0) && poses > 30;
+			// Put away (but the raft, whose copy needs Harry's) : the copy outlives Harry's item.
+			int prev = i > 0 ? STEPS[i - 1].expect : -1;
+			bool putAway = want < 0 && prev >= 0 && prev != ITEM_RAFT && STEPS[i].upItem == KEEP;
+			int alone = g_copyDrawsAlone - aloneAtStart;
+			bool ok = held == want && !shown && (want >= 0 ? draws > 30 : draws == 0) && poses > 30 && (!putAway || alone > 5);
 			if ( !ok ) g_itemFailures++;
-			mp_log( "[AT] Item step %d (%s) : Harry holds item %d (expected %d), Evil Harry's own pickaxes %s, copy drawn %d times, pose copied %d times : %s\n",
-				i, STEPS[i].name, held, want, shown ? "shown" : "hidden", draws, poses, ok ? "ok" : "WRONG" );
+			mp_log( "[AT] Item step %d (%s) : Harry holds item %d (expected %d), Evil Harry's own pickaxes %s, copy drawn %d times (%d after Harry's was away), pose copied %d times : %s\n",
+				i, STEPS[i].name, held, want, shown ? "shown" : "hidden", draws, alone, poses, ok ? "ok" : "WRONG" );
 			char name[40];
 			sprintf_s( name, "09_item_%02d_%s", i, STEPS[i].name );
 			for ( char* c = name; *c; c++ ) if ( *c == ' ' ) *c = '_';
