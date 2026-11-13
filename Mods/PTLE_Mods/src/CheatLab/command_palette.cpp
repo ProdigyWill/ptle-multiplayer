@@ -287,6 +287,24 @@ static void _deactivate_effectors( bool enable )
 
 
 // --------------------------------------------------------------------------------
+// The HUD's life meter (EUIHudLifeMeter, at HUD+0xF8) lays its icons out for the
+// max health only when it enters the screen : changing the max while it is up
+// leaves the new icons at the middle of the screen. Sending it back to its
+// "hidden" state (+0x124 = 0) with "show" requested (+0x198) makes it lay them
+// out again.
+// --------------------------------------------------------------------------------
+static void _refresh_life_meter()
+{
+	uint8_t* hud = (uint8_t*) Gizmod::getHUD();
+	if ( !hud ) return;
+	uint8_t* meter = *(uint8_t**) (hud + 0xF8);
+	if ( !meter || *(uint32_t*) meter != 0x8A04D8 ) return;   // EUIHudLifeMeter vtable.
+	*(int*) (meter + 0x124) = 0;
+	*(uint8_t*) (meter + 0x198) = 1;
+}
+
+
+// --------------------------------------------------------------------------------
 // Give useful items, abilities, and max HP.
 // --------------------------------------------------------------------------------
 static void _give_stuff()
@@ -303,8 +321,12 @@ static void _give_stuff()
 	harry->m_smashStrike = 1;
 	harry->m_breakdance = 1;
 
-	// Hotbar. (Max HP isn't raised : a max of 10 left a stray health icon in the
-	// middle of the screen.)
+	// Max HP (10), then have the life meter lay out its new icons.
+	harry->m_healthMax = 10;
+	harry->m_healthValue = 10;
+	_refresh_life_meter();
+
+	// Hotbar.
 	harry->m_itemHotbar[0] = injector::ReadMemory<void*>( 0x8EEC20 );  // Raft.
 	harry->m_itemHotbar[1] = injector::ReadMemory<void*>( 0x8EEBCC );  // Pickaxes.
 	harry->m_itemHotbar[2] = injector::ReadMemory<void*>( 0x8EEBB0 );  // Torch.
@@ -359,6 +381,7 @@ static void _remove_stuff()
 	// Health.
 	harry->m_healthMax = 5;
 	harry->m_healthValue = 5;
+	_refresh_life_meter();
 
 	// Clear hotbar contents.
 	harry->m_itemHotbar[0] = 0;
