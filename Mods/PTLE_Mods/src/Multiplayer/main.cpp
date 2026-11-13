@@ -2,16 +2,18 @@
 // Multiplayer (milestone 1 : puppet test).
 //
 // Spawns a second Harry-looking character (the game's Evil Harry beast) and drives
-// its transform from code every frame. There is no networking yet : the puppet
-// replays the local player's own movement a short delay behind, which proves we
-// can own and move a second character. The "remote player" source is isolated in
-// PushLocalSnapshot() / GetPuppetTarget() so it can later be fed from a server.
+// its transform from code every frame. Every tick the local player's state goes out
+// as a snapshot packet (net/protocol.h) through a transport (net/transport.h), and
+// the puppet replays the snapshots that come in (net/remote.h). For now the only
+// transport is a loopback that echoes our own packets back, so the puppet replays
+// the local player, through the network code. PTLE_MP_NETSIM="latency,jitter,loss"
+// (ms, ms, fraction) simulates a bad connection on it.
 //
 // Hotkeys (only while the game window has focus) :
 //   F5 : spawn the puppet in the current level.
 //   F6 : cycle the puppet's animation : automatic (idle when still, run when
 //        moving, facing its direction of travel), then idle/rest states by hand.
-//   F7 : cycle the replay delay (0.25s .. 3s).
+//   F7 : cycle the playback delay (0.13s .. 3s).
 //   F8 : Evil Harry stays where he is (spawned where Harry stands if needed) and
 //        copies Harry in place : animations, items, facing, jumps and climbs (up and
 //        down only). F8 again : he follows.
@@ -43,6 +45,11 @@
 #include "ptle/types/types.h"
 
 #include "utils/func.h"
+
+#include "net/protocol.h"
+#include "net/remote.h"
+#include "net/snapshot.h"
+#include "net/transport.h"
 
 
 #define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
@@ -146,31 +153,8 @@ static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
 
 
 // --------------------------------------------------------------------------------
-// Remote player source (for now : a delayed echo of the local player).
+// Snapshots of the local player, and the remote player's.
 // --------------------------------------------------------------------------------
-static const int MAX_CHAR_BONES = 80;   // Harry's skeleton has 76 bones.
-static const int MAX_ITEM_BONES = 64;
-
-struct PlayerSnapshot
-{
-	Matrix4f transform;
-	Vector3f position;
-	Vector3f rotationEuler;
-	bool onGround;                               // EICharacter::m_onGround (CheatLab writes it too).
-	float lift;                                  // Height above where he last stood (jumps, climbs), never below 0.
-	uint32_t clipCRC;                            // Animation clip the player is playing (0 = unknown).
-	float clipWeight;
-	int heldItem;                                // Item table index of the item in Harry's hand, or -1.
-	int bones;                                   // Harry's pose : his bones relative to his transform (0 : unknown).
-	Matrix4f pose[MAX_CHAR_BONES];
-	Matrix4f handR, handL;                       // His hand matrices, relative to his transform.
-	int drawnSlot;                               // DRAWN_ITEMS index of the item Harry drew this frame, or -1.
-	int itemState;                               // Its state (+0x70) when it drew : some draw only in some states.
-	Matrix4f itemLocal;                          // Its matrix, relative to his transform.
-	int itemBones;                               // Animated items : their bones, relative to his transform (0 : none).
-	Matrix4f itemPose[MAX_ITEM_BONES];
-};
-
 // Row-vector matrices (translation in row 3) : world = local * parent.
 static void MatMul( const Matrix4f& a, const Matrix4f& b, Matrix4f* out )
 {
@@ -217,24 +201,106 @@ static void MatsMul( const Matrix4f* m, int count, const Matrix4f& b, Matrix4f* 
 	for ( int i = 0; i < count; i++ ) MatMul( m[i], b, &out[i] );
 }
 
-static const int HISTORY_SIZE = 256;
-static PlayerSnapshot g_history[HISTORY_SIZE];   // Static storage keeps Matrix4f 16-byte aligned.
-static int g_historyHead = 0;                    // Next slot to write.
-static int g_historyCount = 0;
+static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the autotest section).
 
-static const int DELAY_CHOICES[] = { 8, 15, 30, 60, 90, 180 };   // In game ticks.
+static PlayerSnapshot g_local;                 // Static storage keeps Matrix4f 16-byte aligned.
+static bool g_haveLocal = false;
+static RemotePlayer g_remote;                  // The one puppet's player (for now : ourselves, looped back).
+static const PlayerSnapshot* g_target = 0;     // What the puppet shows this tick (see NetUpdate).
+
+static const int DELAY_CHOICES[] = { 133, 250, 500, 1000, 1500, 3000 };   // Playback delay (ms).
 static int g_delayIndex = 3;
 
-// The snapshot written last : Harry's item draws (after his tick) add to it.
+// The network side.
+static Transport* g_transport = 0;
+static uint8_t g_localPlayerId = 0;
+static uint32_t g_sendSequence = 0;
+static struct NetStats {
+	uint32_t sent, sentBytes, maxBytes, tooBig, badPackets;
+	float maxPackingError;
+} g_netStats;
+
+// The local snapshot written last : Harry's item draws (after his tick) add to it.
 static PlayerSnapshot* LatestSnapshot()
 {
-	return g_historyCount ? &g_history[(g_historyHead + HISTORY_SIZE - 1) % HISTORY_SIZE] : 0;
+	return g_haveLocal ? &g_local : 0;
 }
 
 static void ResetHistory()
 {
-	g_historyHead = 0;
-	g_historyCount = 0;
+	g_haveLocal = false;
+	g_remote.Reset();
+	g_target = 0;
+}
+
+// Autotest : how much packing a matrix loses (logs the worst ones).
+static void CheckPacking( const char* what, int index, const Matrix4f& m, bool perAxis = false )
+{
+	if ( !IsSaneMatrix( m ) ) return;   // Sent as nothing.
+	float err = PackingError( m, perAxis );
+	if ( err <= g_netStats.maxPackingError ) return;
+	g_netStats.maxPackingError = err;
+	if ( err < 0.01F ) return;
+	const float (*a)[4] = m.data;
+	mp_log( "[NET] Packing loses %.4f on %s %d (held item %d, drawn %d) : (%.3f %.3f %.3f) (%.3f %.3f %.3f) (%.3f %.3f %.3f) t (%.3f %.3f %.3f)\n",
+		err, what, index, g_local.heldItem, g_local.drawnSlot, a[0][0], a[0][1], a[0][2], a[1][0], a[1][1], a[1][2], a[2][0], a[2][1], a[2][2], a[3][0], a[3][1], a[3][2] );
+}
+
+// Sends the local snapshot once it's complete (the tick after it was recorded :
+// item draws come after the tick).
+static void SendLocalSnapshot()
+{
+	if ( !g_haveLocal || !g_transport ) return;
+	uint8_t packet[MAX_PACKET];
+	int length = EncodeSnapshot( g_local, g_localPlayerId, ++g_sendSequence, packet, sizeof(packet) );
+	if ( !length ) {
+		if ( !g_netStats.tooBig++ ) mp_log( "[NET] Snapshot doesn't fit in a packet (%d bones, %d item bones).\n", g_local.bones, g_local.itemBones );
+		return;
+	}
+	g_transport->Send( packet, length );
+	g_netStats.sent++;
+	g_netStats.sentBytes += length;
+	if ( (uint32_t) length > g_netStats.maxBytes ) g_netStats.maxBytes = length;
+
+	if ( g_autotest ) {   // How much the packing loses.
+		for ( int i = 0; i < g_local.bones; i++ ) CheckPacking( "bone", i, g_local.pose[i] );
+		CheckPacking( "right hand", 0, g_local.handR );
+		CheckPacking( "left hand", 0, g_local.handL );
+		for ( int i = 0; i < g_local.itemBones; i++ ) CheckPacking( "item bone", i, g_local.itemPose[i], true );
+	}
+}
+
+static void LogNetStats()
+{
+	const NetStats& n = g_netStats;
+	mp_log( "[NET] Sent %u snapshots (avg %u bytes, max %u, %u too big). Received %u, lost %u, late %u, reordered %u, bad %u. Max packing error %.4f.\n",
+		n.sent, n.sent ? n.sentBytes / n.sent : 0, n.maxBytes, n.tooBig,
+		g_remote.received, g_remote.Lost(), g_remote.late, g_remote.reordered, n.badPackets, n.maxPackingError );
+}
+
+// Takes in what arrived and picks what the puppet shows this tick.
+static void NetUpdate()
+{
+	static PlayerSnapshot incoming;   // Static : big, and 16-byte aligned.
+	uint8_t packet[MAX_PACKET];
+	int length;
+	while ( g_transport && (length = g_transport->Receive( packet, sizeof(packet) )) > 0 ) {
+		PacketHeader h;
+		if ( !DecodeHeader( packet, length, &h ) ) { g_netStats.badPackets++; continue; }
+		if ( h.type != PACKET_SNAPSHOT ) continue;
+		if ( !DecodeSnapshot( packet, length, &incoming ) ) { g_netStats.badPackets++; continue; }
+		g_remote.Add( incoming, h.sequence );
+	}
+
+	uint32_t now = NetNowMs();
+	g_target = g_remote.Update( now, DELAY_CHOICES[g_delayIndex] );
+	if ( g_target && g_target->level != Gizmod::getCurrentLevelCRC() ) g_target = 0;   // Another level : not shown.
+
+	static uint32_t lastStats = now;
+	if ( now - lastStats >= 10000 ) {
+		lastStats = now;
+		LogNetStats();
+	}
 }
 
 // --------------------------------------------------------------------------------
@@ -339,7 +405,11 @@ static int GetHeldItem( EIHarry* harry )
 
 static void PushLocalSnapshot( EIHarry* harry )
 {
-	PlayerSnapshot& s = g_history[g_historyHead];
+	SendLocalSnapshot();   // The previous one, complete now.
+
+	PlayerSnapshot& s = g_local;
+	s.time          = NetNowMs();
+	s.level         = Gizmod::getCurrentLevelCRC();
 	s.transform     = harry->m_transformMatrix;
 	s.position      = harry->m_position;
 	s.rotationEuler = harry->m_rotationEuler;
@@ -382,17 +452,12 @@ static void PushLocalSnapshot( EIHarry* harry )
 		lastItem = s.heldItem;
 	}
 
-	g_historyHead = (g_historyHead + 1) % HISTORY_SIZE;
-	if ( g_historyCount < HISTORY_SIZE ) g_historyCount++;
+	g_haveLocal = true;
 }
 
 static const PlayerSnapshot* GetPuppetTarget()
 {
-	int delay = DELAY_CHOICES[g_delayIndex];
-	if ( g_historyCount <= delay ) return 0;
-
-	int idx = (g_historyHead - 1 - delay + HISTORY_SIZE) % HISTORY_SIZE;
-	return &g_history[idx];
+	return g_target;
 }
 
 
@@ -1246,7 +1311,7 @@ static void HandleHotkeys( EIHarry* harry )
 
 	if ( f7 ) {
 		g_delayIndex = (g_delayIndex + 1) % (sizeof(DELAY_CHOICES) / sizeof(DELAY_CHOICES[0]));
-		mp_log( "[MP] Replay delay : %d ticks.\n", DELAY_CHOICES[g_delayIndex] );
+		mp_log( "[MP] Playback delay : %d ms.\n", DELAY_CHOICES[g_delayIndex] );
 	}
 
 	// F8 : Evil Harry stays here (spawning him where Harry stands if needed) and
@@ -1291,8 +1356,7 @@ GET_METHOD( 0x5EBA90, void, ScheduleWorldLoad, void*, uint32_t, bool );
 static const uint32_t AUTOTEST_LEVEL = 0x7567D75A;
 static volatile LONG g_settled = 0;           // 1 = cutscene/book dismissed, game runs.
 
-static bool g_autotest = false;
-static bool g_background = false;             // Autotest without focus (see above).
+static bool g_background = false;            // Autotest without focus (see above).
 static volatile uint8_t g_fakeKeys[256];      // Background : the keys the test holds (DirectInput codes).
 static bool g_skipPuppetAI = false;           // true = don't run Evil Harry's own tick (no animation).
 static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
@@ -1731,6 +1795,7 @@ static DWORD WINAPI AutotestThread( void* )
 
 	if ( heldKey ) SendKey( heldKey, false );
 	if ( InterlockedExchange( &g_snapPending, 0 ) ) TakeSnapshot( g_snapName );
+	LogNetStats();
 	mp_log( "[AT] %s\n", g_autotestDone == 1 ? "RESULT : PASS" : "RESULT : FAIL" );
 	Sleep( 300 );
 	ExitProcess( g_autotestDone == 1 ? 0 : 2 );
@@ -2290,6 +2355,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 	if ( self != Gizmod::getHarry() ) return;
 
 	PushLocalSnapshot( self );
+	NetUpdate();
 	if ( g_autotest ) AutotestStep( self );
 	HandleHotkeys( self );
 }
@@ -2367,6 +2433,16 @@ public:
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
 
 		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
+
+		// The transport : loopback (the puppet replays us), with simulated network
+		// conditions from PTLE_MP_NETSIM="latency,jitter,loss" (ms, ms, fraction).
+		NetSimulation sim = { 0, 0, 0.0F };
+		char simEnv[64] = { 0, };
+		if ( GetEnvironmentVariableA( "PTLE_MP_NETSIM", simEnv, sizeof(simEnv) ) ) {
+			sscanf_s( simEnv, "%d,%d,%f", &sim.latencyMs, &sim.jitterMs, &sim.loss );
+		}
+		g_transport = CreateLoopbackTransport( sim );
+		mp_log( "[NET] Loopback transport (latency %d ms, jitter %d ms, loss %.0f%%).\n", sim.latencyMs, sim.jitterMs, sim.loss * 100.0F );
 
 		char env[8] = { 0, };
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {

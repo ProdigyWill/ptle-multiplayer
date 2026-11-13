@@ -79,6 +79,15 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="net\protocol.cpp" />
+    <ClCompile Include="net\remote.cpp" />
+    <ClCompile Include="net\transport.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="net\protocol.h" />
+    <ClInclude Include="net\remote.h" />
+    <ClInclude Include="net\snapshot.h" />
+    <ClInclude Include="net\transport.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
