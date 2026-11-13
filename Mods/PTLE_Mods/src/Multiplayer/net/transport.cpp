@@ -6,6 +6,9 @@
 #include <vector>
 
 
+static void NoLog( const char*, ... ) {}
+void (*g_netLog)( const char* fmt, ... ) = NoLog;
+
 uint32_t NetNowMs()
 {
 	static LARGE_INTEGER freq = { 0 };
@@ -47,6 +50,9 @@ public:
 		m_inFlight.erase( m_inFlight.begin() + best );
 		return length;
 	}
+
+	int PlayerId() const override { return 0; }
+	bool Echoes() const override { return true; }
 
 private:
 	struct Packet

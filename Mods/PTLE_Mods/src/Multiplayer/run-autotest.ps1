@@ -3,11 +3,13 @@
 # converted to PNG).
 #
 #   powershell -ExecutionPolicy Bypass -File run-autotest.ps1 [-NoBuild] [-Foreground] [-TimeoutSec 420]
-#       [-NetSim "latency,jitter,loss"]
+#       [-NetSim "latency,jitter,loss"] [-Server host:port]
 #
 # The puppet replays the player through the network code (loopback). -NetSim sets
 # the simulated connection : one-way latency (ms), jitter (ms), loss (fraction).
 # The default is a mediocre internet connection; "0,0,0" is a perfect one.
+# -Server goes through a relay server instead (server/relay.py), in echo mode : the
+# server sends the player's moves back and the puppet replays them.
 #
 # By default the test runs in the background : the game window opens behind the
 # others without taking focus, and its keys are fed to it directly, so the computer
@@ -19,7 +21,8 @@ param(
 	[switch] $NoBuild,
 	[switch] $Foreground,
 	[int] $TimeoutSec = 420,
-	[string] $NetSim = '100,40,0.05'
+	[string] $NetSim = '100,40,0.05',
+	[string] $Server = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +55,11 @@ foreach ($mod in 'Multiplayer', 'WindowedMode', 'CheatLab') {
 if (Test-Path $shotsDir) { Remove-Item (Join-Path $shotsDir '*') -Force }
 
 $vars = @{ PTLE_MP_AUTOTEST = '1'; PTLE_MP_NETSIM = $NetSim }
+if ($Server) {
+	$vars.PTLE_MP_SERVER = $Server
+	$vars.PTLE_MP_ECHO = '1'
+	$vars.PTLE_MP_ROOM = "autotest-$PID"
+}
 if ($Foreground) {
 	$vars.PTLE_MP_FOREGROUND = '1'
 	Write-Host '== Running game in autotest mode (in front, real key presses)'

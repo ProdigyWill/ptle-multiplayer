@@ -6,7 +6,7 @@
 
 static const uint16_t MAGIC = 0x4D50;   // "PM".
 static const uint8_t VERSION = 3;
-static const int HEADER_SIZE = 2 + 1 + 1 + 1 + 4;
+static const int HEADER_SIZE = PACKET_HEADER_SIZE;   // 2 + 1 + 1 + 1 + 4.
 
 static const float TRANSLATION_STEP = 1.0F / 512.0F;    // int16 : +-64 units.
 static const float MAX_SANE_VALUE = 10000.0F;           // Beyond : garbage (an item never posed yet).
@@ -259,6 +259,12 @@ static void PutHeader( Writer& w, uint8_t type, uint8_t player, uint32_t sequenc
 	w.put<uint8_t>( type );
 	w.put<uint8_t>( player );
 	w.put<uint32_t>( sequence );
+}
+
+void EncodeHeader( uint8_t type, uint8_t player, uint32_t sequence, uint8_t* out )
+{
+	Writer w = { out, out + HEADER_SIZE, true };
+	PutHeader( w, type, player, sequence );
 }
 
 bool DecodeHeader( const uint8_t* in, int length, PacketHeader* header )

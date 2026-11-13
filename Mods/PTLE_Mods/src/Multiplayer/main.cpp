@@ -4,10 +4,17 @@
 // Spawns a second Harry-looking character (the game's Evil Harry beast) and drives
 // its transform from code every frame. Every tick the local player's state goes out
 // as a snapshot packet (net/protocol.h) through a transport (net/transport.h), and
-// the puppet replays the snapshots that come in (net/remote.h). For now the only
-// transport is a loopback that echoes our own packets back, so the puppet replays
-// the local player, through the network code. PTLE_MP_NETSIM="latency,jitter,loss"
-// (ms, ms, fraction) simulates a bad connection on it.
+// the puppet replays the snapshots that come in (net/remote.h).
+//
+// Settings : mods\Multiplayer.ini (written with defaults the first time), section
+// [Network] : Server (relay server "host:port", see server/relay.py), Room, Name,
+// Echo (1 : the server sends our own moves back, to test alone). Environment
+// variables PTLE_MP_SERVER, PTLE_MP_ROOM, PTLE_MP_NAME, PTLE_MP_ECHO override them.
+// With no server, a loopback transport echoes our own packets back, so the puppet
+// replays the local player through the network code; PTLE_MP_NETSIM="latency,
+// jitter,loss" (ms, ms, fraction) simulates a bad connection on it.
+//
+// For now one other player is shown (the first one heard from).
 //
 // Hotkeys (only while the game window has focus) :
 //   F5 : spawn the puppet in the current level.
@@ -99,6 +106,14 @@ static void OpenLogFile()
 	CreateDirectoryA( path, 0 );
 	strcat_s( path, "\\logs" );
 	CreateDirectoryA( path, 0 );
+	// PTLE_MP_INSTANCE=<name> : logs\<name>\ (several games running at once).
+	char instance[32];
+	DWORD n = GetEnvironmentVariableA( "PTLE_MP_INSTANCE", instance, sizeof(instance) );
+	if ( n > 0 && n < sizeof(instance) ) {
+		strcat_s( path, "\\" );
+		strcat_s( path, instance );
+		CreateDirectoryA( path, 0 );
+	}
 	strcpy_s( g_logDir, path );
 	strcat_s( path, "\\multiplayer.log" );
 
@@ -213,10 +228,13 @@ static int g_delayIndex = 3;
 
 // The network side.
 static Transport* g_transport = 0;
-static uint8_t g_localPlayerId = 0;
+static bool g_networked = false;               // Through a server (not the loopback).
 static uint32_t g_sendSequence = 0;
+static int g_remoteId = -1;                    // The player the puppet shows (-1 : none yet).
+static uint32_t g_remoteLastHeard = 0;
+static const uint32_t REMOTE_SILENT_MS = 5000; // Then : forget them.
 static struct NetStats {
-	uint32_t sent, sentBytes, maxBytes, tooBig, badPackets;
+	uint32_t sent, sentBytes, maxBytes, tooBig, badPackets, otherPlayers;
 	float maxPackingError;
 } g_netStats;
 
@@ -230,6 +248,7 @@ static void ResetHistory()
 {
 	g_haveLocal = false;
 	g_remote.Reset();
+	g_remoteId = -1;
 	g_target = 0;
 }
 
@@ -251,8 +270,10 @@ static void CheckPacking( const char* what, int index, const Matrix4f& m, bool p
 static void SendLocalSnapshot()
 {
 	if ( !g_haveLocal || !g_transport ) return;
+	int me = g_transport->PlayerId();
+	if ( me < 0 ) return;   // Not in a room yet.
 	uint8_t packet[MAX_PACKET];
-	int length = EncodeSnapshot( g_local, g_localPlayerId, ++g_sendSequence, packet, sizeof(packet) );
+	int length = EncodeSnapshot( g_local, (uint8_t) me, ++g_sendSequence, packet, sizeof(packet) );
 	if ( !length ) {
 		if ( !g_netStats.tooBig++ ) mp_log( "[NET] Snapshot doesn't fit in a packet (%d bones, %d item bones).\n", g_local.bones, g_local.itemBones );
 		return;
@@ -273,9 +294,10 @@ static void SendLocalSnapshot()
 static void LogNetStats()
 {
 	const NetStats& n = g_netStats;
-	mp_log( "[NET] Sent %u snapshots (avg %u bytes, max %u, %u too big). Received %u, lost %u, late %u, reordered %u, bad %u. Max packing error %.4f.\n",
-		n.sent, n.sent ? n.sentBytes / n.sent : 0, n.maxBytes, n.tooBig,
-		g_remote.received, g_remote.Lost(), g_remote.late, g_remote.reordered, n.badPackets, n.maxPackingError );
+	mp_log( "[NET] Sent %u snapshots (avg %u bytes, max %u, %u too big). Player %d : received %u, lost %u, late %u, reordered %u. Bad %u, from others %u. Ping %d ms. Max packing error %.4f.\n",
+		n.sent, n.sent ? n.sentBytes / n.sent : 0, n.maxBytes, n.tooBig, g_remoteId,
+		g_remote.received, g_remote.Lost(), g_remote.late, g_remote.reordered, n.badPackets, n.otherPlayers,
+		g_transport ? g_transport->RoundTripMs() : -1, n.maxPackingError );
 }
 
 // Takes in what arrived and picks what the puppet shows this tick.
@@ -284,15 +306,39 @@ static void NetUpdate()
 	static PlayerSnapshot incoming;   // Static : big, and 16-byte aligned.
 	uint8_t packet[MAX_PACKET];
 	int length;
-	while ( g_transport && (length = g_transport->Receive( packet, sizeof(packet) )) > 0 ) {
+	uint32_t now = NetNowMs();
+	if ( !g_transport ) return;
+	g_transport->Update();
+	int me = g_transport->PlayerId();
+	bool echo = g_transport->Echoes();
+	while ( (length = g_transport->Receive( packet, sizeof(packet) )) > 0 ) {
 		PacketHeader h;
 		if ( !DecodeHeader( packet, length, &h ) ) { g_netStats.badPackets++; continue; }
+		if ( h.type == PACKET_LEAVE ) {
+			if ( h.player == g_remoteId ) {
+				mp_log( "[NET] Player %d left.\n", g_remoteId );
+				g_remote.Reset();
+				g_remoteId = -1;
+			}
+			continue;
+		}
 		if ( h.type != PACKET_SNAPSHOT ) continue;
+		if ( h.player == me && !echo ) continue;   // Ourselves.
+		if ( g_remoteId < 0 ) {
+			g_remoteId = h.player;
+			mp_log( "[NET] Showing player %d.\n", g_remoteId );
+		}
+		else if ( h.player != g_remoteId ) { g_netStats.otherPlayers++; continue; }   // One other player for now.
 		if ( !DecodeSnapshot( packet, length, &incoming ) ) { g_netStats.badPackets++; continue; }
 		g_remote.Add( incoming, h.sequence );
+		g_remoteLastHeard = now;
+	}
+	if ( g_remoteId >= 0 && now - g_remoteLastHeard > REMOTE_SILENT_MS ) {
+		mp_log( "[NET] Nothing from player %d for %u s : forgetting them.\n", g_remoteId, REMOTE_SILENT_MS / 1000 );
+		g_remote.Reset();
+		g_remoteId = -1;
 	}
 
-	uint32_t now = NetNowMs();
 	g_target = g_remote.Update( now, DELAY_CHOICES[g_delayIndex] );
 	if ( g_target && g_target->level != Gizmod::getCurrentLevelCRC() ) g_target = 0;   // Another level : not shown.
 
@@ -2356,6 +2402,16 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 
 	PushLocalSnapshot( self );
 	NetUpdate();
+	// Another player in this level : show them (Evil Harry appears on his own).
+	if ( g_networked && !g_autotest && !g_puppet && g_target ) {
+		static uint32_t lastTry = 0;
+		uint32_t now = NetNowMs();
+		if ( now - lastTry >= 1000 ) {
+			lastTry = now;
+			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", g_remoteId );
+			SpawnPuppet( self );
+		}
+	}
 	if ( g_autotest ) AutotestStep( self );
 	HandleHotkeys( self );
 }
@@ -2404,6 +2460,69 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 
 
 // --------------------------------------------------------------------------------
+// Settings (see the top of this file).
+// --------------------------------------------------------------------------------
+struct NetConfig
+{
+	char server[128];
+	char room[64];
+	char name[64];
+	bool echo;
+};
+
+static const char DEFAULT_INI[] =
+	"; Multiplayer mod settings.\r\n"
+	"[Network]\r\n"
+	"; Relay server (host:port). Empty : no network, Evil Harry (F5) replays you.\r\n"
+	"Server=\r\n"
+	"; Players in the same room see each other.\r\n"
+	"Room=default\r\n"
+	"Name=Harry\r\n"
+	"; 1 : the server sends your own moves back to you (Evil Harry replays you\r\n"
+	"; through the internet, to test alone).\r\n"
+	"Echo=0\r\n";
+
+static void GetEnvOverride( const char* var, char* value, int size )
+{
+	char buf[128];
+	DWORD n = GetEnvironmentVariableA( var, buf, sizeof(buf) );
+	if ( n > 0 && n < sizeof(buf) ) strncpy_s( value, size, buf, _TRUNCATE );
+}
+
+static void ReadNetConfig( NetConfig* c )
+{
+	// mods\Multiplayer.ini, next to this plugin.
+	char ini[MAX_PATH] = { 0, };
+	HMODULE self = 0;
+	GetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) &ReadNetConfig, &self );
+	GetModuleFileNameA( self, ini, MAX_PATH );
+	char* slash = strrchr( ini, '\\' );
+	if ( slash ) strcpy_s( slash + 1, MAX_PATH - (slash + 1 - ini), "Multiplayer.ini" );
+
+	if ( GetFileAttributesA( ini ) == INVALID_FILE_ATTRIBUTES ) {
+		FILE* f = 0;
+		if ( fopen_s( &f, ini, "wb" ) == 0 && f ) {
+			fwrite( DEFAULT_INI, 1, sizeof(DEFAULT_INI) - 1, f );
+			fclose( f );
+			mp_log( "[NET] Wrote default settings to %s.\n", ini );
+		}
+	}
+	GetPrivateProfileStringA( "Network", "Server", "", c->server, sizeof(c->server), ini );
+	GetPrivateProfileStringA( "Network", "Room", "default", c->room, sizeof(c->room), ini );
+	GetPrivateProfileStringA( "Network", "Name", "Harry", c->name, sizeof(c->name), ini );
+	char echo[8] = "0";
+	GetPrivateProfileStringA( "Network", "Echo", "0", echo, sizeof(echo), ini );
+
+	GetEnvOverride( "PTLE_MP_SERVER", c->server, sizeof(c->server) );
+	GetEnvOverride( "PTLE_MP_ROOM", c->room, sizeof(c->room) );
+	GetEnvOverride( "PTLE_MP_NAME", c->name, sizeof(c->name) );
+	GetEnvOverride( "PTLE_MP_ECHO", echo, sizeof(echo) );
+	c->echo = echo[0] == '1';
+}
+
+
+
+// --------------------------------------------------------------------------------
 // Plugin.
 // --------------------------------------------------------------------------------
 class MultiplayerPlugin : public GizmodPlugin, public ILoadLevelListener
@@ -2434,15 +2553,34 @@ public:
 
 		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
 
-		// The transport : loopback (the puppet replays us), with simulated network
-		// conditions from PTLE_MP_NETSIM="latency,jitter,loss" (ms, ms, fraction).
-		NetSimulation sim = { 0, 0, 0.0F };
-		char simEnv[64] = { 0, };
-		if ( GetEnvironmentVariableA( "PTLE_MP_NETSIM", simEnv, sizeof(simEnv) ) ) {
-			sscanf_s( simEnv, "%d,%d,%f", &sim.latencyMs, &sim.jitterMs, &sim.loss );
+		// Several games at once (PTLE_MP_INSTANCE, multiplayer tests on one computer) :
+		// the game allows one copy only (CreateMutex at 0x60D456; if it already exists
+		// the new copy brings the old one's window up and quits). Always "doesn't exist".
+		char instance[32];
+		if ( GetEnvironmentVariableA( "PTLE_MP_INSTANCE", instance, sizeof(instance) ) ) {
+			injector::WriteMemory<uint8_t>( 0x60D46A, 0xEB, true );   // jne -> jmp.
+			mp_log( "[MP] Instance \"%s\" : more than one copy of the game allowed.\n", instance );
 		}
-		g_transport = CreateLoopbackTransport( sim );
-		mp_log( "[NET] Loopback transport (latency %d ms, jitter %d ms, loss %.0f%%).\n", sim.latencyMs, sim.jitterMs, sim.loss * 100.0F );
+
+		g_netLog = mp_log;
+		NetConfig config;
+		ReadNetConfig( &config );
+		if ( config.server[0] ) {
+			g_networked = true;
+			g_transport = CreateUdpTransport( config.server, config.room, config.name, config.echo );
+			mp_log( "[NET] Server %s, room \"%s\", name \"%s\"%s.\n", config.server, config.room, config.name, config.echo ? ", echo" : "" );
+		}
+		else {
+			// Loopback (the puppet replays us), with simulated network conditions
+			// from PTLE_MP_NETSIM="latency,jitter,loss" (ms, ms, fraction).
+			NetSimulation sim = { 0, 0, 0.0F };
+			char simEnv[64] = { 0, };
+			if ( GetEnvironmentVariableA( "PTLE_MP_NETSIM", simEnv, sizeof(simEnv) ) ) {
+				sscanf_s( simEnv, "%d,%d,%f", &sim.latencyMs, &sim.jitterMs, &sim.loss );
+			}
+			g_transport = CreateLoopbackTransport( sim );
+			mp_log( "[NET] No server : loopback (latency %d ms, jitter %d ms, loss %.0f%%).\n", sim.latencyMs, sim.jitterMs, sim.loss * 100.0F );
+		}
 
 		char env[8] = { 0, };
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
