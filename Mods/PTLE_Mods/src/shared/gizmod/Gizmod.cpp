@@ -54,6 +54,9 @@ std::string Gizmod::getVersionString() const
 
 void Gizmod::showConsole()
 {
+	// GIZMOD_NO_CONSOLE=1 (background test runs) : no console window popping up in front.
+	char env[4] = { 0, };
+	if ( GetEnvironmentVariableA( "GIZMOD_NO_CONSOLE", env, sizeof(env) ) && env[0] == '1' ) return;
 	AllocConsole();
 }
 

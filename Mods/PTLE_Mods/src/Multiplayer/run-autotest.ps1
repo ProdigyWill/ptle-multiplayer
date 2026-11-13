@@ -1,12 +1,18 @@
-# Builds the Multiplayer plugin, installs it, runs the game in autotest mode and
-# collects the results (log + screenshots converted to PNG).
+# Builds the mod loader and the Multiplayer and WindowedMode plugins, installs them,
+# runs the game in autotest mode and collects the results (log + screenshots
+# converted to PNG).
 #
-#   powershell -ExecutionPolicy Bypass -File run-autotest.ps1 [-NoBuild] [-TimeoutSec 420]
+#   powershell -ExecutionPolicy Bypass -File run-autotest.ps1 [-NoBuild] [-Foreground] [-TimeoutSec 420]
+#
+# By default the test runs in the background : the game window opens behind the
+# others without taking focus, and its keys are fed to it directly, so the computer
+# stays usable. -Foreground brings the game to the front and sends real key presses.
 #
 # Results : Documents\PTLE Multiplayer\logs\multiplayer.log and logs\shots\*.png
 
 param(
 	[switch] $NoBuild,
+	[switch] $Foreground,
 	[int] $TimeoutSec = 420
 )
 
@@ -25,23 +31,33 @@ if (Get-Process -Name 'PITFALL The Lost Expedition' -ErrorAction SilentlyContinu
 }
 
 if (-not $NoBuild) {
-	Write-Host '== Building Multiplayer plugin'
-	& $msbuild (Join-Path $modsDir 'PTLE_Mods.sln') /t:Multiplayer /p:Configuration=Release /p:Platform=Win32 `
+	Write-Host '== Building the mod loader, Multiplayer and WindowedMode'
+	& $msbuild (Join-Path $modsDir 'PTLE_Mods.sln') '/t:ModLoader;Multiplayer;WindowedMode' /p:Configuration=Release /p:Platform=Win32 `
 		/p:PlatformToolset=v143 /p:TrackFileAccess=false /v:minimal /nologo | Out-Host
 	if ($LASTEXITCODE -ne 0) { throw "Build failed ($LASTEXITCODE)." }
 }
 
 Write-Host '== Installing'
-Copy-Item (Join-Path $modsDir 'bin\Release\Multiplayer.asi') (Join-Path $gameDir 'mods\Multiplayer.asi') -Force
+Copy-Item (Join-Path $modsDir 'bin\Release\binkw32.dll') (Join-Path $gameDir 'binkw32.dll') -Force   # The mod loader.
+foreach ($mod in 'Multiplayer', 'WindowedMode') {
+	Copy-Item (Join-Path $modsDir "bin\Release\$mod.asi") (Join-Path $gameDir "mods\$mod.asi") -Force
+}
 
 if (Test-Path $shotsDir) { Remove-Item (Join-Path $shotsDir '*') -Force }
 
-Write-Host '== Running game in autotest mode'
-$env:PTLE_MP_AUTOTEST = '1'
+$vars = @{ PTLE_MP_AUTOTEST = '1' }
+if ($Foreground) {
+	$vars.PTLE_MP_FOREGROUND = '1'
+	Write-Host '== Running game in autotest mode (in front, real key presses)'
+} else {
+	$vars.GIZMOD_NO_CONSOLE = '1'   # Its console window would pop up in front.
+	Write-Host '== Running game in autotest mode (in the background)'
+}
+foreach ($k in $vars.Keys) { Set-Item "Env:$k" $vars[$k] }
 try {
 	$proc = Start-Process -FilePath $gameExe -WorkingDirectory $gameDir -PassThru
 } finally {
-	Remove-Item Env:PTLE_MP_AUTOTEST
+	foreach ($k in $vars.Keys) { Remove-Item "Env:$k" }
 }
 
 if (-not $proc.WaitForExit($TimeoutSec * 1000)) {

@@ -18,6 +18,7 @@
 // --------------------------------------------------------------------------------
 
 #include <Windows.h>
+#include <d3d9.h>
 #include <math.h>
 #include <ShlObj.h>
 #include <share.h>
@@ -1272,9 +1273,14 @@ static void HandleHotkeys( EIHarry* harry )
 
 // --------------------------------------------------------------------------------
 // Autotest mode (environment variable PTLE_MP_AUTOTEST=1, set by
-// tools\run-autotest.ps1). Presses Enter through the menus, auto-skips
-// cutscenes, then runs a scripted test on the game thread, takes screenshots
-// into logs\shots\ and exits the game. Normal launches are unaffected.
+// run-autotest.ps1). Presses Enter through the menus, auto-skips cutscenes,
+// then runs a scripted test on the game thread, takes screenshots into
+// logs\shots\ and exits the game. Normal launches are unaffected.
+//
+// It runs in the background : the game never takes focus, its keys come from the
+// test (fed into the game's keyboard poll) and screenshots come from the window
+// itself, so the computer stays usable meanwhile. PTLE_MP_FOREGROUND=1 instead
+// brings the game to the front and sends real key presses (the old way).
 // --------------------------------------------------------------------------------
 GET_METHOD( 0x4B55F0, void, EIHarry_Teleport, EIHarry*, Matrix4f*, bool, float );
 
@@ -1286,9 +1292,12 @@ static const uint32_t AUTOTEST_LEVEL = 0x7567D75A;
 static volatile LONG g_settled = 0;           // 1 = cutscene/book dismissed, game runs.
 
 static bool g_autotest = false;
+static bool g_background = false;             // Autotest without focus (see above).
+static volatile uint8_t g_fakeKeys[256];      // Background : the keys the test holds (DirectInput codes).
 static bool g_skipPuppetAI = false;           // true = don't run Evil Harry's own tick (no animation).
 static volatile LONG g_autotestDone = 0;      // 1 = pass, 2 = fail.
 static volatile LONG g_snapPending = 0;
+static volatile LONG g_windowFailures = 0;    // Game window checks (always on top).
 static volatile LONG g_holdKey = 0;           // Virtual key the autotest thread should hold...
 static volatile LONG g_holdMs = 0;            // ...for this long.
 static volatile LONG g_holdKey2 = 0;          // Second key held at the same time (e.g. crouch + walk).
@@ -1305,12 +1314,41 @@ static void RequestSnapshot( const char* name )
 	InterlockedExchange( &g_snapPending, 1 );
 }
 
-// Grabs the game window's client area from the screen into logs\shots\<name>.bmp.
-static void TakeSnapshot( const char* name )
+// Writes a 24-bit bottom-up image to logs\shots\<name>.bmp.
+static void WriteBmp( const char* name, int w, int h, const void* bits )
+{
+	char path[MAX_PATH];
+	sprintf_s( path, "%s\\shots", g_logDir );
+	CreateDirectoryA( path, 0 );
+	sprintf_s( path, "%s\\shots\\%s.bmp", g_logDir, name );
+
+	BITMAPINFOHEADER ih; ZeroMemory( &ih, sizeof(ih) );
+	ih.biSize = sizeof(BITMAPINFOHEADER);
+	ih.biWidth = w;
+	ih.biHeight = h;   // Bottom-up, as BMP files expect.
+	ih.biPlanes = 1;
+	ih.biBitCount = 24;
+	ih.biCompression = BI_RGB;
+	DWORD imageSize = (((w * 3) + 3) & ~3) * h;
+	BITMAPFILEHEADER fh; ZeroMemory( &fh, sizeof(fh) );
+	fh.bfType = 0x4D42;
+	fh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+	fh.bfSize = fh.bfOffBits + imageSize;
+
+	FILE* f = 0;
+	if ( fopen_s( &f, path, "wb" ) == 0 && f ) {
+		fwrite( &fh, sizeof(fh), 1, f );
+		fwrite( &ih, sizeof(ih), 1, f );
+		fwrite( bits, imageSize, 1, f );
+		fclose( f );
+		mp_log( "[AT] Screenshot : shots\\%s.bmp\n", name );
+	}
+}
+
+// Foreground : grabs the game window's client area from the screen.
+static void GrabScreen( const char* name )
 {
 	HWND wnd = *((HWND*) HWND_GAME_WINDOW);
-	if ( !wnd || !g_logDir[0] ) return;
-
 	RECT rc;
 	GetClientRect( wnd, &rc );
 	POINT origin = { 0, 0 };
@@ -1323,7 +1361,7 @@ static void TakeSnapshot( const char* name )
 	BITMAPINFO bi; ZeroMemory( &bi, sizeof(bi) );
 	bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 	bi.bmiHeader.biWidth = w;
-	bi.bmiHeader.biHeight = h;   // Bottom-up, as BMP files expect.
+	bi.bmiHeader.biHeight = h;
 	bi.bmiHeader.biPlanes = 1;
 	bi.bmiHeader.biBitCount = 24;
 	bi.bmiHeader.biCompression = BI_RGB;
@@ -1332,36 +1370,172 @@ static void TakeSnapshot( const char* name )
 	HGDIOBJ old = SelectObject( mem, dib );
 	BitBlt( mem, 0, 0, w, h, screen, origin.x, origin.y, SRCCOPY | CAPTUREBLT );
 	GdiFlush();
-
-	char path[MAX_PATH];
-	sprintf_s( path, "%s\\shots", g_logDir );
-	CreateDirectoryA( path, 0 );
-	sprintf_s( path, "%s\\shots\\%s.bmp", g_logDir, name );
-
-	DWORD stride = ((w * 3) + 3) & ~3;
-	DWORD imageSize = stride * h;
-	BITMAPFILEHEADER fh; ZeroMemory( &fh, sizeof(fh) );
-	fh.bfType = 0x4D42;
-	fh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-	fh.bfSize = fh.bfOffBits + imageSize;
-
-	FILE* f = 0;
-	if ( fopen_s( &f, path, "wb" ) == 0 && f ) {
-		fwrite( &fh, sizeof(fh), 1, f );
-		fwrite( &bi.bmiHeader, sizeof(BITMAPINFOHEADER), 1, f );
-		fwrite( bits, imageSize, 1, f );
-		fclose( f );
-		mp_log( "[AT] Screenshot : shots\\%s.bmp\n", name );
-	}
-
+	WriteBmp( name, w, h, bits );
 	SelectObject( mem, old );
 	DeleteObject( dib );
 	DeleteDC( mem );
 	ReleaseDC( 0, screen );
 }
 
+// Background : the window may be covered (and its Direct3D 9 output isn't in what
+// Windows can capture of it), so the frame is copied from the back buffer right
+// before the game presents it. The renderer is a static object at 0x926790 with
+// its IDirect3DDevice9 at +0x74 (filled by CreateDevice at 0x697FB2).
+static const uint32_t RENDERER_DEVICE = 0x926790 + 0x74;
+static const int VTABLE_SLOT_PRESENT = 17;   // IDirect3DDevice9::Present.
+typedef HRESULT (__stdcall *PresentFunc)( IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA* );
+static PresentFunc g_origPresent = 0;
+static volatile LONG g_grabRequested = 0;
+static char g_grabName[64];
+static HANDLE g_grabDone = 0;
+
+static void GrabBackBuffer( IDirect3DDevice9* dev )
+{
+	IDirect3DSurface9* back = 0;
+	IDirect3DSurface9* resolved = 0;
+	IDirect3DSurface9* copy = 0;
+	if ( FAILED( dev->GetBackBuffer( 0, 0, D3DBACKBUFFER_TYPE_MONO, &back ) ) ) { mp_log( "[AT] Screenshot : no back buffer.\n" ); return; }
+	D3DSURFACE_DESC d;
+	back->GetDesc( &d );
+	IDirect3DSurface9* source = back;
+	if ( d.MultiSampleType != D3DMULTISAMPLE_NONE
+	  && SUCCEEDED( dev->CreateRenderTarget( d.Width, d.Height, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &resolved, 0 ) )
+	  && SUCCEEDED( dev->StretchRect( back, 0, resolved, 0, D3DTEXF_NONE ) ) ) {
+		source = resolved;
+	}
+	D3DLOCKED_RECT lr;
+	if ( SUCCEEDED( dev->CreateOffscreenPlainSurface( d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &copy, 0 ) )
+	  && SUCCEEDED( dev->GetRenderTargetData( source, copy ) )
+	  && SUCCEEDED( copy->LockRect( &lr, 0, D3DLOCK_READONLY ) ) ) {
+		int w = d.Width, h = d.Height;
+		int stride = ((w * 3) + 3) & ~3;
+		uint8_t* bits = (uint8_t*) calloc( stride, h );
+		for ( int y = 0; bits && y < h; y++ ) {
+			const uint8_t* src = (const uint8_t*) lr.pBits + y * lr.Pitch;
+			uint8_t* dst = bits + (h - 1 - y) * stride;
+			for ( int x = 0; x < w; x++, dst += 3 ) {
+				if ( d.Format == D3DFMT_X8R8G8B8 || d.Format == D3DFMT_A8R8G8B8 ) {
+					dst[0] = src[x * 4]; dst[1] = src[x * 4 + 1]; dst[2] = src[x * 4 + 2];
+				}
+				else {   // 16-bit : R5G6B5, or X1R5G5B5.
+					uint16_t v = ((const uint16_t*) src)[x];
+					bool g6 = d.Format == D3DFMT_R5G6B5;
+					dst[0] = (uint8_t) ((v & 0x1F) << 3);
+					dst[1] = (uint8_t) (g6 ? ((v >> 5) & 0x3F) << 2 : ((v >> 5) & 0x1F) << 3);
+					dst[2] = (uint8_t) (g6 ? ((v >> 11) & 0x1F) << 3 : ((v >> 10) & 0x1F) << 3);
+				}
+			}
+		}
+		if ( bits ) WriteBmp( g_grabName, w, h, bits );
+		free( bits );
+		copy->UnlockRect();
+	}
+	else {
+		mp_log( "[AT] Screenshot : couldn't read the back buffer (format %d).\n", d.Format );
+	}
+	if ( copy ) copy->Release();
+	if ( resolved ) resolved->Release();
+	back->Release();
+}
+
+static HRESULT __stdcall Present_Hook( IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty )
+{
+	if ( g_grabRequested ) {
+		GrabBackBuffer( dev );
+		InterlockedExchange( &g_grabRequested, 0 );
+		SetEvent( g_grabDone );
+	}
+	return g_origPresent( dev, src, dst, wnd, dirty );
+}
+
+// Hooks the device's Present once it exists.
+static bool HookPresent()
+{
+	if ( g_origPresent ) return true;
+	IDirect3DDevice9* dev = *(IDirect3DDevice9**) RENDERER_DEVICE;
+	HMODULE d3d9 = GetModuleHandleA( "d3d9.dll" );
+	if ( !dev || !d3d9 ) return false;
+	// Windows' d3d9.dll gives each device its own copy of the vtable (heap memory),
+	// so the check is on Present itself : it must be code in a loaded module.
+	void** vtable = *(void***) dev;
+	MEMORY_BASIC_INFORMATION mbi;
+	if ( !VirtualQuery( vtable, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT
+	  || !VirtualQuery( vtable[VTABLE_SLOT_PRESENT], &mbi, sizeof(mbi) ) || mbi.Type != MEM_IMAGE ) {
+		mp_log( "[AT] The renderer's device (0x%.8X) doesn't look like a Direct3D 9 device.\n", (uint32_t) dev );
+		return false;
+	}
+	char module[MAX_PATH] = "?";
+	GetModuleFileNameA( (HMODULE) mbi.AllocationBase, module, MAX_PATH );
+	mp_log( "[AT] Direct3D device 0x%.8X, Present in %s.\n", (uint32_t) dev, module );
+	g_grabDone = CreateEventA( 0, FALSE, FALSE, 0 );
+	g_origPresent = (PresentFunc) vtable[VTABLE_SLOT_PRESENT];
+	injector::WriteMemory( &vtable[VTABLE_SLOT_PRESENT], &Present_Hook, true );
+	mp_log( "[AT] Screenshots come from the Direct3D back buffer.\n" );
+	return true;
+}
+
+// Saves the game's picture into logs\shots\<name>.bmp.
+static void TakeSnapshot( const char* name )
+{
+	if ( !*((HWND*) HWND_GAME_WINDOW) || !g_logDir[0] ) return;
+	if ( !g_background ) { GrabScreen( name ); return; }
+	if ( !HookPresent() ) { mp_log( "[AT] Screenshot %s skipped : no Direct3D device yet.\n", name ); return; }
+	strcpy_s( g_grabName, name );
+	ResetEvent( g_grabDone );
+	InterlockedExchange( &g_grabRequested, 1 );
+	if ( WaitForSingleObject( g_grabDone, 3000 ) != WAIT_OBJECT_0 ) {
+		InterlockedExchange( &g_grabRequested, 0 );
+		mp_log( "[AT] Screenshot %s skipped : no frame presented.\n", name );
+	}
+}
+
+// DirectInput key code of a virtual key (the arrows are "extended" keys).
+static uint8_t KeyToDIK( WORD vk )
+{
+	switch ( vk ) {
+	case VK_UP:    return 0xC8;
+	case VK_DOWN:  return 0xD0;
+	case VK_LEFT:  return 0xCB;
+	case VK_RIGHT: return 0xCD;
+	}
+	return (uint8_t) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC );
+}
+
+// The game polls the keyboard (0x6E8A80, called from 0x663BBE) through DirectInput
+// in foreground mode : the keys down now at 0x940EC0, a frame earlier at 0x940C90
+// (all up while the window isn't in front). In background autotests the keys come
+// from the test instead, whatever window is in front.
+static const uint32_t KEYS_NOW = 0x940EC0, KEYS_BEFORE = 0x940C90;
+static const uint32_t POLL_KEYBOARD = 0x6E8A80, POLL_KEYBOARD_CALL = 0x663BBE;
+
+static void PollKeyboard_Hook()
+{
+	uint8_t before[256];
+	memcpy( before, (void*) KEYS_NOW, sizeof(before) );
+	((void (*)()) POLL_KEYBOARD)();
+	memcpy( (void*) KEYS_BEFORE, before, sizeof(before) );   // Not cleared : held keys stay held.
+	for ( int i = 0; i < 256; i++ ) ((uint8_t*) KEYS_NOW)[i] = g_fakeKeys[i];
+}
+
+// The game window shows up without being activated or brought forward : its
+// startup SetFocus and SetForegroundWindow calls just drop their argument,
+// SetWindowPos gets SWP_NOACTIVATE and ShowWindow SW_SHOWNOACTIVATE (same for the
+// SetFocus + ShowWindow pair at 0x698383).
+static void PatchWindowNoActivate()
+{
+	static const uint8_t POP_ARG[6] = { 0x83, 0xC4, 0x04, 0x90, 0x90, 0x90 };   // add esp, 4
+	injector::WriteMemoryRaw( 0x60D660, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
+	injector::WriteMemoryRaw( 0x60D66D, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetForegroundWindow.
+	injector::WriteMemory<uint8_t>( 0x60D674, SWP_NOACTIVATE, true );
+	injector::WriteMemory<uint8_t>( 0x60D6AA, SW_SHOWNOACTIVATE, true );
+	injector::WriteMemory<uint8_t>( 0x60D180, SW_SHOWNOACTIVATE, true );
+	injector::WriteMemoryRaw( 0x698383, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
+	injector::WriteMemory<uint8_t>( 0x69838A, SW_SHOWNOACTIVATE, true );
+}
+
 static void SendKey( WORD vk, bool down )
 {
+	if ( g_background ) { g_fakeKeys[KeyToDIK( vk )] = down ? 0x80 : 0; return; }
 	INPUT in; ZeroMemory( &in, sizeof(in) );
 	in.type = INPUT_KEYBOARD;
 	in.ki.wScan = (WORD) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC );
@@ -1372,6 +1546,12 @@ static void SendKey( WORD vk, bool down )
 
 static void TapKey( WORD vk )
 {
+	if ( g_background ) {
+		SendKey( vk, true );
+		Sleep( 100 );
+		SendKey( vk, false );
+		return;
+	}
 	INPUT in[2]; ZeroMemory( in, sizeof(in) );
 	WORD scan = (WORD) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC );
 	in[0].type = INPUT_KEYBOARD;
@@ -1398,6 +1578,7 @@ static void EnableAutoSkipCutscenes()
 // waits up to a second for it. Keys are only ever sent to the game itself.
 static bool EnsureGameFocus( HWND wnd )
 {
+	if ( g_background ) return true;   // Keys reach the game whatever is in front.
 	for ( int i = 0; i < 10 && !GameHasFocus(); i++ ) {
 		// Windows ignores SetForegroundWindow from a background thread unless it
 		// shares input with the current foreground window, so attach briefly.
@@ -1418,12 +1599,17 @@ static DWORD WINAPI AutotestThread( void* )
 	mp_log( "[AT] Autotest mode on.\n" );
 
 	HWND wnd = 0;
-	while ( !(wnd = *((HWND*) HWND_GAME_WINDOW)) ) {
+	while ( !(wnd = *((HWND*) HWND_GAME_WINDOW)) || (g_background && !IsWindowVisible( wnd )) ) {
 		if ( GetTickCount() - start > 60000 ) {
 			mp_log( "[AT] FAIL : game window never appeared.\n" );
 			ExitProcess( 2 );
 		}
 		Sleep( 200 );
+	}
+	if ( g_background ) {
+		// Behind every other window, without activating it : it keeps rendering.
+		SetWindowPos( wnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE );
+		mp_log( "[AT] Running in the background (game window behind the others, keys fed to it directly).\n" );
 	}
 	Sleep( 3000 );
 
@@ -1474,12 +1660,16 @@ static DWORD WINAPI AutotestThread( void* )
 		char name[32];
 		sprintf_s( name, "settle_stalled_%d", attempt );
 		TakeSnapshot( name );
-		if ( GameHasFocus() ) { TapKey( VK_ESCAPE ); mp_log( "[AT] Game looks paused, pressed Esc.\n" ); }
+		if ( g_background || GameHasFocus() ) { TapKey( VK_ESCAPE ); mp_log( "[AT] Game looks paused, pressed Esc.\n" ); }
 		Sleep( 1500 );
 	}
 	TakeSnapshot( "settle_2_free" );
 	InterlockedExchange( &g_settled, 1 );
 	mp_log( "[AT] Game runs freely, starting the test script.\n" );
+	// The WindowedMode mod keeps the game from staying above every other window.
+	bool topmost = (GetWindowLongA( wnd, GWL_EXSTYLE ) & WS_EX_TOPMOST) != 0;
+	mp_log( "[AT] Game window always on top : %s.\n", topmost ? "yes (WRONG)" : "no (ok)" );
+	if ( topmost ) InterlockedIncrement( &g_windowFailures );
 
 	// The scripted part runs on the game thread (AutotestStep). Service screenshots
 	// and key holds.
@@ -1503,7 +1693,7 @@ static DWORD WINAPI AutotestThread( void* )
 				mp_log( "[AT] Game isn't the active window, not holding key 0x%X.\n", k );
 			}
 		}
-		if ( heldKey && (GetTickCount() >= releaseAt || !GameHasFocus()) ) {
+		if ( heldKey && (GetTickCount() >= releaseAt || (!g_background && !GameHasFocus())) ) {
 			SendKey( heldKey, false );
 			heldKey = 0;
 		}
@@ -1514,7 +1704,7 @@ static DWORD WINAPI AutotestThread( void* )
 			heldKey2 = (WORD) k2;
 			releaseAt2 = GetTickCount() + g_holdMs2;
 		}
-		if ( heldKey2 && (GetTickCount() >= releaseAt2 || !GameHasFocus()) ) {
+		if ( heldKey2 && (GetTickCount() >= releaseAt2 || (!g_background && !GameHasFocus())) ) {
 			SendKey( heldKey2, false );
 			heldKey2 = 0;
 		}
@@ -2059,7 +2249,8 @@ static void AutotestStep( EIHarry* harry )
 		LogTelemetry( harry, "final" );
 		RequestSnapshot( "05_stopped" );
 		if ( g_itemFailures ) mp_log( "[AT] FAIL : %d item steps wrong.\n", g_itemFailures );
-		InterlockedExchange( &g_autotestDone, g_itemFailures ? 2 : 1 );
+		if ( g_windowFailures ) mp_log( "[AT] FAIL : the game window stays on top of others.\n" );
+		InterlockedExchange( &g_autotestDone, (g_itemFailures || g_windowFailures) ? 2 : 1 );
 		break;
 	}
 }
@@ -2171,6 +2362,11 @@ public:
 		char env[8] = { 0, };
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
 			g_autotest = true;
+			g_background = !(GetEnvironmentVariableA( "PTLE_MP_FOREGROUND", env, sizeof(env) ) && env[0] == '1');
+			if ( g_background ) {
+				injector::MakeCALL( POLL_KEYBOARD_CALL, &PollKeyboard_Hook );
+				PatchWindowNoActivate();
+			}
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			EnableAutoSkipCutscenes();
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );

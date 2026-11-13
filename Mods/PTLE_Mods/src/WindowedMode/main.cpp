@@ -39,6 +39,10 @@ void InitMod()
 
 		// Window styles.
 		injector::WriteMemory<uint32_t>( 0x6E860A, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX) );
+
+		// Don't keep the window above all others : the game's SetWindowPos( HWND_TOPMOST )
+		// (push -1 at 0x60D686) becomes HWND_NOTOPMOST (-2).
+		injector::WriteMemory<uint8_t>( 0x60D687, 0xFE );
 	}
 
 	// Functional window.
