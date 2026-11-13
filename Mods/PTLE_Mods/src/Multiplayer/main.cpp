@@ -154,10 +154,12 @@ struct PlayerSnapshot
 	float clipWeight;
 	int heldItem;                                // Item table index of the item in Harry's hand, or -1.
 	int drawnSlot;                               // DRAWN_ITEMS index of the item Harry's hand drew, or -1.
-	Matrix4f itemLocal;                          // Its matrix relative to Harry's transform.
+	int itemHand;                                // What itemLocal is relative to : HAND_RIGHT or HAND_BODY (his transform).
+	Matrix4f itemLocal;
 };
 
 static int g_drawnSlot = -1;                     // What Harry's hand drew since the last snapshot.
+static int g_drawnHand = -1;
 static Matrix4f g_drawnLocal;
 
 // Row-vector matrices (translation in row 3) : world = local * parent.
@@ -244,6 +246,10 @@ static uint32_t GetLayerClipCRC( uint8_t* layer )
 	return clip ? *(uint32_t*) (clip + CLIP_CRC) : 0;
 }
 
+// Layer 217 holds a frozen pose (its clock never moves) that Harry blends from
+// when he switches item animations; mirroring it froze the puppet mid pull-out.
+static const int HOLD_POSE_LAYER = 217;
+
 // The clip a character is mostly showing : its highest-weight layer.
 static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight )
 {
@@ -251,6 +257,7 @@ static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight 
 	float bestWeight = 0.01F;
 	int bestLayer = -1;
 	for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
+		if ( i == HOLD_POSE_LAYER ) continue;
 		uint8_t* layer = GetAnimLayer( c, i );
 		if ( !layer ) continue;
 		float w = *(float*) (layer + LAYER_WEIGHT);
@@ -299,6 +306,8 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 	int layer = -1;
 	s.clipCRC = GetPlayingClip( harry, &layer, &s.clipWeight );
+	static uint32_t lastPlayed = 0;   // Only the hold-pose layer is up : keep the clip before it.
+	if ( s.clipCRC ) lastPlayed = s.clipCRC; else s.clipCRC = lastPlayed;
 	static uint32_t lastClip = 0;
 	if ( s.clipCRC != lastClip ) {
 		mp_log( "[MP] Harry plays clip 0x%.8X (layer %d, weight %.2f, %s).\n",
@@ -308,6 +317,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 	s.heldItem = GetHeldItem( harry );
 	s.drawnSlot = g_drawnSlot;   // Torch, TNT or raft drawn since the last tick (see NoteHarryItemDraw).
+	s.itemHand = g_drawnHand;
 	s.itemLocal = g_drawnLocal;
 	g_drawnSlot = -1;
 	static int lastItem = -1;
@@ -838,9 +848,10 @@ static void ApplyPuppetItem( EIEvilHarryP* p, const PlayerSnapshot* t )
 // top of it, the raft through its inflating animated model. They only draw while
 // out (item state +0x70 is 2-4, byte +0x91 set; the raft also needs byte +0x108).
 //
-// Each time one draws for Harry we note where, relative to Harry; the snapshot
-// keeps it. The puppet's own render then draws the item where the snapshot says,
-// relative to the puppet, with those fields forced for the duration of the call.
+// Each time one draws for Harry we note where, relative to his hand (or body, for
+// the raft); the snapshot keeps it. The puppet's own render then draws the item
+// there relative to the puppet's hand (or body), with those fields forced for the
+// duration of the call.
 typedef void (__thiscall *ItemDrawFunc)( void* item, void* context, void* arg );
 typedef void (__thiscall *RenderFunc)( EInstance* self, void* context, void* arg );
 static const uint32_t ITEM_SLOT_DRAW = 4 * 4;
@@ -866,16 +877,32 @@ static RenderFunc g_origEvilHarryRender = 0;
 
 static int g_puppetItemDraws = 0;     // For the autotest.
 
+// Harry's right hand matrix (the torch draws at exactly 1.5 x it; TNT sits on it
+// too) and, on Evil Harry, the pickaxe model on the same hand : with both playing
+// the same clip, m_pickaxeModel1's matrix matches Harry's +0x470 relative to the
+// body. So hand-held copies ride the puppet's own hand, whatever pose it is in.
+// (+0x4B0 looks like the left hand, but it doesn't line up with m_pickaxeModel0.)
+static const int HAND_BODY = -1, HAND_RIGHT = 1;
+static const uint32_t HARRY_RIGHT_HAND = 0x470;   // Matrix4f.
+
 static void NoteHarryItemDraw( int slot, void* item )
 {
 	EIHarry* owner = FIELD( item, EIHarry*, ITEM_OWNER );
 	if ( !owner ) return;
 	// Until it has inflated, the raft's draw only poses it (something else shows it).
 	if ( DRAWN_ITEMS[slot].item == ITEM_RAFT && !FIELD( item, uint8_t, RAFT_INFLATED ) ) return;
-	Matrix4f world, ownerInverse;
+	Matrix4f world, inverse;
 	memcpy( &world, (uint8_t*) item + ITEM_WORLD_MATRIX, sizeof(world) );
-	if ( !MatInverseAffine( owner->m_transformMatrix, &ownerInverse ) ) return;
-	MatMul( world, ownerInverse, &g_drawnLocal );
+	g_drawnHand = HAND_BODY;
+	// Hand-held : relative to Harry's right hand. The raft : relative to his body.
+	if ( DRAWN_ITEMS[slot].item != ITEM_RAFT && MatInverseAffine( FIELD( owner, Matrix4f, HARRY_RIGHT_HAND ), &inverse ) ) {
+		MatMul( world, inverse, &g_drawnLocal );
+		g_drawnHand = HAND_RIGHT;
+	}
+	if ( g_drawnHand == HAND_BODY ) {
+		if ( !MatInverseAffine( owner->m_transformMatrix, &inverse ) ) return;
+		MatMul( world, inverse, &g_drawnLocal );
+	}
 	g_drawnSlot = slot;
 }
 
@@ -935,8 +962,15 @@ static void DrawPuppetItem( int slot, void* context, void* arg )
 	if ( !g_puppet ) return;
 	const PlayerSnapshot* t = GetPuppetTarget();
 	if ( !t || t->drawnSlot != slot ) return;
+	const Matrix4f* base = &g_puppet->m_transformMatrix;
+	if ( t->itemHand != HAND_BODY ) {
+		// The puppet's hand : the pickaxe model on it follows that hand bone, shown or not.
+		EIStaticModel* m = (EIStaticModel*) g_puppet->m_pickaxeModel1;
+		if ( !m ) return;
+		base = &m->m_worldTransform;
+	}
 	Matrix4f world;
-	MatMul( t->itemLocal, g_puppet->m_transformMatrix, &world );
+	MatMul( t->itemLocal, *base, &world );
 	DrawItemAt( slot, world, context, arg );
 }
 
