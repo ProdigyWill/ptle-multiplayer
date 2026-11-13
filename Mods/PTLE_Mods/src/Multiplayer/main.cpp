@@ -151,6 +151,7 @@ struct PlayerSnapshot
 	bool onGround;                               // EICharacter::m_onGround (CheatLab writes it too).
 	uint32_t clipCRC;                            // Animation clip the player is playing (0 = unknown).
 	float clipWeight;
+	int heldItem;                                // Item table index of the item in Harry's hand, or -1.
 };
 
 static const int HISTORY_SIZE = 256;
@@ -215,6 +216,32 @@ static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight 
 	return best;
 }
 
+// --------------------------------------------------------------------------------
+// Items. Harry+0x93C (EIPlayer::m_itemHotbar) is really his item manager : its
+// first four pointers are the wheel's items, +0x10 is the item being taken out or
+// put away and +0x14 the item in his hand (0 when empty-handed; cleared as soon as
+// he starts putting it away). The game's item table (0x8EEB90, 9 entries of 0x1C
+// bytes) has each item's object at +4.
+// --------------------------------------------------------------------------------
+static const uint32_t ITEM_TABLE = 0x8EEB90;
+static const uint32_t ITEM_ENTRY_SIZE = 0x1C;
+static const int NUM_ITEMS = 9;
+static const int ITEM_TORCH = 1, ITEM_PICKAXES = 2, ITEM_TNT = 3, ITEM_RAFT = 5;
+static const uint32_t ITEM_MANAGER_HELD = 0x14;
+
+static void* GetItemObject( int index ) { return *(void**) (ITEM_TABLE + index * ITEM_ENTRY_SIZE + 4); }
+
+static int GetHeldItem( EIHarry* harry )
+{
+	void* manager = harry->m_itemHotbar;
+	if ( !manager ) return -1;
+	void* held = FIELD( manager, void*, ITEM_MANAGER_HELD );
+	if ( !held ) return -1;
+	for ( int i = 0; i < NUM_ITEMS; i++ )
+		if ( GetItemObject( i ) == held ) return i;
+	return -1;
+}
+
 static void PushLocalSnapshot( EIHarry* harry )
 {
 	PlayerSnapshot& s = g_history[g_historyHead];
@@ -230,6 +257,13 @@ static void PushLocalSnapshot( EIHarry* harry )
 		mp_log( "[MP] Harry plays clip 0x%.8X (layer %d, weight %.2f, %s).\n",
 			s.clipCRC, layer, s.clipWeight, harry->m_onGround ? "ground" : "air" );
 		lastClip = s.clipCRC;
+	}
+
+	s.heldItem = GetHeldItem( harry );
+	static int lastItem = -1;
+	if ( s.heldItem != lastItem ) {
+		mp_log( "[MP] Harry holds item %d.\n", s.heldItem );
+		lastItem = s.heldItem;
 	}
 
 	g_historyHead = (g_historyHead + 1) % HISTORY_SIZE;
@@ -728,14 +762,34 @@ static void ApplyPuppetCollision( EIEvilHarryP* p )
 	FIELD( p, uint8_t, BEAST_BODY_SOLID ) = g_puppetSolid ? 1 : 0;
 }
 
+// Evil Harry always carries his pickaxes (m_pickaxeModel0/1); show them only while
+// Harry holds his. Bit 0 of an instance's flags (+0x2C) is "visible".
+static const uint32_t INSTANCE_FLAGS = 0x2C;
+static const uint32_t INSTANCE_VISIBLE = 0x1;
+
+static void ShowModel( void* model, bool show )
+{
+	if ( !model ) return;
+	uint32_t& flags = FIELD( model, uint32_t, INSTANCE_FLAGS );
+	flags = show ? (flags | INSTANCE_VISIBLE) : (flags & ~INSTANCE_VISIBLE);
+}
+
+static void ApplyPuppetItem( EIEvilHarryP* p, const PlayerSnapshot* t )
+{
+	bool pickaxes = t && t->heldItem == ITEM_PICKAXES;
+	ShowModel( p->m_pickaxeModel0, pickaxes );
+	ShowModel( p->m_pickaxeModel1, pickaxes );
+}
+
 static void DrivePuppet( EIEvilHarryP* p )
 {
 	ApplyPuppetCollision( p );
 
 	Vector3f pos;
-	if ( !GetPuppetTargetPosition( &pos ) ) return;
+	if ( !GetPuppetTargetPosition( &pos ) ) { ApplyPuppetItem( p, 0 ); return; }
 
 	const PlayerSnapshot* t = GetPuppetTarget();
+	ApplyPuppetItem( p, t );
 	Vector3f rot = t->rotationEuler;
 
 	p->EIBeast::m_position = pos;
@@ -952,9 +1006,10 @@ static void TapKey( WORD vk )
 	WORD scan = (WORD) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC );
 	in[0].type = INPUT_KEYBOARD;
 	in[0].ki.wScan = scan;
-	in[0].ki.dwFlags = KEYEVENTF_SCANCODE;
+	DWORD ext = (vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT) ? KEYEVENTF_EXTENDEDKEY : 0;
+	in[0].ki.dwFlags = KEYEVENTF_SCANCODE | ext;
 	in[1] = in[0];
-	in[1].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+	in[1].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP | ext;
 
 	SendInput( 1, &in[0], sizeof(INPUT) );
 	Sleep( 100 );
@@ -1134,6 +1189,21 @@ static void LogTelemetry( EIHarry* harry, const char* tag )
 }
 
 // Runs every Harry tick on the game thread while in autotest mode.
+// Gives Harry the raft, pickaxes, torch and TNT (like CheatLab's "give stuff").
+static void GiveTestItems( EIHarry* harry )
+{
+	void** wheel = harry->m_itemHotbar;
+	if ( !wheel ) return;
+	wheel[0] = GetItemObject( ITEM_RAFT );       // Up.
+	wheel[1] = GetItemObject( ITEM_PICKAXES );   // Right.
+	wheel[2] = GetItemObject( ITEM_TORCH );      // Down.
+	wheel[3] = GetItemObject( ITEM_TNT );        // Left.
+	for ( int i = 0; i < 8; i++ ) FIELD( ITEM_TABLE + i * ITEM_ENTRY_SIZE, int, 0x14 ) = 1;   // Unlocked.
+	mp_log( "[AT] Gave raft, pickaxes, torch, TNT.\n" );
+}
+
+static int g_itemFailures = 0;
+
 static void AutotestStep( EIHarry* harry )
 {
 	static const LONG WALK_KEYS[] = { 'W', 'A', 'S', 'D' };   // Arrow keys don't move Harry.
@@ -1222,7 +1292,7 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedExchange( &g_autotestDone, 2 );
 			return;
 		}
-		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps.
+		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
 		break;
 
 	case 1:   // Walk Harry with the keyboard; the puppet replays it ~1s later.
@@ -1285,7 +1355,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( step == 0 || now - phaseStart >= 4000 ) {
 			if ( step >= NUM_JUMPS ) {
 				SetAirAnimation( g_puppet, AIR_CANDIDATES[0] );
-				phase = 3; phaseStart = now;
+				phase = 8; phaseStart = now; step = 0; snapped = false;
 				break;
 			}
 			SetAirAnimation( g_puppet, AIR_CANDIDATES[JUMP_CLIP[step]] );
@@ -1352,6 +1422,44 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		break;
+
+	case 8:   // Items : hold numpad 5 and tap an arrow to take an item out or put it away.
+	{
+		// Evil Harry's pickaxes should show only while Harry (a second earlier) held his.
+		static const LONG KEYS[]          = { 0, VK_RIGHT, VK_RIGHT, VK_DOWN, VK_DOWN };
+		static const char* const NAMES[]  = { "empty handed", "pickaxes out", "pickaxes away", "torch out", "torch away" };
+		static const int  EXPECT_ITEM[]   = { -1, ITEM_PICKAXES, -1, ITEM_TORCH, -1 };
+		static const int NUM = 5;
+		DWORD t = now - phaseStart;
+		if ( step == 0 || t >= 3500 ) {
+			if ( step >= NUM ) { phase = 3; phaseStart = now; break; }
+			if ( step == 0 ) GiveTestItems( harry );
+			if ( KEYS[step] ) {
+				InterlockedExchange( &g_holdMs2, 700 );
+				InterlockedExchange( &g_holdKey2, VK_NUMPAD5 );   // Toggle item, held...
+			}
+			step++; phaseStart = now; snapped = false;
+		}
+		else if ( t >= 250 && t < 300 && KEYS[step - 1] ) {
+			InterlockedExchange( &g_tapKey, KEYS[step - 1] );   // ...while the arrow is tapped.
+		}
+		else if ( !snapped && t >= 3000 ) {   // Past the replay delay.
+			int i = step - 1;
+			int held = GetHeldItem( harry );
+			bool shown = g_puppet && g_puppet->m_pickaxeModel0
+				&& (FIELD( g_puppet->m_pickaxeModel0, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE);
+			bool ok = held == EXPECT_ITEM[i] && shown == (EXPECT_ITEM[i] == ITEM_PICKAXES);
+			if ( !ok ) g_itemFailures++;
+			mp_log( "[AT] Item step %d (%s) : Harry holds item %d (expected %d), Evil Harry's pickaxes %s : %s\n",
+				i, NAMES[i], held, EXPECT_ITEM[i], shown ? "shown" : "hidden", ok ? "ok" : "WRONG" );
+			char name[40];
+			sprintf_s( name, "09_item_%d_%s", i, NAMES[i] );
+			for ( char* c = name; *c; c++ ) if ( *c == ' ' ) *c = '_';
+			RequestSnapshot( name );
+			snapped = true;
+		}
+		break;
+	}
 
 	case 7:   // Roll : hold crouch (numpad 8), then walk forward; log Harry's matrices.
 	{
@@ -1473,7 +1581,8 @@ static void AutotestStep( EIHarry* harry )
 		if ( now - phaseStart < 3000 ) break;
 		LogTelemetry( harry, "final" );
 		RequestSnapshot( "05_stopped" );
-		InterlockedExchange( &g_autotestDone, 1 );
+		if ( g_itemFailures ) mp_log( "[AT] FAIL : %d item steps wrong.\n", g_itemFailures );
+		InterlockedExchange( &g_autotestDone, g_itemFailures ? 2 : 1 );
 		break;
 	}
 }
