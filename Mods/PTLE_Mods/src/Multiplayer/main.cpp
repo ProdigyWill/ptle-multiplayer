@@ -33,6 +33,7 @@
 #include "ptle/EIEvilHarryP.h"
 #include "ptle/EBeastStateMachine.h"
 #include "ptle/ERLevel.h"
+#include "ptle/EIStaticModel.h"
 #include "ptle/math/Matrix4f.h"
 #include "ptle/math/Vector3f.h"
 #include "ptle/types/types.h"
@@ -152,7 +153,52 @@ struct PlayerSnapshot
 	uint32_t clipCRC;                            // Animation clip the player is playing (0 = unknown).
 	float clipWeight;
 	int heldItem;                                // Item table index of the item in Harry's hand, or -1.
+	int drawnSlot;                               // DRAWN_ITEMS index of the item Harry's hand drew, or -1.
+	Matrix4f itemLocal;                          // Its matrix relative to Harry's transform.
 };
+
+static int g_drawnSlot = -1;                     // What Harry's hand drew since the last snapshot.
+static Matrix4f g_drawnLocal;
+
+// Row-vector matrices (translation in row 3) : world = local * parent.
+static void MatMul( const Matrix4f& a, const Matrix4f& b, Matrix4f* out )
+{
+	Matrix4f r;
+	for ( int i = 0; i < 4; i++ )
+		for ( int j = 0; j < 4; j++ )
+			r.data[i][j] = a.data[i][0] * b.data[0][j] + a.data[i][1] * b.data[1][j]
+			             + a.data[i][2] * b.data[2][j] + a.data[i][3] * b.data[3][j];
+	*out = r;
+}
+
+// Inverse of an affine matrix (3x3 part may be scaled; last column 0,0,0,1).
+static bool MatInverseAffine( const Matrix4f& m, Matrix4f* out )
+{
+	const float (*a)[4] = m.data;
+	float c00 = a[1][1] * a[2][2] - a[1][2] * a[2][1];
+	float c01 = a[1][2] * a[2][0] - a[1][0] * a[2][2];
+	float c02 = a[1][0] * a[2][1] - a[1][1] * a[2][0];
+	float det = a[0][0] * c00 + a[0][1] * c01 + a[0][2] * c02;
+	if ( fabsf( det ) < 1e-8F ) return false;
+	float k = 1.0F / det;
+	Matrix4f r;
+	r.data[0][0] = c00 * k;
+	r.data[0][1] = (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * k;
+	r.data[0][2] = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * k;
+	r.data[1][0] = c01 * k;
+	r.data[1][1] = (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * k;
+	r.data[1][2] = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * k;
+	r.data[2][0] = c02 * k;
+	r.data[2][1] = (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * k;
+	r.data[2][2] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * k;
+	for ( int j = 0; j < 3; j++ ) {
+		r.data[3][j] = -(a[3][0] * r.data[0][j] + a[3][1] * r.data[1][j] + a[3][2] * r.data[2][j]);
+		r.data[j][3] = 0.0F;
+	}
+	r.data[3][3] = 1.0F;
+	*out = r;
+	return true;
+}
 
 static const int HISTORY_SIZE = 256;
 static PlayerSnapshot g_history[HISTORY_SIZE];   // Static storage keeps Matrix4f 16-byte aligned.
@@ -228,6 +274,7 @@ static const uint32_t ITEM_ENTRY_SIZE = 0x1C;
 static const int NUM_ITEMS = 9;
 static const int ITEM_TORCH = 1, ITEM_PICKAXES = 2, ITEM_TNT = 3, ITEM_RAFT = 5;
 static const uint32_t ITEM_MANAGER_HELD = 0x14;
+static const uint32_t ITEM_WORLD_MATRIX = 0x30;   // Matrix4f the item draws its model with while out.
 
 static void* GetItemObject( int index ) { return *(void**) (ITEM_TABLE + index * ITEM_ENTRY_SIZE + 4); }
 
@@ -260,6 +307,9 @@ static void PushLocalSnapshot( EIHarry* harry )
 	}
 
 	s.heldItem = GetHeldItem( harry );
+	s.drawnSlot = g_drawnSlot;   // Torch, TNT or raft drawn since the last tick (see NoteHarryItemDraw).
+	s.itemLocal = g_drawnLocal;
+	g_drawnSlot = -1;
 	static int lastItem = -1;
 	if ( s.heldItem != lastItem ) {
 		mp_log( "[MP] Harry holds item %d.\n", s.heldItem );
@@ -762,8 +812,9 @@ static void ApplyPuppetCollision( EIEvilHarryP* p )
 	FIELD( p, uint8_t, BEAST_BODY_SOLID ) = g_puppetSolid ? 1 : 0;
 }
 
-// Evil Harry always carries his pickaxes (m_pickaxeModel0/1); show them only while
-// Harry holds his. Bit 0 of an instance's flags (+0x2C) is "visible".
+// Evil Harry's hands hold two static models (m_pickaxeModel0/1, the pickaxe model
+// attached to his hand bones) : shown only while Harry held his pickaxes.
+// Bit 0 of an instance's flags (+0x2C) is "visible".
 static const uint32_t INSTANCE_FLAGS = 0x2C;
 static const uint32_t INSTANCE_VISIBLE = 0x1;
 
@@ -779,6 +830,149 @@ static void ApplyPuppetItem( EIEvilHarryP* p, const PlayerSnapshot* t )
 	bool pickaxes = t && t->heldItem == ITEM_PICKAXES;
 	ShowModel( p->m_pickaxeModel0, pickaxes );
 	ShowModel( p->m_pickaxeModel1, pickaxes );
+}
+
+// The other items draw themselves (vtable slot 4 : (context, arg)) with their own
+// matrix at +0x30, which follows Harry's hand, including while he takes the item
+// out and puts it away : the torch through the base item draw (0x507120), TNT on
+// top of it, the raft through its inflating animated model. They only draw while
+// out (item state +0x70 is 2-4, byte +0x91 set; the raft also needs byte +0x108).
+//
+// Each time one draws for Harry we note where, relative to Harry; the snapshot
+// keeps it. The puppet's own render then draws the item where the snapshot says,
+// relative to the puppet, with those fields forced for the duration of the call.
+typedef void (__thiscall *ItemDrawFunc)( void* item, void* context, void* arg );
+typedef void (__thiscall *RenderFunc)( EInstance* self, void* context, void* arg );
+static const uint32_t ITEM_SLOT_DRAW = 4 * 4;
+static const uint32_t VTABLE_SLOT_RENDER = 0x34;      // EInstance::Render( context, arg ).
+static const uint32_t ITEM_OWNER = 0x20;              // The player holding it.
+static const uint32_t ITEM_STATE = 0x70;              // 3 : out.
+static const uint32_t ITEM_ACTIVE = 0x91;             // uint8_t.
+static const uint32_t RAFT_INFLATED = 0x108;          // uint8_t.
+static const uint32_t RAFT_ANIM_MODEL = 0xA4;         // Animated model inside the raft item.
+static const uint32_t ANIM_MODEL_POSE = 0x4;          // Bone matrices it draws with (read when the frame is drawn).
+static const uint32_t ANIM_MODEL_SKELETON = 0x18;
+static const uint32_t SKELETON_BONE_COUNT = 0x18;
+static const uint32_t ANIM_MODEL_STAMP = 0x24;        // Frame it last posed at (0x61A970 skips when unchanged).
+static const int MAX_POSE_BONES = 128;
+static Matrix4f g_puppetPose[MAX_POSE_BONES];        // The puppet's raft pose (static : 16-byte aligned).
+
+static const struct { int item; uint32_t vtable; } DRAWN_ITEMS[] = {
+	{ ITEM_TORCH, 0x89A200 }, { ITEM_TNT, 0x89A160 }, { ITEM_RAFT, 0x8949B0 },
+};
+static const int NUM_DRAWN_ITEMS = sizeof(DRAWN_ITEMS) / sizeof(DRAWN_ITEMS[0]);
+static ItemDrawFunc g_origItemDraw[NUM_DRAWN_ITEMS];
+static RenderFunc g_origEvilHarryRender = 0;
+
+static int g_puppetItemDraws = 0;     // For the autotest.
+
+static void NoteHarryItemDraw( int slot, void* item )
+{
+	EIHarry* owner = FIELD( item, EIHarry*, ITEM_OWNER );
+	if ( !owner ) return;
+	// Until it has inflated, the raft's draw only poses it (something else shows it).
+	if ( DRAWN_ITEMS[slot].item == ITEM_RAFT && !FIELD( item, uint8_t, RAFT_INFLATED ) ) return;
+	Matrix4f world, ownerInverse;
+	memcpy( &world, (uint8_t*) item + ITEM_WORLD_MATRIX, sizeof(world) );
+	if ( !MatInverseAffine( owner->m_transformMatrix, &ownerInverse ) ) return;
+	MatMul( world, ownerInverse, &g_drawnLocal );
+	g_drawnSlot = slot;
+}
+
+// Draws item slot "slot" at "world", whatever state Harry's item is in now.
+static void DrawItemAt( int slot, const Matrix4f& world, void* context, void* arg )
+{
+	uint8_t* item = (uint8_t*) GetItemObject( DRAWN_ITEMS[slot].item );
+	if ( !item ) return;
+	bool raft = DRAWN_ITEMS[slot].item == ITEM_RAFT;
+
+	// The raft's animated model only exists in a drawable state while Harry's own
+	// raft is inflated (forcing it earlier crashes the renderer) : no copy otherwise.
+	if ( raft && !FIELD( item, uint8_t, RAFT_INFLATED ) ) return;
+
+	uint8_t* anim = raft ? item + RAFT_ANIM_MODEL : 0;
+	void* harryPose = 0;
+	uint32_t stamp = 0;
+	if ( anim ) {
+		// The pose is read when the frame is drawn : the copy needs its own buffer,
+		// or both rafts would show whichever pose was computed last.
+		void* skeleton = FIELD( anim, void*, ANIM_MODEL_SKELETON );
+		int bones = skeleton ? FIELD( skeleton, int, SKELETON_BONE_COUNT ) : 0;
+		harryPose = FIELD( anim, void*, ANIM_MODEL_POSE );
+		if ( bones <= 0 || bones > MAX_POSE_BONES || !harryPose ) return;
+		memcpy( g_puppetPose, harryPose, bones * sizeof(Matrix4f) );
+	}
+
+	Matrix4f savedMatrix;
+	memcpy( &savedMatrix, item + ITEM_WORLD_MATRIX, sizeof(savedMatrix) );
+	int savedState = FIELD( item, int, ITEM_STATE );
+	uint8_t savedActive = FIELD( item, uint8_t, ITEM_ACTIVE );
+
+	memcpy( item + ITEM_WORLD_MATRIX, &world, sizeof(world) );
+	FIELD( item, int, ITEM_STATE ) = 3;
+	FIELD( item, uint8_t, ITEM_ACTIVE ) = 1;
+	if ( anim ) {
+		FIELD( anim, void*, ANIM_MODEL_POSE ) = g_puppetPose;
+		stamp = FIELD( anim, uint32_t, ANIM_MODEL_STAMP );
+		FIELD( anim, uint32_t, ANIM_MODEL_STAMP ) = stamp ^ 0x80000000u;   // Pose again, from "world".
+	}
+
+	g_origItemDraw[slot]( item, context, arg );
+	g_puppetItemDraws++;
+
+	if ( anim ) {
+		FIELD( anim, void*, ANIM_MODEL_POSE ) = harryPose;
+		FIELD( anim, uint32_t, ANIM_MODEL_STAMP ) = stamp;
+	}
+	FIELD( item, uint8_t, ITEM_ACTIVE ) = savedActive;
+	FIELD( item, int, ITEM_STATE ) = savedState;
+	memcpy( item + ITEM_WORLD_MATRIX, &savedMatrix, sizeof(savedMatrix) );
+}
+
+// Draws the item the puppet's snapshot says it holds, if it is "slot".
+static void DrawPuppetItem( int slot, void* context, void* arg )
+{
+	if ( !g_puppet ) return;
+	const PlayerSnapshot* t = GetPuppetTarget();
+	if ( !t || t->drawnSlot != slot ) return;
+	Matrix4f world;
+	MatMul( t->itemLocal, g_puppet->m_transformMatrix, &world );
+	DrawItemAt( slot, world, context, arg );
+}
+
+// The raft's copy is drawn right after Harry's raft (drawing it from the puppet's
+// render crashed the renderer while flushing the frame), so it only shows while
+// Harry's raft is out too. The torch and TNT are drawn by the puppet's render.
+#define ITEM_DRAW_HOOK( n ) \
+	static void __fastcall ItemDraw_Hook##n( void* item, void*, void* context, void* arg ) \
+	{ \
+		g_origItemDraw[n]( item, context, arg ); \
+		NoteHarryItemDraw( n, item ); \
+		if ( DRAWN_ITEMS[n].item == ITEM_RAFT ) DrawPuppetItem( n, context, arg ); \
+	}
+ITEM_DRAW_HOOK( 0 )
+ITEM_DRAW_HOOK( 1 )
+ITEM_DRAW_HOOK( 2 )
+static void* const ITEM_DRAW_HOOKS[NUM_DRAWN_ITEMS] = { &ItemDraw_Hook0, &ItemDraw_Hook1, &ItemDraw_Hook2 };
+
+static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* context, void* arg )
+{
+	g_origEvilHarryRender( self, context, arg );
+	if ( self != g_puppet ) return;
+	const PlayerSnapshot* t = GetPuppetTarget();
+	if ( t && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
+}
+
+static void InstallItemDrawHooks()
+{
+	for ( int i = 0; i < NUM_DRAWN_ITEMS; i++ ) {
+		uint32_t slot = DRAWN_ITEMS[i].vtable + ITEM_SLOT_DRAW;
+		g_origItemDraw[i] = injector::ReadMemory<ItemDrawFunc>( slot, true );
+		injector::WriteMemory( slot, ITEM_DRAW_HOOKS[i], true );
+	}
+	uint32_t render = VTABLE_EVILHARRY_P + VTABLE_SLOT_RENDER;
+	g_origEvilHarryRender = injector::ReadMemory<RenderFunc>( render, true );
+	injector::WriteMemory( render, &EvilHarryRender_Hook, true );
 }
 
 static void DrivePuppet( EIEvilHarryP* p )
@@ -808,6 +1002,7 @@ static void DrivePuppet( EIEvilHarryP* p )
 	p->m_transformMatrix.data[3][1] = world.data[3][1];
 	p->m_transformMatrix.data[3][2] = world.data[3][2];
 	FIELD( p, Vector3f, BEAST_PREV_POS ) = pos;
+
 }
 
 
@@ -1425,15 +1620,20 @@ static void AutotestStep( EIHarry* harry )
 
 	case 8:   // Items : hold numpad 5 and tap an arrow to take an item out or put it away.
 	{
-		// Evil Harry's pickaxes should show only while Harry (a second earlier) held his.
-		static const LONG KEYS[]          = { 0, VK_RIGHT, VK_RIGHT, VK_DOWN, VK_DOWN };
-		static const char* const NAMES[]  = { "empty handed", "pickaxes out", "pickaxes away", "torch out", "torch away" };
-		static const int  EXPECT_ITEM[]   = { -1, ITEM_PICKAXES, -1, ITEM_TORCH, -1 };
-		static const int NUM = 5;
+		// Evil Harry should hold what Harry held a second earlier.
+		static const LONG KEYS[]         = { 0, VK_RIGHT, VK_RIGHT, VK_DOWN, VK_DOWN, VK_UP, VK_UP, VK_LEFT, VK_LEFT };
+		static const char* const NAMES[] = { "empty handed", "pickaxes out", "pickaxes away", "torch out", "torch away",
+		                                     "raft out", "raft away", "TNT out", "TNT away" };
+		static const int  EXPECT_ITEM[]  = { -1, ITEM_PICKAXES, -1, ITEM_TORCH, -1, ITEM_RAFT, -1, ITEM_TNT, -1 };
+		static const int NUM = 9;
+		static int drawsAtStart = 0;
 		DWORD t = now - phaseStart;
-		if ( step == 0 || t >= 3500 ) {
-			if ( step >= NUM ) { phase = 3; phaseStart = now; break; }
-			if ( step == 0 ) GiveTestItems( harry );
+		if ( step == 0 || t >= 4500 ) {
+			if ( step >= NUM ) { g_puppetOffset.x = 6.0F; phase = 3; phaseStart = now; break; }
+			if ( step == 0 ) {
+				GiveTestItems( harry );
+				g_puppetOffset.x = -6.0F;   // On Harry's right-hand side, which holds the items.
+			}
 			if ( KEYS[step] ) {
 				InterlockedExchange( &g_holdMs2, 700 );
 				InterlockedExchange( &g_holdKey2, VK_NUMPAD5 );   // Toggle item, held...
@@ -1443,15 +1643,24 @@ static void AutotestStep( EIHarry* harry )
 		else if ( t >= 250 && t < 300 && KEYS[step - 1] ) {
 			InterlockedExchange( &g_tapKey, KEYS[step - 1] );   // ...while the arrow is tapped.
 		}
-		else if ( !snapped && t >= 3000 ) {   // Past the replay delay.
+		else if ( t >= 3000 && t < 3100 ) {   // After the delayed put-away animation (the raft takes longest).
+			drawsAtStart = g_puppetItemDraws;
+		}
+		else if ( !snapped && t >= 4000 ) {   // Past the replay delay.
 			int i = step - 1;
 			int held = GetHeldItem( harry );
-			bool shown = g_puppet && g_puppet->m_pickaxeModel0
-				&& (FIELD( g_puppet->m_pickaxeModel0, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE);
-			bool ok = held == EXPECT_ITEM[i] && shown == (EXPECT_ITEM[i] == ITEM_PICKAXES);
+			void* m0 = g_puppet ? g_puppet->m_pickaxeModel0 : 0;
+			void* m1 = g_puppet ? g_puppet->m_pickaxeModel1 : 0;
+			bool shown0 = m0 && (FIELD( m0, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE);
+			bool shown1 = m1 && (FIELD( m1, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE);
+			int draws = g_puppetItemDraws - drawsAtStart;   // Puppet copies drawn over the last 0.9 s.
+			int want = EXPECT_ITEM[i];
+			bool drawn = want >= 0 && want != ITEM_PICKAXES;
+			bool ok = held == want && shown0 == (want == ITEM_PICKAXES) && shown1 == (want == ITEM_PICKAXES)
+				&& (drawn ? draws > 30 : draws == 0);
 			if ( !ok ) g_itemFailures++;
-			mp_log( "[AT] Item step %d (%s) : Harry holds item %d (expected %d), Evil Harry's pickaxes %s : %s\n",
-				i, NAMES[i], held, EXPECT_ITEM[i], shown ? "shown" : "hidden", ok ? "ok" : "WRONG" );
+			mp_log( "[AT] Item step %d (%s) : Harry holds item %d (expected %d), Evil Harry's pickaxes %s/%s, item drawn %d times : %s\n",
+				i, NAMES[i], held, want, shown0 ? "shown" : "hidden", shown1 ? "shown" : "hidden", draws, ok ? "ok" : "WRONG" );
 			char name[40];
 			sprintf_s( name, "09_item_%d_%s", i, NAMES[i] );
 			for ( char* c = name; *c; c++ ) if ( *c == ' ' ) *c = '_';
@@ -1685,6 +1894,7 @@ public:
 
 		injector::WriteMemory( harrySlot, &HarryTick_Hook, true );
 		injector::WriteMemory( evilSlot,  &EvilHarryTick_Hook, true );
+		InstallItemDrawHooks();
 
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
 
