@@ -303,11 +303,8 @@ static void _give_stuff()
 	harry->m_smashStrike = 1;
 	harry->m_breakdance = 1;
 
-	// Max HP (10).
-	harry->m_healthMax = 10;
-	harry->m_healthValue = 10;
-
-	// Hotbar.
+	// Hotbar. (Max HP isn't raised : a max of 10 left a stray health icon in the
+	// middle of the screen.)
 	harry->m_itemHotbar[0] = injector::ReadMemory<void*>( 0x8EEC20 );  // Raft.
 	harry->m_itemHotbar[1] = injector::ReadMemory<void*>( 0x8EEBCC );  // Pickaxes.
 	harry->m_itemHotbar[2] = injector::ReadMemory<void*>( 0x8EEBB0 );  // Torch.

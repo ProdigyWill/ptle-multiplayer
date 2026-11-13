@@ -12,6 +12,8 @@
 //   F6 : cycle the puppet's animation : automatic (idle when still, run when
 //        moving, facing its direction of travel), then idle/rest states by hand.
 //   F7 : cycle the replay delay (0.25s .. 3s).
+//   F8 : Evil Harry stays where he is (spawned where Harry stands if needed) and
+//        copies Harry in place : animations, items, facing. F8 again : he follows.
 // --------------------------------------------------------------------------------
 
 #include <Windows.h>
@@ -471,8 +473,11 @@ GET_METHOD( 0x60FFA0, void, EICharacter_SetRot, EICharacter*, Vector3f* );
 // puppet stands beside Harry instead of inside him).
 static Vector3f g_puppetOffset = { 0.0F, 0.0F, 0.0F };
 
-// Autotest : hold the puppet at a fixed spot (collision test).
+// Hold the puppet at a fixed spot : the autotest's collision test, and F8 ("stay
+// here") for testing by hand, where it keeps copying Harry's animations, items and
+// facing without following him around.
 static bool g_puppetPinned = false;
+static bool g_puppetStaysHere = false;   // F8 : pinned, faces where Harry faced.
 static Vector3f g_puppetPin = { 0.0F, 0.0F, 0.0F };
 
 static bool GetPuppetTargetPosition( Vector3f* out )
@@ -561,6 +566,12 @@ static void UpdateLocomotion( EIEvilHarryP* p )
 		g_velY = g_velY * 0.75F + dy * 0.25F;
 		g_moveSpeed = sqrtf( g_velX * g_velX + g_velY * g_velY );
 		if ( g_moveSpeed > 0.01F ) g_heading = atan2f( g_velY, g_velX );
+	}
+	if ( g_puppetStaysHere ) {
+		// Not moving : face where Harry faced. His transform's row 1 points opposite
+		// to where he walks (see InitLocomotion).
+		const PlayerSnapshot* f = GetPuppetTarget();
+		if ( f ) g_heading = atan2f( -f->transform.data[1][1], -f->transform.data[1][0] );
 	}
 	g_lastTarget = pos;
 	g_haveLastTarget = true;
@@ -1050,6 +1061,7 @@ static void DrivePuppet( EIEvilHarryP* p )
 static volatile LONG g_reqSpawn = 0;
 static volatile LONG g_reqState = 0;
 static volatile LONG g_reqDelay = 0;
+static volatile LONG g_reqStay = 0;
 static volatile LONG g_harryTicks = 0;
 
 static bool GameHasFocus()
@@ -1063,12 +1075,13 @@ static bool GameHasFocus()
 
 static DWORD WINAPI HotkeyThread( void* )
 {
-	bool wasDown[3] = { false, false, false };
-	const int keys[3] = { VK_F5, VK_F6, VK_F7 };
-	volatile LONG* reqs[3] = { &g_reqSpawn, &g_reqState, &g_reqDelay };
+	static const int NUM_KEYS = 4;
+	bool wasDown[NUM_KEYS] = { false, false, false, false };
+	const int keys[NUM_KEYS] = { VK_F5, VK_F6, VK_F7, VK_F8 };
+	volatile LONG* reqs[NUM_KEYS] = { &g_reqSpawn, &g_reqState, &g_reqDelay, &g_reqStay };
 
 	for ( ;; ) {
-		for ( int i = 0; i < 3; i++ ) {
+		for ( int i = 0; i < NUM_KEYS; i++ ) {
 			bool down = (GetAsyncKeyState( keys[i] ) & 0x8000) != 0;
 			if ( down && !wasDown[i] ) {
 				if ( GameHasFocus() ) {
@@ -1091,6 +1104,10 @@ static void HandleHotkeys( EIHarry* harry )
 	bool f5 = InterlockedExchange( &g_reqSpawn, 0 ) != 0;
 	bool f6 = InterlockedExchange( &g_reqState, 0 ) != 0;
 	bool f7 = InterlockedExchange( &g_reqDelay, 0 ) != 0;
+	bool f8 = InterlockedExchange( &g_reqStay, 0 ) != 0;
+
+	// The puppet went with the last level : F8's "stay here" goes too.
+	if ( !g_puppet && g_puppetStaysHere ) g_puppetPinned = g_puppetStaysHere = false;
 
 	if ( f5 ) {
 		SpawnPuppet( harry );
@@ -1124,6 +1141,25 @@ static void HandleHotkeys( EIHarry* harry )
 	if ( f7 ) {
 		g_delayIndex = (g_delayIndex + 1) % (sizeof(DELAY_CHOICES) / sizeof(DELAY_CHOICES[0]));
 		mp_log( "[MP] Replay delay : %d ticks.\n", DELAY_CHOICES[g_delayIndex] );
+	}
+
+	// F8 : Evil Harry stays here (spawning him where Harry stands if needed) and
+	// keeps copying Harry in place; again : he follows Harry again.
+	if ( f8 ) {
+		if ( !g_puppetStaysHere ) {
+			Vector3f here = harry->m_position;
+			if ( !g_puppet ) SpawnPuppet( harry );
+			else here = g_puppet->EIBeast::m_position;
+			if ( g_puppet ) {
+				g_puppetPin = here;
+				g_puppetPinned = g_puppetStaysHere = true;
+				mp_log( "[MP] Evil Harry stays at (%.1f, %.1f, %.1f) and copies Harry there.\n", here.x, here.y, here.z );
+			}
+		}
+		else {
+			g_puppetPinned = g_puppetStaysHere = false;
+			mp_log( "[MP] Evil Harry follows Harry again.\n" );
+		}
 	}
 }
 
@@ -1652,6 +1688,50 @@ static void AutotestStep( EIHarry* harry )
 		}
 		break;
 
+	case 10:  // F8 "stay here" : Evil Harry stays put but keeps copying Harry.
+	{
+		static Vector3f pinned;
+		static float headingAtStart = 0.0F;
+		static bool sawMirror = false;
+		DWORD t = now - phaseStart;
+		if ( step == 0 ) {
+			InterlockedIncrement( &g_reqStay );   // As if F8 was pressed.
+			step = 1;
+		}
+		else if ( step == 1 && t >= 500 ) {
+			if ( !g_puppetStaysHere ) { mp_log( "[AT] FAIL : F8 didn't pin Evil Harry.\n" ); g_itemFailures++; phase = 3; phaseStart = now; break; }
+			pinned = g_puppet->EIBeast::m_position;
+			headingAtStart = g_heading;
+			sawMirror = false;
+			InterlockedExchange( &g_holdMs, 2000 );
+			InterlockedExchange( &g_holdKey, 'D' );   // Walk away, turning.
+			step = 2;
+		}
+		else if ( step == 2 ) {
+			if ( g_mirrorClip && g_mirrorClip != 0xB23CB6D0 ) sawMirror = true;   // Copying something besides standing.
+			if ( t >= 3500 ) {
+				RequestSnapshot( "12_stay_here" );
+				Vector3f p = g_puppet->EIBeast::m_position;
+				float dx = p.x - pinned.x, dy = p.y - pinned.y, dh = harry->m_position.x - pinned.x, dhy = harry->m_position.y - pinned.y;
+				float moved = sqrtf( dx * dx + dy * dy ), harryAway = sqrtf( dh * dh + dhy * dhy );
+				float turned = fabsf( g_heading - headingAtStart ) * 180.0F / MP_PI;
+				bool ok = moved < 0.5F && harryAway > 3.0F && sawMirror && turned > 20.0F;
+				if ( !ok ) g_itemFailures++;
+				mp_log( "[AT] Stay here : Evil Harry moved %.2f, Harry is %.1f away, puppet copied a clip %s, turned %.0f deg : %s\n",
+					moved, harryAway, sawMirror ? "yes" : "no", turned, ok ? "ok" : "WRONG" );
+				InterlockedIncrement( &g_reqStay );   // F8 again : follow.
+				step = 3;
+			}
+		}
+		else if ( step == 3 && t >= 4000 ) {
+			bool ok = !g_puppetStaysHere && !g_puppetPinned;
+			if ( !ok ) g_itemFailures++;
+			mp_log( "[AT] F8 again : Evil Harry follows : %s\n", ok ? "ok" : "WRONG" );
+			phase = 3; phaseStart = now;
+		}
+		break;
+	}
+
 	case 8:   // Items : hold numpad 5 and tap an arrow to take an item out or put it away.
 	{
 		// Evil Harry should hold what Harry held a second earlier.
@@ -1663,7 +1743,7 @@ static void AutotestStep( EIHarry* harry )
 		static int drawsAtStart = 0;
 		DWORD t = now - phaseStart;
 		if ( step == 0 || t >= 4500 ) {
-			if ( step >= NUM ) { g_puppetOffset.x = 6.0F; phase = 3; phaseStart = now; break; }
+			if ( step >= NUM ) { g_puppetOffset.x = 6.0F; phase = 10; phaseStart = now; step = 0; break; }
 			if ( step == 0 ) {
 				GiveTestItems( harry );
 				g_puppetOffset.x = -6.0F;   // On Harry's right-hand side, which holds the items.
@@ -1942,7 +2022,7 @@ public:
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
 		}
 
-		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F5 spawn, F6 state, F7 delay.\n",
+		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F5 spawn, F6 state, F7 delay, F8 stay here.\n",
 			(uint32_t) g_origHarryTick, (uint32_t) g_origEvilHarryTick );
 	}
 
