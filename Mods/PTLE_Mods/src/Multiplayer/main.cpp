@@ -39,6 +39,7 @@
 #include "gizmod/Gizmod.h"
 #include "gizmod/GizmodPlugin.h"
 #include "gizmod/event/LoadLevelEvent.h"
+#include "gizmod/event/LevelLoadedEvent.h"
 
 #include "injector/injector.hpp"
 
@@ -512,6 +513,9 @@ static const PlayerSnapshot* GetPuppetTarget()
 // Puppet.
 // --------------------------------------------------------------------------------
 static EIEvilHarryP* g_puppet = 0;
+// Where it was spawned : a puppet whose level is gone was freed with it.
+static void*    g_puppetWorld = 0;
+static uint32_t g_puppetLevel = 0;
 static int g_forcedState = -1;
 
 // Index of a state by its short name ("idle left" matches "evil harry.idle left").
@@ -527,6 +531,7 @@ static int FindStateIndex( EIBeast* beast, const char* shortName )
 	return -1;
 }
 static char g_puppetName[] = "evil harry";
+static char* const GAME_EMPTY_STRING = (char*) 0x9410B0;   // The game strings' "" (0x6F047A).
 
 static void LogStateMachine( EIBeast* beast )
 {
@@ -571,8 +576,10 @@ static void SpawnPuppet( EIHarry* harry )
 	p->m_rotation.z = 0.0F;
 	p->m_rotation.w = 1.0F;
 
-	// NOTE : the beast destructor frees this string. ForgetPuppet() clears it
-	// before the level unloads so the game never frees our static memory.
+	// The asset loads by this name. Once loaded the name becomes the game's empty
+	// string (see below) : the beast's destructor frees its name with the game's heap
+	// (0x6F0490 -> 0x617D50) unless it's that one, and freeing our static memory
+	// corrupted the heap when the level unloaded.
 	p->m_beastTypeCRC = HashPath( (char*) "BEvilHarryP" );
 	p->m_beastTypeName = g_puppetName;
 	EIBeast_LoadBeastAsset( p );
@@ -585,8 +592,11 @@ static void SpawnPuppet( EIHarry* harry )
 	AddToWorld( harry->m_world, p );
 	ERLevel_SetupEntity( harry->m_world, p, 0 );
 	p->Init();
+	p->m_beastTypeName = GAME_EMPTY_STRING;
 
 	g_puppet = p;
+	g_puppetWorld = harry->m_world;
+	g_puppetLevel = Gizmod::getCurrentLevelCRC();
 
 	// Its default state (21, "get ready for boss fight") draws it as a black
 	// silhouette. Start calm and lit instead.
@@ -612,16 +622,12 @@ static void SpawnPuppet( EIHarry* harry )
 	LogStateMachine( p );
 }
 
-// Called before the level is torn down : the puppet gets destroyed with it.
+// Called when a level loads : the old level's puppet was destroyed with it (already
+// gone by now : don't touch it).
 static void ForgetPuppet()
 {
 	if ( g_puppet ) {
-		// The name points to our static memory. Detach it so the game's
-		// destructor doesn't try to free it (known crash at 0x412A32).
-		if ( g_puppet->m_beastTypeName == g_puppetName ) {
-			g_puppet->m_beastTypeName = 0;
-		}
-		mp_log( "[MP] Level unloading, puppet released.\n" );
+		mp_log( "[MP] New level, the puppet went with the old one.\n" );
 	}
 	g_puppet = 0;
 	ResetHistory();
@@ -1220,6 +1226,8 @@ static_assert( sizeof(ITEM_DRAW_HOOKS) / sizeof(ITEM_DRAW_HOOKS[0]) == NUM_DRAWN
 static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* context, void* arg )
 {
 	const PlayerSnapshot* t = self == g_puppet ? GetPuppetTarget() : 0;
+	// Online with nobody to show here (they left, or are in another level) : not drawn.
+	if ( self == g_puppet && g_networked && !t ) return;
 	if ( t ) ApplyPuppetPose( self, t );
 	g_origEvilHarryRender( self, context, arg );
 	if ( t && g_puppet && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
@@ -1416,7 +1424,27 @@ static volatile LONG g_tapKey = 0;            // Virtual key the autotest thread
 static char g_snapName[64];
 
 static const DWORD AUTOTEST_MENU_TIMEOUT_MS  = 180000;
-static const DWORD AUTOTEST_TOTAL_TIMEOUT_MS = 360000;
+static DWORD AUTOTEST_TOTAL_TIMEOUT_MS = 360000;   // Longer for the level survey.
+
+// Level survey (PTLE_MP_SURVEY=1) : instead of the scripted test, visit these levels
+// and spawn Evil Harry beside Harry in each, to see where his model loads and draws.
+static bool g_survey = false;
+static const struct { uint32_t crc; const char* name; } SURVEY_LEVELS[] = {
+	{ 0x7A9B3870, "a55_jungle_trail" },
+	{ 0xEE8F6900, "a03_crash_site" },
+	{ 0x07ECCC35, "a05_mama_oullo_tower" },
+	{ 0x05AA726C, "b05_native_village" },
+	{ 0x72AD42FA, "b04_st_claire_night" },
+	{ 0x0C1C3E47, "b09_renegade_fort" },
+	{ 0x8147EA91, "s06_copacanti_lake" },
+	{ 0x1553BBE1, "s50_penguin_den" },
+	{ 0x907C492B, "c53_mountain_overlook" },
+	{ 0xEA667977, "c07_abandoned_cavern" },
+	{ 0x93F89D45, "a53_gates_of_el_dorado" },
+	{ 0x0081082C, "a01_chameleon_temple" },
+};
+static const int NUM_SURVEY_LEVELS = sizeof(SURVEY_LEVELS) / sizeof(SURVEY_LEVELS[0]);
+static int g_surveyLoaded = 0, g_surveyDrawn = 0;
 
 static void RequestSnapshot( const char* name )
 {
@@ -1933,8 +1961,52 @@ static void AutotestStep( EIHarry* harry )
 		lastTelemetry = now;
 	}
 
+	if ( g_survey && phase == -1 && g_settled ) { phase = 100; phaseStart = now; step = 0; }
+
 	switch ( phase )
 	{
+	case 100: {   // Survey : go to the next level.
+		if ( now - phaseStart < 3000 ) break;
+		if ( step >= NUM_SURVEY_LEVELS ) {
+			mp_log( "[AT] SURVEY : Evil Harry's model loaded in %d of %d levels, drawn in %d.\n", g_surveyLoaded, NUM_SURVEY_LEVELS, g_surveyDrawn );
+			InterlockedExchange( &g_autotestDone, 1 );
+			break;
+		}
+		mp_log( "[AT] SURVEY : going to %s (0x%.8X).\n", SURVEY_LEVELS[step].name, SURVEY_LEVELS[step].crc );
+		ScheduleWorldLoad( (void*) 0x917028, SURVEY_LEVELS[step].crc, false );
+		phase = 101; phaseStart = now;
+		break;
+	}
+	case 101:   // Survey : wait for the level, let it settle, spawn.
+		if ( Gizmod::getCurrentLevelCRC() != SURVEY_LEVELS[step].crc ) {
+			if ( now - phaseStart > 60000 ) {
+				mp_log( "[AT] SURVEY %s : FAILED TO LOAD (still in 0x%.8X).\n", SURVEY_LEVELS[step].name, Gizmod::getCurrentLevelCRC() );
+				step++; phase = 100; phaseStart = now;
+			}
+			break;
+		}
+		if ( !snapped ) { snapped = true; phaseStart = now; break; }   // Arrived : settle from now.
+		if ( now - phaseStart < 10000 ) break;
+		SpawnPuppet( harry );
+		phase = 102; phaseStart = now;
+		lastHarryTicks = g_puppetPoseCopies;
+		break;
+	case 102:   // Survey : look.
+		if ( now - phaseStart < 3000 ) break;
+		{
+			bool loaded = g_puppet && g_puppet->m_beastType;
+			int draws = g_puppetPoseCopies - (int) lastHarryTicks;
+			if ( loaded ) g_surveyLoaded++;
+			if ( draws > 0 ) g_surveyDrawn++;
+			mp_log( "[AT] SURVEY %s : spawned %s, model %s, drawn %d times in 3 s.\n", SURVEY_LEVELS[step].name,
+				g_puppet ? "yes" : "NO", loaded ? "loaded" : "MISSING", draws );
+			char shot[64];
+			sprintf_s( shot, "survey_%02d_%s", step, SURVEY_LEVELS[step].name );
+			RequestSnapshot( shot );
+		}
+		step++; phase = 100; phaseStart = now; snapped = false;
+		break;
+
 	case -1:  // Go to an open level (same call as the Gizmod "Go to" menu).
 		if ( !g_settled ) { phaseStart = now; break; }
 		if ( AUTOTEST_LEVEL == 0 ) {
@@ -2400,6 +2472,12 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 
 	if ( self != Gizmod::getHarry() ) return;
 
+	// Another level since the puppet was spawned. The load events don't cover every
+	// way of changing levels (the "Go to" menu, loading a save), this does.
+	if ( g_puppet && (self->m_world != g_puppetWorld || Gizmod::getCurrentLevelCRC() != g_puppetLevel) ) {
+		ForgetPuppet();
+	}
+
 	PushLocalSnapshot( self );
 	NetUpdate();
 	// Another player in this level : show them (Evil Harry appears on his own).
@@ -2525,7 +2603,7 @@ static void ReadNetConfig( NetConfig* c )
 // --------------------------------------------------------------------------------
 // Plugin.
 // --------------------------------------------------------------------------------
-class MultiplayerPlugin : public GizmodPlugin, public ILoadLevelListener
+class MultiplayerPlugin : public GizmodPlugin, public ILoadLevelListener, public ILevelLoadedListener
 {
 public:
 
@@ -2550,6 +2628,7 @@ public:
 		InstallItemDrawHooks();
 
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
+		Gizmod::getInstance()->getEventListener()->registerEvent<LevelLoadedEvent>( this );
 
 		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
 
@@ -2592,6 +2671,11 @@ public:
 			}
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			EnableAutoSkipCutscenes();
+			if ( GetEnvironmentVariableA( "PTLE_MP_SURVEY", env, sizeof(env) ) && env[0] == '1' ) {
+				g_survey = true;
+				AUTOTEST_TOTAL_TIMEOUT_MS = 1200000;
+				mp_log( "[AT] Level survey mode.\n" );
+			}
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
 		}
 
@@ -2600,6 +2684,11 @@ public:
 	}
 
 	virtual void onLoadLevel( LoadLevelEvent& e )
+	{
+		ForgetPuppet();
+	}
+
+	virtual void onLevelLoaded( LevelLoadedEvent& e )
 	{
 		ForgetPuppet();
 	}

@@ -3,7 +3,10 @@
 # converted to PNG).
 #
 #   powershell -ExecutionPolicy Bypass -File run-autotest.ps1 [-NoBuild] [-Foreground] [-TimeoutSec 420]
-#       [-NetSim "latency,jitter,loss"] [-Server host:port]
+#       [-NetSim "latency,jitter,loss"] [-Server host:port] [-Survey]
+#
+# -Survey : instead of the scripted test, visit a dozen real levels and spawn Evil
+# Harry in each (screenshots logs\shots\survey_*.png). Takes about 10 minutes.
 #
 # The puppet replays the player through the network code (loopback). -NetSim sets
 # the simulated connection : one-way latency (ms), jitter (ms), loss (fraction).
@@ -22,8 +25,10 @@ param(
 	[switch] $Foreground,
 	[int] $TimeoutSec = 420,
 	[string] $NetSim = '100,40,0.05',
-	[string] $Server = ''
+	[string] $Server = '',
+	[switch] $Survey
 )
+if ($Survey -and -not $PSBoundParameters.ContainsKey('TimeoutSec')) { $TimeoutSec = 1300 }
 
 $ErrorActionPreference = 'Stop'
 
@@ -55,6 +60,7 @@ foreach ($mod in 'Multiplayer', 'WindowedMode', 'CheatLab') {
 if (Test-Path $shotsDir) { Remove-Item (Join-Path $shotsDir '*') -Force }
 
 $vars = @{ PTLE_MP_AUTOTEST = '1'; PTLE_MP_NETSIM = $NetSim }
+if ($Survey) { $vars.PTLE_MP_SURVEY = '1' }
 if ($Server) {
 	$vars.PTLE_MP_SERVER = $Server
 	$vars.PTLE_MP_ECHO = '1'
