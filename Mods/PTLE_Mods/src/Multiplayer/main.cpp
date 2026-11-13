@@ -1520,9 +1520,18 @@ static void PollKeyboard_Hook()
 // The game window shows up without being activated or brought forward : its
 // startup SetFocus and SetForegroundWindow calls just drop their argument,
 // SetWindowPos gets SWP_NOACTIVATE and ShowWindow SW_SHOWNOACTIVATE (same for the
-// SetFocus + ShowWindow pair at 0x698383).
+// SetFocus + ShowWindow pair at 0x698383). Its SetWindowPos( HWND_TOPMOST ) call
+// (0x60D68F) puts it at the bottom of the window stack instead, so it never even
+// shows in front of other windows.
+static BOOL __stdcall SetWindowPos_Bottom( HWND wnd, HWND, int x, int y, int cx, int cy, UINT flags )
+{
+	return SetWindowPos( wnd, HWND_BOTTOM, x, y, cx, cy, flags | SWP_NOACTIVATE );
+}
+
 static void PatchWindowNoActivate()
 {
+	injector::MakeCALL( 0x60D68F, &SetWindowPos_Bottom, true );
+	injector::MakeNOP( 0x60D694, 1, true );
 	static const uint8_t POP_ARG[6] = { 0x83, 0xC4, 0x04, 0x90, 0x90, 0x90 };   // add esp, 4
 	injector::WriteMemoryRaw( 0x60D660, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
 	injector::WriteMemoryRaw( 0x60D66D, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetForegroundWindow.

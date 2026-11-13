@@ -1,4 +1,4 @@
-# Builds the mod loader and the Multiplayer and WindowedMode plugins, installs them,
+# Builds the mod loader and the Multiplayer, WindowedMode and CheatLab plugins, installs them,
 # runs the game in autotest mode and collects the results (log + screenshots
 # converted to PNG).
 #
@@ -31,15 +31,15 @@ if (Get-Process -Name 'PITFALL The Lost Expedition' -ErrorAction SilentlyContinu
 }
 
 if (-not $NoBuild) {
-	Write-Host '== Building the mod loader, Multiplayer and WindowedMode'
-	& $msbuild (Join-Path $modsDir 'PTLE_Mods.sln') '/t:ModLoader;Multiplayer;WindowedMode' /p:Configuration=Release /p:Platform=Win32 `
+	Write-Host '== Building the mod loader, Multiplayer, WindowedMode and CheatLab'
+	& $msbuild (Join-Path $modsDir 'PTLE_Mods.sln') '/t:ModLoader;Multiplayer;WindowedMode;CheatLab' /p:Configuration=Release /p:Platform=Win32 `
 		/p:PlatformToolset=v143 /p:TrackFileAccess=false /v:minimal /nologo | Out-Host
 	if ($LASTEXITCODE -ne 0) { throw "Build failed ($LASTEXITCODE)." }
 }
 
 Write-Host '== Installing'
 Copy-Item (Join-Path $modsDir 'bin\Release\binkw32.dll') (Join-Path $gameDir 'binkw32.dll') -Force   # The mod loader.
-foreach ($mod in 'Multiplayer', 'WindowedMode') {
+foreach ($mod in 'Multiplayer', 'WindowedMode', 'CheatLab') {
 	Copy-Item (Join-Path $modsDir "bin\Release\$mod.asi") (Join-Path $gameDir "mods\$mod.asi") -Force
 }
 
@@ -51,6 +51,7 @@ if ($Foreground) {
 	Write-Host '== Running game in autotest mode (in front, real key presses)'
 } else {
 	$vars.GIZMOD_NO_CONSOLE = '1'   # Its console window would pop up in front.
+	$vars.GIZMOD_BACKGROUND = '1'   # Other mods' windows (CheatLab's palette) open behind the others.
 	Write-Host '== Running game in autotest mode (in the background)'
 }
 foreach ($k in $vars.Keys) { Set-Item "Env:$k" $vars[$k] }

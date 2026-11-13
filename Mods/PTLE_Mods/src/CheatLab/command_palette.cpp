@@ -1299,7 +1299,16 @@ void command_create_window()
 		return true;
 	}, (LPARAM) font );
 
-	ShowWindow( hwndPalette, SW_SHOW );
+	// Shown without being activated : it would otherwise take the focus from whatever
+	// window the player is in when the game starts (the game window activates itself).
+	// GIZMOD_BACKGROUND=1 (background test runs) : behind every other window too.
+	char env[4] = { 0, };
+	if ( GetEnvironmentVariableA( "GIZMOD_BACKGROUND", env, sizeof(env) ) && env[0] == '1' ) {
+		SetWindowPos( hwndPalette, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW );
+	}
+	else {
+		ShowWindow( hwndPalette, SW_SHOWNOACTIVATE );
+	}
 }
 
 void command_process_window()
