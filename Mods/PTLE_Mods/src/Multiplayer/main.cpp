@@ -2591,6 +2591,12 @@ static void ReadNetConfig( NetConfig* c )
 	char echo[8] = "0";
 	GetPrivateProfileStringA( "Network", "Echo", "0", echo, sizeof(echo), ini );
 
+	// The autotests choose their server themselves (none : loopback), whatever the ini says.
+	char autotest[8] = { 0, };
+	if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", autotest, sizeof(autotest) ) && autotest[0] == '1' ) {
+		c->server[0] = 0;
+		strcpy_s( echo, "0" );
+	}
 	GetEnvOverride( "PTLE_MP_SERVER", c->server, sizeof(c->server) );
 	GetEnvOverride( "PTLE_MP_ROOM", c->room, sizeof(c->room) );
 	GetEnvOverride( "PTLE_MP_NAME", c->name, sizeof(c->name) );
