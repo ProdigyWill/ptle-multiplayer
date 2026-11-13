@@ -8,7 +8,7 @@
 # on the other PC and give it the Pitfall folder (the one with Start.exe).
 
 param(
-	[string] $Server = 'ribbitrally.com:27777',
+	[string] $Server = '15.204.239.19:27777',
 	[string] $Room = 'two-pc-test',
 	[string] $Name = 'Player 2'
 )
