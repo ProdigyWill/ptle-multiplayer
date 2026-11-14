@@ -19,6 +19,7 @@
 // For now one other player is shown (the first one heard from).
 //
 // Hotkeys (only while the game window has focus) :
+//   F1 : the menu (players, display settings, keys).
 //   F5 : spawn the puppet in the current level.
 //   F6 : cycle the puppet's animation : automatic (idle when still, run when
 //        moving, facing its direction of travel), then idle/rest states by hand.
@@ -61,6 +62,7 @@
 #include "net/snapshot.h"
 #include "net/transport.h"
 #include "overlay.h"
+#include "menu.h"
 #include "ptle/levels/level_info.h"
 
 
@@ -257,6 +259,7 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 static bool g_animSurvey = false;
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
+static bool g_menuTest = false;                  // PTLE_MP_MENUTEST=1 : the autotest drives the menu (F1).
 static bool g_viewerTest = false;                // PTLE_MP_VIEWERTEST=1 : the autotest drives the animation viewer.
 static uint32_t g_animSurveyClip = 0;            // The clip the puppet plays (0 : normal).
 static volatile LONG g_cropPending = 0;          // A cropped grab, taken in Present.
@@ -1709,8 +1712,23 @@ static volatile LONG g_reqSpawn = 0;
 static volatile LONG g_reqState = 0;
 static volatile LONG g_reqDelay = 0;
 static volatile LONG g_reqStay = 0;
-static volatile LONG g_reqList = 0;
-static bool g_showList = false;   // F9.
+static volatile LONG g_reqMenu = 0;
+
+// The menu (F1) and what it sets. Display settings are kept in the ini ([Display]).
+static Menu g_menu;
+static bool g_showTags = true;    // Names above the other players.
+static bool g_showList = false;   // The player list stays on screen while playing.
+static char g_iniPath[MAX_PATH] = { 0, };
+enum { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_PREV, MK_COUNT };
+static volatile LONG g_menuKeys[MK_COUNT];   // Presses, from the hotkey thread.
+static volatile LONG g_menuOpen = 0;         // For the hotkey thread and the keyboard poll.
+static volatile DWORD g_menuBlockUntil = 0;  // Keys stay away from the game a moment after it closes (the Esc that closed it).
+static struct { bool active; float x, y; bool down; } g_testMouse;   // Autotest : stands in for the mouse.
+
+static bool MenuBlocksInput()
+{
+	return g_menuOpen || (int) (g_menuBlockUntil - GetTickCount()) > 0;
+}
 static volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
                      g_reqReplay = 0, g_reqStarredOnly = 0;
 static volatile LONG g_harryTicks = 0;
@@ -1729,9 +1747,9 @@ static DWORD WINAPI HotkeyThread( void* )
 	// The animation viewer's keys ([ ] \ ') only matter while it's open.
 	static const int NUM_KEYS = 11;
 	bool wasDown[NUM_KEYS] = { false, };
-	const int keys[NUM_KEYS] = { VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_OEM_4, VK_OEM_6, VK_OEM_5, VK_OEM_7 };
-	const char* names[NUM_KEYS] = { "F5", "F6", "F7", "F8", "F9", "F10", "F11", "[", "]", "\\", "'" };
-	volatile LONG* reqs[NUM_KEYS] = { &g_reqSpawn, &g_reqState, &g_reqDelay, &g_reqStay, &g_reqList,
+	const int keys[NUM_KEYS] = { VK_F5, VK_F6, VK_F7, VK_F8, VK_F1, VK_F10, VK_F11, VK_OEM_4, VK_OEM_6, VK_OEM_5, VK_OEM_7 };
+	const char* names[NUM_KEYS] = { "F5", "F6", "F7", "F8", "F1", "F10", "F11", "[", "]", "\\", "'" };
+	volatile LONG* reqs[NUM_KEYS] = { &g_reqSpawn, &g_reqState, &g_reqDelay, &g_reqStay, &g_reqMenu,
 		&g_reqViewer, &g_reqStar, &g_reqPrev, &g_reqNext, &g_reqReplay, &g_reqStarredOnly };
 
 	for ( ;; ) {
@@ -1751,6 +1769,22 @@ static DWORD WINAPI HotkeyThread( void* )
 				}
 			}
 			wasDown[i] = down;
+		}
+
+		// The menu's keys, while it's open. Held arrows repeat.
+		static const int MENU_VK[7] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB };
+		static bool menuDown[7] = { false, };
+		static DWORD menuNext[7];
+		bool menu = g_menuOpen && GameHasFocus();
+		for ( int i = 0; i < 7; i++ ) {
+			bool down = menu && (GetAsyncKeyState( MENU_VK[i] ) & 0x8000) != 0;
+			DWORD now = GetTickCount();
+			if ( down && (!menuDown[i] || (i < 4 && (int) (now - menuNext[i]) >= 0)) ) {
+				int slot = (i == 6 && (GetAsyncKeyState( VK_SHIFT ) & 0x8000)) ? MK_PREV : i;
+				InterlockedIncrement( &g_menuKeys[slot] );
+				menuNext[i] = now + (menuDown[i] ? 70 : 350);
+			}
+			menuDown[i] = down;
 		}
 		Sleep( 15 );
 	}
@@ -1990,7 +2024,6 @@ static void HandleHotkeys( EIHarry* harry )
 	bool f6 = InterlockedExchange( &g_reqState, 0 ) != 0;
 	bool f7 = InterlockedExchange( &g_reqDelay, 0 ) != 0;
 	bool f8 = InterlockedExchange( &g_reqStay, 0 ) != 0;
-	if ( InterlockedExchange( &g_reqList, 0 ) ) g_showList = !g_showList;
 	HandleAnimViewer( harry );
 
 	// The puppet went with the last level : F8's "stay here" goes too.
@@ -2335,13 +2368,28 @@ static uint8_t KeyToDIK( WORD vk )
 static const uint32_t KEYS_NOW = 0x940EC0, KEYS_BEFORE = 0x940C90;
 static const uint32_t POLL_KEYBOARD = 0x6E8A80, POLL_KEYBOARD_CALL = 0x663BBE;
 
+// The gamepad is polled just before (0x6E8660( index ), called from 0x663BAD : the
+// DirectInput state, 0 if there's none). While the menu is open the game is told
+// there's none, so Harry doesn't walk off under it.
+static const uint32_t POLL_GAMEPAD = 0x6E8660, POLL_GAMEPAD_CALL = 0x663BAD;
+
+static void* __cdecl PollGamepad_Hook( int index )
+{
+	void* state = ((void* (__cdecl *)( int )) POLL_GAMEPAD)( index );
+	return MenuBlocksInput() ? 0 : state;
+}
+
 static void PollKeyboard_Hook()
 {
-	uint8_t before[256];
-	memcpy( before, (void*) KEYS_NOW, sizeof(before) );
-	((void (*)()) POLL_KEYBOARD)();
-	memcpy( (void*) KEYS_BEFORE, before, sizeof(before) );   // Not cleared : held keys stay held.
-	for ( int i = 0; i < 256; i++ ) ((uint8_t*) KEYS_NOW)[i] = g_fakeKeys[i];
+	if ( g_background ) {
+		uint8_t before[256];
+		memcpy( before, (void*) KEYS_NOW, sizeof(before) );
+		((void (*)()) POLL_KEYBOARD)();
+		memcpy( (void*) KEYS_BEFORE, before, sizeof(before) );   // Not cleared : held keys stay held.
+		for ( int i = 0; i < 256; i++ ) ((uint8_t*) KEYS_NOW)[i] = g_fakeKeys[i];
+	}
+	else ((void (*)()) POLL_KEYBOARD)();
+	if ( MenuBlocksInput() ) memset( (void*) KEYS_NOW, 0, 256 );   // The menu has the keyboard.
 }
 
 // The game window shows up without being activated or brought forward : its
@@ -2739,6 +2787,7 @@ static void AutotestStep( EIHarry* harry )
 		}
 		if ( g_animSurvey ) { phase = 200; phaseStart = now; step = 0; break; }
 		if ( g_viewerTest ) { phase = 300; phaseStart = now; step = 0; break; }
+		if ( g_menuTest ) { phase = 600; phaseStart = now; step = 0; break; }
 		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
@@ -2827,6 +2876,91 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
+		break;
+	}
+	case 600: {   // The menu : keys, the mouse, and Harry standing still meanwhile.
+		static Vector3f from;
+		static int failures = 0;
+		static const int START_DELAY = g_delayIndex;
+		DWORD t = now - phaseStart;
+		struct Local {
+			static float Moved( EIHarry* h, const Vector3f& from ) {
+				float dx = h->m_position.x - from.x, dy = h->m_position.y - from.y;
+				return sqrtf( dx * dx + dy * dy );
+			}
+			static void Check( const char* what, bool ok ) {
+				mp_log( "[AT] Menu : %s : %s\n", what, ok ? "ok" : "WRONG" );
+				if ( !ok ) failures++;
+			}
+			static void HoldW() { InterlockedExchange( &g_holdMs, 1200 ); InterlockedExchange( &g_holdKey, 'W' ); }
+		};
+		switch ( step ) {
+		case 0:
+			step++; break;
+		case 1:
+			InterlockedIncrement( &g_reqMenu ); step++; phaseStart = now; break;
+		case 2:   // Open, on the first page.
+			if ( t < 1000 ) break;
+			Local::Check( "F1 opens it", g_menu.IsOpen() && g_menu.CurrentPage() == 0 );
+			RequestSnapshot( "menu_1_players" );
+			InterlockedIncrement( &g_menuKeys[MK_NEXT] ); step++; phaseStart = now; break;
+		case 3:   // Tab : Display. Enter : name tags off.
+			if ( t < 700 ) break;
+			Local::Check( "Tab goes to the next page", g_menu.CurrentPage() == 1 );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] ); step++; phaseStart = now; break;
+		case 4:   // Down twice, right : the next playback delay.
+			if ( t < 600 ) break;
+			Local::Check( "Enter turns name tags off", !g_showTags );
+			InterlockedIncrement( &g_menuKeys[MK_DOWN] ); InterlockedIncrement( &g_menuKeys[MK_DOWN] ); step++; phaseStart = now; break;
+		case 5:
+			if ( t < 300 ) break;
+			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step++; phaseStart = now; break;
+		case 6:   // W held with the menu open : Harry stays.
+			if ( t < 500 ) break;
+			Local::Check( "Right changes the playback delay", g_delayIndex == (START_DELAY + 1) % 6 );
+			RequestSnapshot( "menu_2_display" );
+			from = harry->m_position; Local::HoldW(); step++; phaseStart = now; break;
+		case 7:   // The mouse : click the third page's tab.
+			if ( t < 1800 ) break;
+			Local::Check( "Harry stays put while it's open", Local::Moved( harry, from ) < 0.5F );
+			g_menu.TabCenter( 2, &g_testMouse.x, &g_testMouse.y );
+			g_testMouse.active = true; g_testMouse.down = true; step++; phaseStart = now; break;
+		case 8:   // Then the first row of the second page (name tags back on).
+			if ( t < 500 ) break;
+			g_testMouse.down = false;
+			Local::Check( "Clicking a tab opens its page", g_menu.CurrentPage() == 2 );
+			RequestSnapshot( "menu_3_keys" );
+			step++; phaseStart = now; break;
+		case 9:
+			if ( t < 500 ) break;
+			g_menu.TabCenter( 1, &g_testMouse.x, &g_testMouse.y ); g_testMouse.down = true; step++; phaseStart = now; break;
+		case 10:
+			if ( t < 300 ) break;
+			g_testMouse.down = false;
+			if ( t < 500 ) break;
+			g_menu.TabCenter( 0, &g_testMouse.x, &g_testMouse.y );
+			g_testMouse.x += 400.0F;   // Same height as the first tab : the first row.
+			g_testMouse.down = true; step++; phaseStart = now; break;
+		case 11:   // Esc closes it; Harry walks again.
+			if ( t < 300 ) break;
+			g_testMouse.down = false;
+			if ( t < 600 ) break;
+			Local::Check( "Clicking a row changes it (name tags back on)", g_showTags );
+			RequestSnapshot( "menu_4_mouse" );
+			g_testMouse.active = false;
+			InterlockedIncrement( &g_menuKeys[MK_BACK] ); step++; phaseStart = now; break;
+		case 12:
+			if ( t < 1000 ) break;
+			Local::Check( "Esc closes it", !g_menu.IsOpen() );
+			from = harry->m_position; Local::HoldW(); step++; phaseStart = now; break;
+		case 13:
+			if ( t < 1800 ) break;
+			Local::Check( "Harry walks again once it's closed", Local::Moved( harry, from ) > 1.0F );
+			RequestSnapshot( "menu_5_closed" );
+			g_delayIndex = START_DELAY;
+			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+			break;
+		}
 		break;
 	}
 	case 300: {   // Animation viewer : keys pressed in turn, a picture after each.
@@ -3307,6 +3441,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 
 	if ( InterlockedIncrement( &g_harryTicks ) == 1 ) {
 		mp_log( "[MP] Harry tick hook is running (this 0x%.8X, global Harry 0x%.8X).\n", self, Gizmod::getHarry() );
+		if ( !g_autotest ) Toast( "F1 : multiplayer menu" );
 	}
 
 	if ( self != Gizmod::getHarry() ) return;
@@ -3468,6 +3603,9 @@ static void ReadNetConfig( NetConfig* c )
 			mp_log( "[NET] Wrote default settings to %s.\n", ini );
 		}
 	}
+	strcpy_s( g_iniPath, ini );
+	g_showTags = GetPrivateProfileIntA( "Display", "NameTags", 1, ini ) != 0;
+	g_showList = GetPrivateProfileIntA( "Display", "PlayerList", 0, ini ) != 0;
 	GetPrivateProfileStringA( "Network", "Server", "", c->server, sizeof(c->server), ini );
 	GetPrivateProfileStringA( "Network", "Room", "default", c->room, sizeof(c->room), ini );
 	GetPrivateProfileStringA( "Network", "Name", "Harry", c->name, sizeof(c->name), ini );
@@ -3524,11 +3662,159 @@ static uint32_t WithAlpha( uint32_t color, float alpha )
 	return (color & 0x00FFFFFF) | ((uint32_t) (((color >> 24) & 0xFF) * alpha + 0.5F) << 24);
 }
 
+// The menu's settings, kept in the ini (not the autotests' : they leave it alone).
+static void SaveSettings()
+{
+	if ( g_autotest || !g_iniPath[0] ) return;
+	char delay[16];
+	sprintf_s( delay, "%d", DELAY_CHOICES[g_delayIndex] );
+	WritePrivateProfileStringA( "Display", "NameTags", g_showTags ? "1" : "0", g_iniPath );
+	WritePrivateProfileStringA( "Display", "PlayerList", g_showList ? "1" : "0", g_iniPath );
+	WritePrivateProfileStringA( "Network", "Delay", delay, g_iniPath );
+}
+
+// The player list's rows : the room, us, the others, the ping.
+static const int MAX_LIST_ROWS = MAX_PEERS + 3;
+static int BuildPlayerRows( char left[][96], char right[][64], uint32_t* colors, const char* lastRight )
+{
+	int rows = 0;
+	int me = g_transport ? g_transport->PlayerId() : -1;
+	uint32_t here = Gizmod::getCurrentLevelCRC();
+	int count = me >= 0 ? 1 : 0;
+	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_players[i].present && i != me ) count++;
+
+	if ( !g_networked ) {
+		sprintf_s( left[rows], 96, "Not online" );
+		sprintf_s( right[rows], 64, "(no Server in Multiplayer.ini)" );
+	}
+	else if ( me < 0 ) {
+		sprintf_s( left[rows], 96, "Room \"%s\"", g_roomName );
+		sprintf_s( right[rows], 64, "connecting..." );
+	}
+	else {
+		sprintf_s( left[rows], 96, "Room \"%s\"", g_roomName );
+		sprintf_s( right[rows], 64, "%d player%s", count, count == 1 ? "" : "s" );
+	}
+	colors[rows++] = 0xFFFFE080;
+	if ( me >= 0 ) {
+		sprintf_s( left[rows], 96, "%s (you)", g_myName );
+		sprintf_s( right[rows], 64, "%s", LevelName( g_haveLocal ? here : 0 ) );
+		colors[rows++] = 0xFFA0FFA0;
+	}
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		const PlayerInfo& info = g_players[i];
+		if ( !info.present || i == me ) continue;
+		sprintf_s( left[rows], 96, "%s", info.name );
+		if ( info.level && info.level == here ) sprintf_s( right[rows], 64, "here" );
+		else sprintf_s( right[rows], 64, "%s", LevelName( info.level ) );
+		colors[rows++] = 0xFFFFFFFF;
+	}
+	int ping = g_transport ? g_transport->RoundTripMs() : -1;
+	if ( ping >= 0 ) sprintf_s( left[rows], 96, "Ping %d ms", ping );
+	else left[rows][0] = 0;
+	sprintf_s( right[rows], 64, "%s", lastRight );
+	colors[rows++] = 0xFFB0B0B0;
+	return rows;
+}
+
+// The menu's pages. Each setting is one row here.
+static void DrawMenu( float sw, float sh, float h )
+{
+	MenuInput in;
+	ZeroMemory( &in, sizeof(in) );
+	in.up = InterlockedExchange( &g_menuKeys[MK_UP], 0 );
+	in.down = InterlockedExchange( &g_menuKeys[MK_DOWN], 0 );
+	in.left = InterlockedExchange( &g_menuKeys[MK_LEFT], 0 );
+	in.right = InterlockedExchange( &g_menuKeys[MK_RIGHT], 0 );
+	in.accept = InterlockedExchange( &g_menuKeys[MK_ACCEPT], 0 );
+	in.back = InterlockedExchange( &g_menuKeys[MK_BACK], 0 );
+	in.nextPage = InterlockedExchange( &g_menuKeys[MK_NEXT], 0 );
+	in.prevPage = InterlockedExchange( &g_menuKeys[MK_PREV], 0 );
+
+	// The mouse, in the overlay's pixels (the window may be scaled).
+	bool cursorShown = true;
+	if ( g_testMouse.active ) {
+		in.mouseX = g_testMouse.x; in.mouseY = g_testMouse.y; in.mouseInside = true; in.mouseDown = g_testMouse.down;
+	}
+	else {
+		HWND wnd = *((HWND*) HWND_GAME_WINDOW);
+		POINT p;
+		RECT rc;
+		if ( wnd && GameHasFocus() && GetCursorPos( &p ) && ScreenToClient( wnd, &p ) && GetClientRect( wnd, &rc ) && rc.right > 0 && rc.bottom > 0 ) {
+			in.mouseX = p.x * sw / rc.right;
+			in.mouseY = p.y * sh / rc.bottom;
+			in.mouseInside = p.x >= 0 && p.y >= 0 && p.x < rc.right && p.y < rc.bottom;
+			in.mouseDown = in.mouseInside && (GetAsyncKeyState( VK_LBUTTON ) & 0x8000) != 0;
+		}
+		CURSORINFO ci;
+		ci.cbSize = sizeof(ci);
+		cursorShown = GetCursorInfo( &ci ) && (ci.flags & CURSOR_SHOWING);
+	}
+	static float lastX = -1.0F, lastY = -1.0F;
+	static bool lastDown = false;
+	in.mouseMoved = in.mouseInside && (in.mouseX != lastX || in.mouseY != lastY);
+	in.mouseClicked = in.mouseDown && !lastDown;
+	lastX = in.mouseX; lastY = in.mouseY; lastDown = in.mouseDown;
+
+	static char left[MAX_LIST_ROWS][96], right[MAX_LIST_ROWS][64];
+	static uint32_t colors[MAX_LIST_ROWS];
+	int rows = BuildPlayerRows( left, right, colors, "" );
+
+	g_menu.Begin( in, sw, sh, h, "Multiplayer", right[0][0] ? right[0] : 0 );
+	if ( g_menu.Page( "Players" ) ) {
+		for ( int r = 0; r < rows; r++ ) g_menu.Info( left[r], r == 0 ? "" : right[r], colors[r] );
+	}
+	if ( g_menu.Page( "Display" ) ) {
+		static const char* const DELAYS[] = { "133 ms", "250 ms", "500 ms", "1 s", "1.5 s", "3 s" };
+		bool changed = false;
+		changed |= g_menu.Toggle( "Name tags", &g_showTags, "Names above the other players." );
+		changed |= g_menu.Toggle( "Player list while playing", &g_showList, "Keeps the player list in the corner of the screen." );
+		changed |= g_menu.Choice( "Playback delay", &g_delayIndex, DELAYS, sizeof(DELAYS) / sizeof(DELAYS[0]),
+			"How far behind the others are shown. Shorter : closer to live, but jerkier on a bad connection." );
+		if ( changed ) SaveSettings();
+	}
+	if ( g_menu.Page( "Keys" ) ) {
+		g_menu.Info( "F1", "This menu" );
+		g_menu.Info( "F10", "Animation viewer ( [ ] \\ ' and F11 inside it)" );
+		g_menu.Header( "For testing" );
+		g_menu.Info( "F5", "Spawn a puppet that copies you", Menu::DIM );
+		g_menu.Info( "F6", "Puppet's animation state", Menu::DIM );
+		g_menu.Info( "F7", "Next playback delay", Menu::DIM );
+		g_menu.Info( "F8", "Puppet stays where it is", Menu::DIM );
+	}
+	g_menu.End();
+
+	// Our own pointer where the game hides Windows'.
+	if ( in.mouseInside && !cursorShown ) {
+		OverlayRect( in.mouseX - 1.0F, in.mouseY - 1.0F, 10.0F, 10.0F, 0xFF000000 );
+		OverlayRect( in.mouseX, in.mouseY, 8.0F, 8.0F, 0xFFFFFFFF );
+	}
+}
+
+// Tells the hotkey thread and the keyboard poll whether the menu is open.
+static void SyncMenuOpen()
+{
+	bool open = g_menu.IsOpen();
+	if ( (g_menuOpen != 0) == open ) return;
+	if ( open ) for ( int i = 0; i < MK_COUNT; i++ ) InterlockedExchange( &g_menuKeys[i], 0 );
+	else g_menuBlockUntil = GetTickCount() + 300;
+	InterlockedExchange( &g_menuOpen, open ? 1 : 0 );
+	mp_log( "[MP] Menu %s.\n", open ? "opened" : "closed" );
+}
+
+static void SetMenuOpen( bool open )
+{
+	if ( open == g_menu.IsOpen() ) return;
+	if ( open ) g_menu.Open(); else g_menu.Close();
+	SyncMenuOpen();
+}
+
 static void DrawOverlay( IDirect3DDevice9* dev )
 {
 	if ( g_animSurvey ) return;   // Clean frames.
 	uint32_t now = NetNowMs();
-	bool any = g_showList || g_animViewer;
+	if ( InterlockedExchange( &g_reqMenu, 0 ) ) SetMenuOpen( !g_menu.IsOpen() );
+	bool any = g_showList || g_animViewer || g_menu.IsOpen();
 	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame == g_presentCount;
 	for ( int i = 0; i < MAX_TOASTS && !any; i++ ) any = g_toasts[i].text[0] && now - g_toasts[i].time < TOAST_MS;
 	if ( !any ) return;
@@ -3545,7 +3831,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 	// Name tags.
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const Peer& p = g_peers[i];
-		if ( !p.beast || p.tagFrame != g_presentCount ) continue;
+		if ( !g_showTags || !p.beast || p.tagFrame != g_presentCount ) continue;
 		float alpha = 1.0F - (p.tagDepth - TAG_FADE_START) / (TAG_FADE_END - TAG_FADE_START);
 		if ( alpha <= 0.0F ) continue;
 		const char* name = PlayerName( p.id );
@@ -3557,47 +3843,10 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 
 	float listLeft = sw;   // Messages stay clear of the player list.
 	// The player list, top right.
-	if ( g_showList ) {
-		static const int MAX_ROWS = MAX_PEERS + 3;
-		char left[MAX_ROWS][96], right[MAX_ROWS][64];
-		uint32_t colors[MAX_ROWS];
-		int rows = 0;
-		int me = g_transport ? g_transport->PlayerId() : -1;
-		uint32_t here = Gizmod::getCurrentLevelCRC();
-		int count = me >= 0 ? 1 : 0;
-		for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_players[i].present && i != me ) count++;
-
-		if ( !g_networked ) {
-			sprintf_s( left[rows], "Not online" );
-			sprintf_s( right[rows], "(no Server in Multiplayer.ini)" );
-		}
-		else if ( me < 0 ) {
-			sprintf_s( left[rows], "Room \"%s\"", g_roomName );
-			sprintf_s( right[rows], "connecting..." );
-		}
-		else {
-			sprintf_s( left[rows], "Room \"%s\"", g_roomName );
-			sprintf_s( right[rows], "%d player%s", count, count == 1 ? "" : "s" );
-		}
-		colors[rows++] = 0xFFFFE080;
-		if ( me >= 0 ) {
-			sprintf_s( left[rows], "%s (you)", g_myName );
-			sprintf_s( right[rows], "%s", LevelName( g_haveLocal ? here : 0 ) );
-			colors[rows++] = 0xFFA0FFA0;
-		}
-		for ( int i = 0; i < MAX_PEERS; i++ ) {
-			const PlayerInfo& info = g_players[i];
-			if ( !info.present || i == me ) continue;
-			sprintf_s( left[rows], "%s", info.name );
-			if ( info.level && info.level == here ) sprintf_s( right[rows], "here" );
-			else sprintf_s( right[rows], "%s", LevelName( info.level ) );
-			colors[rows++] = 0xFFFFFFFF;
-		}
-		int ping = g_transport ? g_transport->RoundTripMs() : -1;
-		if ( ping >= 0 ) sprintf_s( left[rows], "Ping %d ms", ping );
-		else left[rows][0] = 0;
-		sprintf_s( right[rows], "F9 : hide" );
-		colors[rows++] = 0xFFB0B0B0;
+	if ( g_showList && !g_menu.IsOpen() ) {
+		char left[MAX_LIST_ROWS][96], right[MAX_LIST_ROWS][64];
+		uint32_t colors[MAX_LIST_ROWS];
+		int rows = BuildPlayerRows( left, right, colors, "F1 : menu" );
 
 		float wl = 0.0F, wr = 0.0F;
 		for ( int r = 0; r < rows; r++ ) {
@@ -3656,6 +3905,10 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		for ( int r = 0; r < 3; r++ ) OverlayText( bx + pad, by + pad + r * h * 1.3F, line[r], colors[r] );
 	}
 
+	if ( g_menu.IsOpen() ) {
+		DrawMenu( sw, sh, h );
+		SyncMenuOpen();   // Esc closed it.
+	}
 	OverlayEnd();
 }
 
@@ -3781,14 +4034,18 @@ public:
 			mp_log( "[NET] No server : loopback (latency %d ms, jitter %d ms, loss %.0f%%).\n", sim.latencyMs, sim.jitterMs, sim.loss * 100.0F );
 		}
 
+		static const uint8_t POLL_ORIGINAL[1] = { 0xE8 };
+		if ( memcmp( (void*) POLL_KEYBOARD_CALL, POLL_ORIGINAL, 1 ) == 0 ) injector::MakeCALL( POLL_KEYBOARD_CALL, &PollKeyboard_Hook );
+		else mp_log( "[MP] The keyboard poll call isn't what we expect : keys reach the game while the menu is open.\n" );
+		static const uint8_t PAD_ORIGINAL[5] = { 0xE8, 0xAE, 0x4A, 0x08, 0x00 };   // call 0x6E8660.
+		if ( memcmp( (void*) POLL_GAMEPAD_CALL, PAD_ORIGINAL, 5 ) == 0 ) injector::MakeCALL( POLL_GAMEPAD_CALL, &PollGamepad_Hook );
+		else mp_log( "[MP] The gamepad poll call isn't what we expect : the gamepad reaches the game while the menu is open.\n" );
+
 		char env[8] = { 0, };
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
 			g_autotest = true;
 			g_background = !(GetEnvironmentVariableA( "PTLE_MP_FOREGROUND", env, sizeof(env) ) && env[0] == '1');
-			if ( g_background ) {
-				injector::MakeCALL( POLL_KEYBOARD_CALL, &PollKeyboard_Hook );
-				PatchWindowNoActivate();
-			}
+			if ( g_background ) PatchWindowNoActivate();
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
@@ -3799,6 +4056,11 @@ public:
 			if ( GetEnvironmentVariableA( "PTLE_MP_DISTTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_distTest = true;
 				mp_log( "[AT] Distance test.\n" );
+			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_MENUTEST", env, sizeof(env) ) && env[0] == '1' ) {
+				g_menuTest = true;
+				g_showList = false;
+				mp_log( "[AT] Menu test.\n" );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_VIEWERTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_viewerTest = true;
@@ -3819,7 +4081,7 @@ public:
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
 		}
 
-		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F5 spawn, F6 state, F7 delay, F8 stay here, F9 player list.\n",
+		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F1 menu, F5 spawn, F6 state, F7 delay, F8 stay here.\n",
 			(uint32_t) g_origHarryTick, (uint32_t) g_origEvilHarryTick );
 	}
 
