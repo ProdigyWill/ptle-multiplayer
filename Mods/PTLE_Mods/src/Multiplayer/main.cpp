@@ -340,6 +340,14 @@ static int g_myOutfit = 0;       // The one chosen (Multiplayer.ini, [Appearance
 static int g_myWornOutfit = 0;   // The one Harry wears now : what the others are told.
 static int g_testOutfit = -1;    // Autotest : every puppet wears this.
 
+// Retro Harry's colours. His model takes all its colour from a 32x32 texture of four
+// flat squares, so each player can have their own (see the Retro palette section).
+static const int RETRO_OUTFIT = 3;
+enum { RETRO_HAIR, RETRO_SKIN, RETRO_SHIRT, RETRO_TROUSERS, RETRO_PARTS };
+static const char* const RETRO_PART_NAMES[RETRO_PARTS] = { "Hair", "Skin", "Shirt", "Trousers" };
+static const uint8_t RETRO_DEFAULT[RETRO_PARTS][3] = { { 142, 118, 62 }, { 255, 161, 123 }, { 78, 200, 74 }, { 0, 87, 0 } };
+static uint8_t g_myColors[RETRO_PARTS][3];   // Multiplayer.ini, [Appearance] RetroHair... (RRGGBB).
+
 struct PlayerInfo
 {
 	bool present;
@@ -347,6 +355,7 @@ struct PlayerInfo
 	uint32_t level;
 	uint32_t lastInfo;
 	uint8_t outfit;
+	uint8_t colors[RETRO_PARTS][3];
 };
 static PlayerInfo g_players[MAX_PEERS];
 static char g_myName[MAX_NAME + 1] = "Harry";
@@ -589,6 +598,8 @@ static void NetUpdate()
 			info.lastInfo = now;
 			int extra = PACKET_HEADER_SIZE + 5 + nameLength;   // After the name : the outfit (not sent by older builds).
 			info.outfit = (extra < length && packet[extra] < NUM_OUTFITS) ? packet[extra] : 0;
+			if ( extra + 1 + (int) sizeof(info.colors) <= length ) memcpy( info.colors, packet + extra + 1, sizeof(info.colors) );
+			else memcpy( info.colors, RETRO_DEFAULT, sizeof(info.colors) );
 			if ( !info.present || strcmp( info.name, name ) != 0 ) {
 				mp_log( "[NET] Player %d is \"%s\", in %s.\n", h.player, name, LevelName( info.level ) );
 				if ( !info.present && h.player != me ) Toast( "%s joined", name );
@@ -627,7 +638,7 @@ static void NetUpdate()
 	}
 	if ( me >= 0 && now - g_lastInfoSent >= INFO_INTERVAL_MS ) {   // Who we are, where.
 		g_lastInfoSent = now;
-		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1];
+		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1 + sizeof(g_myColors)];
 		EncodeHeader( PACKET_INFO, (uint8_t) me, 0, info );
 		uint32_t where = g_haveLocal ? level : 0;
 		memcpy( info + PACKET_HEADER_SIZE, &where, 4 );
@@ -635,7 +646,8 @@ static void NetUpdate()
 		info[PACKET_HEADER_SIZE + 4] = (uint8_t) n;
 		memcpy( info + PACKET_HEADER_SIZE + 5, g_myName, n );
 		info[PACKET_HEADER_SIZE + 5 + n] = (uint8_t) g_myWornOutfit;
-		g_transport->Send( info, PACKET_HEADER_SIZE + 5 + n + 1 );
+		memcpy( info + PACKET_HEADER_SIZE + 5 + n + 1, g_myColors, sizeof(g_myColors) );
+		g_transport->Send( info, PACKET_HEADER_SIZE + 5 + n + 1 + sizeof(g_myColors) );
 	}
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer* peer = &g_peers[i];
@@ -2342,6 +2354,159 @@ static HRESULT __stdcall Present_Hook( IDirect3DDevice9* dev, const RECT* src, c
 }
 
 // Hooks the device's Present once it exists.
+// --------------------------------------------------------------------------------
+// The Retro palette. Retro Harry's model is 15 pieces, all textured with one 32x32
+// DXT1 texture of four flat squares : shirt (top left), trousers (top right), skin
+// (bottom left), hair (bottom right). The game draws every Retro character's pieces
+// one after the other with that texture set (DrawPrimitive, a vertex shader whose
+// constants c44..c46 are the piece's first bone, in the world). So when a piece is
+// about to be drawn with it, the character it belongs to is the one standing there,
+// and that player's own palette is put in its place for the draw.
+// --------------------------------------------------------------------------------
+typedef HRESULT (__stdcall *SetTextureFunc)( IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9* );
+typedef HRESULT (__stdcall *DrawPrimFunc)( IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT );
+static const int VTABLE_SLOT_SETTEXTURE = 65, VTABLE_SLOT_DRAWPRIMITIVE = 81;
+static SetTextureFunc g_origSetTexture = 0;
+static DrawPrimFunc g_origDrawPrim = 0;
+static IDirect3DBaseTexture9* g_stage0 = 0;   // The texture the game has set.
+static bool g_stage0Retro = false;            // It's the Retro palette.
+static int g_retroSwaps = 0;                  // Pieces drawn with a player's palette (for the autotest).
+
+// Is this texture the game's Retro palette ? Asked for each texture set, so the
+// answer is remembered : the palette itself, and the few other textures of its size
+// and kind that had to be looked into. Forgotten when a level loads.
+static IDirect3DBaseTexture9* g_retroPalette = 0;
+static IDirect3DBaseTexture9* g_retroNot[8];
+static int g_retroNotNext = 0;
+
+static void ForgetRetroTextures()
+{
+	g_retroPalette = 0;
+	ZeroMemory( g_retroNot, sizeof(g_retroNot) );
+	g_stage0 = 0;
+	g_stage0Retro = false;
+}
+
+static bool IsRetroPalette( IDirect3DBaseTexture9* tex )
+{
+	if ( tex == g_retroPalette ) return true;
+	for ( int i = 0; i < 8; i++ ) if ( g_retroNot[i] == tex ) return false;
+	bool retro = false;
+	D3DSURFACE_DESC desc;
+	IDirect3DTexture9* t = (IDirect3DTexture9*) tex;
+	if ( tex->GetType() != D3DRTYPE_TEXTURE || FAILED( t->GetLevelDesc( 0, &desc ) )
+	  || desc.Width != 32 || desc.Height != 32 || desc.Format != D3DFMT_DXT1 ) return false;
+	{
+		// One DXT1 block (two colours, 16 two-bit choices) per square is enough to tell.
+		static const uint32_t BLOCKS[4][2] = { { 0x46496E29, 0xFFFFFFFF }, { 0x02C002A0, 0xAAAAAAAA }, { 0xFD10FD0F, 0x00000000 }, { 0x8BA893C7, 0xFFFFFFFF } };
+		D3DLOCKED_RECT lr;
+		if ( SUCCEEDED( t->LockRect( 0, &lr, 0, D3DLOCK_READONLY ) ) ) {
+			retro = true;
+			for ( int q = 0; q < 4; q++ ) {
+				const uint32_t* block = (const uint32_t*) ((const uint8_t*) lr.pBits + (q / 2) * 4 * lr.Pitch + (q % 2) * 4 * 8);
+				if ( block[0] != BLOCKS[q][0] || block[1] != BLOCKS[q][1] ) retro = false;
+			}
+			t->UnlockRect( 0 );
+		}
+	}
+	if ( retro ) {
+		g_retroPalette = tex;
+		mp_log( "[MP] The Retro palette is texture 0x%.8X.\n", (uint32_t) tex );
+	}
+	else {
+		g_retroNot[g_retroNotNext] = tex;
+		g_retroNotNext = (g_retroNotNext + 1) % 8;
+	}
+	return retro;
+}
+
+// A player's palette : the same four squares in their colours. One per player
+// (the last is ours), made and repainted as needed.
+static struct { IDirect3DTexture9* tex; uint8_t colors[RETRO_PARTS][3]; } g_retroTex[MAX_PEERS + 1];
+
+static IDirect3DTexture9* RetroTexture( IDirect3DDevice9* dev, int slot, const uint8_t colors[RETRO_PARTS][3] )
+{
+	bool paint = false;
+	if ( !g_retroTex[slot].tex ) {
+		if ( FAILED( dev->CreateTexture( 32, 32, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED, &g_retroTex[slot].tex, 0 ) ) ) return 0;
+		paint = true;
+	}
+	if ( paint || memcmp( g_retroTex[slot].colors, colors, sizeof(g_retroTex[slot].colors) ) != 0 ) {
+		static const int SQUARE[2][2] = { { RETRO_SHIRT, RETRO_TROUSERS }, { RETRO_SKIN, RETRO_HAIR } };   // [row][column].
+		D3DLOCKED_RECT lr;
+		if ( FAILED( g_retroTex[slot].tex->LockRect( 0, &lr, 0, 0 ) ) ) return 0;
+		for ( int y = 0; y < 32; y++ ) {
+			uint32_t* row = (uint32_t*) ((uint8_t*) lr.pBits + y * lr.Pitch);
+			for ( int x = 0; x < 32; x++ ) {
+				const uint8_t* c = colors[SQUARE[y / 16][x / 16]];
+				row[x] = 0xFF000000 | (c[0] << 16) | (c[1] << 8) | c[2];
+			}
+		}
+		g_retroTex[slot].tex->UnlockRect( 0 );
+		memcpy( g_retroTex[slot].colors, colors, sizeof(g_retroTex[slot].colors) );
+	}
+	return g_retroTex[slot].tex;
+}
+
+// Whose piece is about to be drawn : the palette of the Retro character it belongs
+// to (0 : the game's own, they kept its colours). A character's 15 pieces are drawn
+// in a row, body and legs first : those report a spot within a step of where the
+// character stands, which says whose they are. The arms report one a few units to
+// the side (nearer a neighbour, sometimes), so they go to whoever the piece before
+// them belonged to.
+static int g_retroOwner = -1;   // The slot of g_retroTex (-1 : nobody yet since the palette was set).
+static const uint8_t (*g_retroOwnerColors)[3] = 0;
+
+static IDirect3DTexture9* RetroTextureHere( IDirect3DDevice9* dev )
+{
+	float bone[3][4];   // Rows : the translation is each row's w.
+	if ( FAILED( dev->GetVertexShaderConstantF( 44, &bone[0][0], 3 ) ) ) return 0;
+	int me = g_transport ? g_transport->PlayerId() : -1;
+	float best = 2.5F * 2.5F;
+	for ( int i = -1; i < MAX_PEERS; i++ ) {   // -1 : our own Harry.
+		Vector3f at;
+		const uint8_t (*c)[3];
+		if ( i < 0 ) {
+			EIHarry* harry = Gizmod::getHarry();
+			if ( !harry || g_myWornOutfit != RETRO_OUTFIT ) continue;
+			at = harry->m_position;
+			c = g_myColors;
+		}
+		else {
+			const Peer& p = g_peers[i];
+			if ( !p.beast || p.shownOutfit != RETRO_OUTFIT ) continue;
+			at = p.beast->EIBeast::m_position;
+			c = (i == me || !g_networked || !g_players[i].present) ? g_myColors : g_players[i].colors;
+		}
+		float dx = bone[0][3] - at.x, dy = bone[1][3] - at.y, dz = bone[2][3] - at.z;
+		float d = dx * dx + dy * dy;
+		if ( d < best && fabsf( dz ) < 8.0F ) { best = d; g_retroOwner = i < 0 ? MAX_PEERS : i; g_retroOwnerColors = c; }
+	}
+	if ( g_retroOwner < 0 || memcmp( g_retroOwnerColors, RETRO_DEFAULT, sizeof(RETRO_DEFAULT) ) == 0 ) return 0;
+	return RetroTexture( dev, g_retroOwner, g_retroOwnerColors );
+}
+
+static HRESULT __stdcall SetTexture_Hook( IDirect3DDevice9* dev, DWORD stage, IDirect3DBaseTexture9* tex )
+{
+	if ( stage == 0 ) {
+		g_stage0 = tex;
+		g_stage0Retro = tex && IsRetroPalette( tex );
+		g_retroOwner = -1;
+	}
+	return g_origSetTexture( dev, stage, tex );
+}
+
+static HRESULT __stdcall DrawPrim_Hook( IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, UINT start, UINT prims )
+{
+	IDirect3DTexture9* own = g_stage0Retro ? RetroTextureHere( dev ) : 0;
+	if ( !own ) return g_origDrawPrim( dev, type, start, prims );
+	g_origSetTexture( dev, 0, own );
+	HRESULT hr = g_origDrawPrim( dev, type, start, prims );
+	g_origSetTexture( dev, 0, g_stage0 );
+	g_retroSwaps++;
+	return hr;
+}
+
 static bool HookPresent()
 {
 	if ( g_origPresent ) return true;
@@ -2363,6 +2528,10 @@ static bool HookPresent()
 	g_grabDone = CreateEventA( 0, FALSE, FALSE, 0 );
 	g_origPresent = (PresentFunc) vtable[VTABLE_SLOT_PRESENT];
 	injector::WriteMemory( &vtable[VTABLE_SLOT_PRESENT], &Present_Hook, true );
+	g_origSetTexture = (SetTextureFunc) vtable[VTABLE_SLOT_SETTEXTURE];
+	injector::WriteMemory( &vtable[VTABLE_SLOT_SETTEXTURE], &SetTexture_Hook, true );
+	g_origDrawPrim = (DrawPrimFunc) vtable[VTABLE_SLOT_DRAWPRIMITIVE];
+	injector::WriteMemory( &vtable[VTABLE_SLOT_DRAWPRIMITIVE], &DrawPrim_Hook, true );
 	mp_log( "[AT] Screenshots come from the Direct3D back buffer.\n" );
 	return true;
 }
@@ -2922,6 +3091,7 @@ static void AutotestStep( EIHarry* harry )
 			if ( !b ) { InterlockedExchange( &g_autotestDone, 2 ); break; }
 			g_testOutfit = step;
 			if ( t < 2500 ) break;
+
 			bool ok = g_cur->shownOutfit == step && FIELD( b, uint32_t, BEAST_MODEL ) == OUTFITS[step].model;
 			mp_log( "[AT] Outfit : the puppet as %s : %s\n", OUTFITS[step].name, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
@@ -2944,12 +3114,15 @@ static void AutotestStep( EIHarry* harry )
 			mp_log( "[AT] Outfit : Harry after the level loaded again (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			SpawnPuppet( harry );   // It replays us : Retro too.
+			static const uint8_t TEST[RETRO_PARTS][3] = { { 245, 245, 245 }, { 255, 161, 123 }, { 220, 50, 40 }, { 50, 100, 220 } };
+			memcpy( g_myColors, TEST, sizeof(g_myColors) );   // White hair, red shirt, blue trousers.
+			g_retroSwaps = 0;
 			step++; phaseStart = now;
 		}
 		else {
 			if ( t < 3000 ) break;
-			bool ok = b && g_cur->shownOutfit == 3;
-			mp_log( "[AT] Outfit : the puppet that replays us : %s\n", ok ? "ok" : "WRONG" );
+			bool ok = b && g_cur->shownOutfit == 3 && g_retroSwaps > 100;
+			mp_log( "[AT] Outfit : the puppet that replays us, both in our colours (%d pieces drawn with them) : %s\n", g_retroSwaps, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_5_ours" );
 			g_myOutfit = 0;
@@ -2984,10 +3157,27 @@ static void AutotestStep( EIHarry* harry )
 			Local::Check( "F1 opens it", g_menu.IsOpen() && g_menu.CurrentPage() == 0 );
 			RequestSnapshot( "menu_1_players" );
 			InterlockedIncrement( &g_menuKeys[MK_NEXT] ); step++; phaseStart = now; break;
-		case 3:   // Tab : Display. Enter : name tags off.
+		case 3:   // Tab : Appearance, with Retro Harry's colours showing. Down three times, right : another shirt.
+			if ( t < 100 ) { g_myOutfit = RETRO_OUTFIT; break; }
 			if ( t < 700 ) break;
 			Local::Check( "Tab goes to the next page", g_menu.CurrentPage() == 1 );
-			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] ); step++; phaseStart = now; break;
+			for ( int i = 0; i < 3; i++ ) InterlockedIncrement( &g_menuKeys[MK_DOWN] );
+			step = 30; phaseStart = now; break;
+		case 30:
+			if ( t < 300 ) break;
+			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step = 31; phaseStart = now; break;
+		case 31:   // Tab again : Display. Enter : name tags off.
+			if ( t < 500 ) break;
+			Local::Check( "Right picks the next shirt colour", memcmp( g_myColors[RETRO_SHIRT], RETRO_DEFAULT[RETRO_SHIRT], 3 ) != 0 );
+			RequestSnapshot( "menu_1b_appearance" );
+			step = 33; phaseStart = now; break;
+		case 33:
+			if ( t < 300 ) break;
+			InterlockedIncrement( &g_menuKeys[MK_NEXT] ); step = 32; phaseStart = now; break;
+		case 32:
+			if ( t < 700 ) break;
+			Local::Check( "Tab again goes to Display", g_menu.CurrentPage() == 2 );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] ); step = 4; phaseStart = now; break;
 		case 4:   // Down twice, right : the next playback delay.
 			if ( t < 600 ) break;
 			Local::Check( "Enter turns name tags off", !g_showTags );
@@ -3003,17 +3193,17 @@ static void AutotestStep( EIHarry* harry )
 		case 7:   // The mouse : click the third page's tab.
 			if ( t < 1800 ) break;
 			Local::Check( "Harry stays put while it's open", Local::Moved( harry, from ) < 0.5F );
-			g_menu.TabCenter( 2, &g_testMouse.x, &g_testMouse.y );
+			g_menu.TabCenter( 3, &g_testMouse.x, &g_testMouse.y );
 			g_testMouse.active = true; g_testMouse.down = true; step++; phaseStart = now; break;
 		case 8:   // Then the first row of the second page (name tags back on).
 			if ( t < 500 ) break;
 			g_testMouse.down = false;
-			Local::Check( "Clicking a tab opens its page", g_menu.CurrentPage() == 2 );
+			Local::Check( "Clicking a tab opens its page", g_menu.CurrentPage() == 3 );
 			RequestSnapshot( "menu_3_keys" );
 			step++; phaseStart = now; break;
 		case 9:
 			if ( t < 500 ) break;
-			g_menu.TabCenter( 1, &g_testMouse.x, &g_testMouse.y ); g_testMouse.down = true; step++; phaseStart = now; break;
+			g_menu.TabCenter( 2, &g_testMouse.x, &g_testMouse.y ); g_testMouse.down = true; step++; phaseStart = now; break;
 		case 10:
 			if ( t < 300 ) break;
 			g_testMouse.down = false;
@@ -3707,6 +3897,19 @@ static void ReadNetConfig( NetConfig* c )
 	}
 	strcpy_s( g_iniPath, ini );
 	g_myOutfit = GetPrivateProfileIntA( "Appearance", "Outfit", 0, ini );
+	char colors[64] = { 0, };
+	GetEnvOverride( "PTLE_MP_COLORS", colors, sizeof(colors) );   // Tests : "RRGGBB,RRGGBB,RRGGBB,RRGGBB" (hair, skin, shirt, trousers).
+	for ( int i = 0; i < RETRO_PARTS; i++ ) {
+		char key[32], value[16];
+		sprintf_s( key, "Retro%s", RETRO_PART_NAMES[i] );
+		GetPrivateProfileStringA( "Appearance", key, "", value, sizeof(value), ini );
+		if ( strlen( colors ) >= (size_t) (i * 7 + 6) ) strncpy_s( value, colors + i * 7, 6 );
+		unsigned rgb = 0;
+		if ( strlen( value ) == 6 && sscanf_s( value, "%x", &rgb ) == 1 ) {
+			g_myColors[i][0] = (uint8_t) (rgb >> 16); g_myColors[i][1] = (uint8_t) (rgb >> 8); g_myColors[i][2] = (uint8_t) rgb;
+		}
+		else memcpy( g_myColors[i], RETRO_DEFAULT[i], 3 );
+	}
 	char outfit[8] = { 0, };
 	GetEnvOverride( "PTLE_MP_OUTFIT", outfit, sizeof(outfit) );   // Tests.
 	if ( outfit[0] ) g_myOutfit = atoi( outfit );
@@ -3783,6 +3986,12 @@ static void SaveSettings()
 	char outfit[16];
 	sprintf_s( outfit, "%d", g_myOutfit );
 	WritePrivateProfileStringA( "Appearance", "Outfit", outfit, g_iniPath );
+	for ( int i = 0; i < RETRO_PARTS; i++ ) {
+		char key[32], value[16];
+		sprintf_s( key, "Retro%s", RETRO_PART_NAMES[i] );
+		sprintf_s( value, "%02X%02X%02X", g_myColors[i][0], g_myColors[i][1], g_myColors[i][2] );
+		WritePrivateProfileStringA( "Appearance", key, value, g_iniPath );
+	}
 	char delay[16];
 	sprintf_s( delay, "%d", DELAY_CHOICES[g_delayIndex] );
 	WritePrivateProfileStringA( "Display", "NameTags", g_showTags ? "1" : "0", g_iniPath );
@@ -3893,6 +4102,46 @@ static void DrawMenu( float sw, float sh, float h )
 			sprintf_s( now, "%s until then", OUTFITS[g_myWornOutfit].name );
 			g_menu.Info( "", now, Menu::DIM );
 		}
+		if ( g_myOutfit == RETRO_OUTFIT ) {
+			// A row of ready colours per part (the first is the game's own), and sliders for any other.
+			static const uint8_t READY[][3] = { { 220, 50, 40 }, { 240, 140, 30 }, { 240, 215, 60 }, { 60, 190, 220 }, { 50, 100, 220 },
+				{ 150, 80, 200 }, { 240, 120, 180 }, { 245, 245, 245 }, { 130, 130, 130 }, { 30, 30, 30 } };
+			static const int NUM_READY = sizeof(READY) / sizeof(READY[0]);
+			static int editing = RETRO_SHIRT;
+			bool changed = false;
+			g_menu.Header( "Retro Harry's colours" );
+			for ( int part = 0; part < RETRO_PARTS; part++ ) {
+				uint32_t swatches[NUM_READY + 1];
+				int index = -1;
+				for ( int i = 0; i <= NUM_READY; i++ ) {
+					const uint8_t* c = i == 0 ? RETRO_DEFAULT[part] : READY[i - 1];
+					swatches[i] = (c[0] << 16) | (c[1] << 8) | c[2];
+					if ( memcmp( c, g_myColors[part], 3 ) == 0 ) index = i;
+				}
+				if ( g_menu.Swatches( RETRO_PART_NAMES[part], &index, swatches, NUM_READY + 1, "Left / Right or click : pick a colour. Shows straight away." ) && index >= 0 ) {
+					memcpy( g_myColors[part], index == 0 ? RETRO_DEFAULT[part] : READY[index - 1], 3 );
+					editing = part;
+					changed = true;
+				}
+			}
+			g_menu.Choice( "Mix a colour for", &editing, RETRO_PART_NAMES, RETRO_PARTS, "Which part the three sliders below change." );
+			static const char* const CHANNELS[3] = { "Red", "Green", "Blue" };
+			for ( int ch = 0; ch < 3; ch++ ) {
+				int v = g_myColors[editing][ch];
+				if ( g_menu.Slider( CHANNELS[ch], &v, 0, 255, 5, "Left / Right, or click and drag." ) ) {
+					g_myColors[editing][ch] = (uint8_t) v;
+					changed = true;
+				}
+			}
+			if ( g_menu.Action( "Back to the original colours" ) ) {
+				memcpy( g_myColors, RETRO_DEFAULT, sizeof(g_myColors) );
+				changed = true;
+			}
+			if ( changed ) {
+				g_lastInfoSent = 0;   // The others hear about it now.
+				SaveSettings();
+			}
+		}
 	}
 	if ( g_menu.Page( "Display" ) ) {
 		static const char* const DELAYS[] = { "133 ms", "250 ms", "500 ms", "1 s", "1.5 s", "3 s" };
@@ -3961,7 +4210,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 	// Name tags.
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const Peer& p = g_peers[i];
-		if ( !g_showTags || !p.beast || p.tagFrame != g_presentCount ) continue;
+		if ( !g_showTags || g_menu.IsOpen() || !p.beast || p.tagFrame != g_presentCount ) continue;
 		float alpha = 1.0F - (p.tagDepth - TAG_FADE_START) / (TAG_FADE_END - TAG_FADE_START);
 		if ( alpha <= 0.0F ) continue;
 		const char* name = PlayerName( p.id );
@@ -4224,6 +4473,7 @@ public:
 	virtual void onLoadLevel( LoadLevelEvent& e )
 	{
 		ApplyMyOutfit();   // The game clears its cheats while it starts : set again before each level loads.
+		ForgetRetroTextures();
 		SuspectPuppets();
 	}
 

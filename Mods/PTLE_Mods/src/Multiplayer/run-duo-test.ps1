@@ -32,7 +32,9 @@ foreach ($name in $names) {
 	$vars = @{
 		PTLE_MP_AUTOTEST = '1'; PTLE_MP_INSTANCE = $name; GIZMOD_NO_CONSOLE = '1'; GIZMOD_BACKGROUND = '1'
 		PTLE_MP_SERVER = $Server; PTLE_MP_ROOM = $room; PTLE_MP_NAME = "player-$name"; PTLE_MP_ECHO = '0'
-		PTLE_MP_OUTFIT = "$(([array]::IndexOf($names, $name) + 1) % 4)"   # Each in another outfit : Nicole, Native, Retro, Harry...
+		# The first two as Retro Harry, each in their own colours (hair, skin, shirt, trousers); the others in another outfit each.
+		PTLE_MP_OUTFIT = "$(@(3, 3, 1, 2, 0, 1, 2, 0)[[array]::IndexOf($names, $name)])"
+		PTLE_MP_COLORS = "$(@('F5F5F5,FFA17B,DC3228,3264DC', '1E1E1E,FFA17B,F0D73C,9650C8', '', '', '', '', '', '')[[array]::IndexOf($names, $name)])"
 	}
 	foreach ($k in $vars.Keys) { Set-Item "Env:$k" $vars[$k] }
 	try {

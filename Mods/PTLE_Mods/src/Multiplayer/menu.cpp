@@ -7,7 +7,7 @@
 #include <string.h>
 
 
-static const int MAX_ROWS = 12;            // The body's height, in rows.
+static const int MAX_ROWS = 13;            // The body's height, in rows.
 static const uint32_t PANEL = 0xD0000000, LINE = 0x30FFFFFF, SELECTED = 0x38FFFFFF, TAB_ON = 0x38FFE080;
 
 void Menu::Open()
@@ -206,7 +206,7 @@ bool Menu::Swatches( const char* label, int* index, const uint32_t* colors, int 
 	bool selected = Selectable( hint, &r, &clicked );
 	if ( count <= 0 ) return false;
 	int old = *index;
-	if ( selected ) {
+	if ( selected && m_in.right != m_in.left ) {   // (-1 : none picked yet.)
 		*index = (*index + m_in.right - m_in.left) % count;
 		if ( *index < 0 ) *index += count;
 	}
