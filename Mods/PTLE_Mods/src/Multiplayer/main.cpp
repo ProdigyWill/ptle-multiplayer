@@ -221,6 +221,15 @@ static void MatsMul( const Matrix4f* m, int count, const Matrix4f& b, Matrix4f* 
 
 static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the autotest section).
 
+// Animation survey (PTLE_MP_ANIMSURVEY=1) : every clip loaded on Harry and on Evil
+// Harry, played in turn on the puppet (which then stops copying Harry's pose), each
+// filmed in a few cropped frames (logs\shots\anim_<n>_f<k>.bmp).
+static bool g_animSurvey = false;
+static uint32_t g_animSurveyClip = 0;            // The clip the puppet plays (0 : normal).
+static volatile LONG g_cropPending = 0;          // A cropped grab, taken in Present.
+static char g_cropName[64];
+static RECT g_crop;
+
 static PlayerSnapshot g_local;                 // Static storage keeps Matrix4f 16-byte aligned.
 static bool g_haveLocal = false;
 
@@ -1049,17 +1058,18 @@ static const int MIRROR_LAYERS[2] = { 200, 201 };
 static bool ApplyMirroredClip( EIEvilHarryP* p )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
-	if ( !g_mirrorClips || !t || !t->clipCRC ) return false;
+	uint32_t clip = g_animSurveyClip ? g_animSurveyClip : (t ? t->clipCRC : 0);
+	if ( !g_mirrorClips || !clip ) return false;
 
 	int current = FIELD( p, int, BEAST_CUR_LAYER );
-	if ( t->clipCRC == g_cur->mirrorClip && current == MIRROR_LAYERS[g_cur->mirrorSlot] ) return true;
+	if ( clip == g_cur->mirrorClip && current == MIRROR_LAYERS[g_cur->mirrorSlot] ) return true;
 
 	EAnimController* ctrl = &FIELD( p, EAnimController, BEAST_ANIMCTRL );
 	int next = (current == MIRROR_LAYERS[g_cur->mirrorSlot]) ? 1 - g_cur->mirrorSlot : g_cur->mirrorSlot;
-	AnimCtrl_SetClip( ctrl, MIRROR_LAYERS[next], t->clipCRC );
+	AnimCtrl_SetClip( ctrl, MIRROR_LAYERS[next], clip );
 	PlayAnimLayer( p, MIRROR_LAYERS[next] );
 	g_cur->mirrorSlot = next;
-	g_cur->mirrorClip = t->clipCRC;
+	g_cur->mirrorClip = clip;
 	return true;
 }
 
@@ -1536,7 +1546,7 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 	const PlayerSnapshot* t = GetPuppetTarget();
 	// Online with nobody to show here (they left, or are in another level) : not drawn.
 	if ( g_networked && !t ) return;
-	if ( t ) ApplyPuppetPose( self, t );
+	if ( t && !g_animSurveyClip ) ApplyPuppetPose( self, t );
 	g_origEvilHarryRender( self, context, arg );
 	if ( t ) NoteNameTag( peer, self );
 	if ( t && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
@@ -1758,6 +1768,7 @@ static const struct { uint32_t crc; const char* name; } SURVEY_LEVELS[] = {
 static const int NUM_SURVEY_LEVELS = sizeof(SURVEY_LEVELS) / sizeof(SURVEY_LEVELS[0]);
 static int g_surveyLoaded = 0, g_surveyDrawn = 0;
 
+
 static void RequestSnapshot( const char* name )
 {
 	strcpy_s( g_snapName, name );
@@ -1838,7 +1849,7 @@ static volatile LONG g_grabRequested = 0;
 static char g_grabName[64];
 static HANDLE g_grabDone = 0;
 
-static void GrabBackBuffer( IDirect3DDevice9* dev )
+static void GrabBackBuffer( IDirect3DDevice9* dev, const char* name, const RECT* crop )
 {
 	IDirect3DSurface9* back = 0;
 	IDirect3DSurface9* resolved = 0;
@@ -1856,11 +1867,17 @@ static void GrabBackBuffer( IDirect3DDevice9* dev )
 	if ( SUCCEEDED( dev->CreateOffscreenPlainSurface( d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &copy, 0 ) )
 	  && SUCCEEDED( dev->GetRenderTargetData( source, copy ) )
 	  && SUCCEEDED( copy->LockRect( &lr, 0, D3DLOCK_READONLY ) ) ) {
-		int w = d.Width, h = d.Height;
+		int x0 = 0, y0 = 0, w = d.Width, h = d.Height;
+		if ( crop ) {   // Clamped to the frame.
+			x0 = max( 0, (int) crop->left ); y0 = max( 0, (int) crop->top );
+			w = min( (int) d.Width, (int) crop->right ) - x0; h = min( (int) d.Height, (int) crop->bottom ) - y0;
+			if ( w <= 0 || h <= 0 ) { x0 = y0 = 0; w = d.Width; h = d.Height; }
+		}
+		int bpp = (d.Format == D3DFMT_X8R8G8B8 || d.Format == D3DFMT_A8R8G8B8) ? 4 : 2;
 		int stride = ((w * 3) + 3) & ~3;
 		uint8_t* bits = (uint8_t*) calloc( stride, h );
 		for ( int y = 0; bits && y < h; y++ ) {
-			const uint8_t* src = (const uint8_t*) lr.pBits + y * lr.Pitch;
+			const uint8_t* src = (const uint8_t*) lr.pBits + (y0 + y) * lr.Pitch + x0 * bpp;
 			uint8_t* dst = bits + (h - 1 - y) * stride;
 			for ( int x = 0; x < w; x++, dst += 3 ) {
 				if ( d.Format == D3DFMT_X8R8G8B8 || d.Format == D3DFMT_A8R8G8B8 ) {
@@ -1875,7 +1892,7 @@ static void GrabBackBuffer( IDirect3DDevice9* dev )
 				}
 			}
 		}
-		if ( bits ) WriteBmp( g_grabName, w, h, bits );
+		if ( bits ) WriteBmp( name, w, h, bits );
 		free( bits );
 		copy->UnlockRect();
 	}
@@ -1896,8 +1913,12 @@ static HRESULT __stdcall Present_Hook( IDirect3DDevice9* dev, const RECT* src, c
 	if ( NetNowMs() - g_lastNetUpdate > 250 ) NetUpdate();
 	DrawOverlay( dev );
 	g_presentCount++;
+	if ( g_cropPending ) {
+		GrabBackBuffer( dev, g_cropName, &g_crop );
+		InterlockedExchange( &g_cropPending, 0 );
+	}
 	if ( g_grabRequested ) {
-		GrabBackBuffer( dev );
+		GrabBackBuffer( dev, g_grabName, 0 );
 		InterlockedExchange( &g_grabRequested, 0 );
 		SetEvent( g_grabDone );
 	}
@@ -2230,6 +2251,10 @@ static void GiveTestItems( EIHarry* harry )
 
 static int g_itemFailures = 0;
 
+static const int MAX_ANIM_CLIPS = 1024;
+static struct { uint32_t crc; int owner; int layer; } g_animClips[MAX_ANIM_CLIPS];
+static int g_animClipCount = 0;
+
 static void AutotestStep( EIHarry* harry )
 {
 	static const LONG WALK_KEYS[] = { 'W', 'A', 'S', 'D' };   // Arrow keys don't move Harry.
@@ -2362,8 +2387,74 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedExchange( &g_autotestDone, 2 );
 			return;
 		}
+		if ( g_animSurvey ) { phase = 200; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
 		break;
+
+	case 200: {   // Animation survey : list the clips.
+		if ( now - phaseStart < 2000 ) break;
+		if ( g_haveCamera ) {   // Beside Harry as the camera sees him : along its right axis.
+			float rx = g_cameraWorld.data[0][0], ry = g_cameraWorld.data[0][1];
+			float l = sqrtf( rx * rx + ry * ry );
+			if ( l > 0.01F ) { g_puppetOffset.x = rx / l * 7.0F; g_puppetOffset.y = ry / l * 7.0F; }
+		}
+		g_animClipCount = 0;
+		EICharacter* owners[2] = { harry, g_cur->beast };
+		const char* ownerNames[2] = { "harry", "evil harry" };
+		for ( int o = 0; o < 2; o++ ) {
+			if ( !owners[o] ) continue;
+			int layers = 0;
+			for ( int key = 0; key < 4096; key++ ) {
+				if ( o == 1 && (key == MIRROR_LAYERS[0] || key == MIRROR_LAYERS[1]) ) continue;
+				uint8_t* layer = GetAnimLayer( owners[o], key );
+				if ( !layer ) continue;
+				layers++;
+				uint32_t crc = GetLayerClipCRC( layer );
+				if ( !crc ) continue;
+				bool seen = false;
+				for ( int i = 0; i < g_animClipCount && !seen; i++ ) seen = g_animClips[i].crc == crc;
+				if ( seen || g_animClipCount >= MAX_ANIM_CLIPS ) continue;
+				g_animClips[g_animClipCount].crc = crc;
+				g_animClips[g_animClipCount].owner = o;
+				g_animClips[g_animClipCount].layer = key;
+				g_animClipCount++;
+			}
+			mp_log( "[AT] ANIM : %s has %d animation layers.\n", ownerNames[o], layers );
+		}
+		mp_log( "[AT] ANIM : %d different clips to film.\n", g_animClipCount );
+		for ( int i = 0; i < g_animClipCount; i++ ) {
+			mp_log( "[AT] ANIM %03d : clip 0x%.8X (%s, layer %d)\n", i, g_animClips[i].crc, ownerNames[g_animClips[i].owner], g_animClips[i].layer );
+		}
+		phase = 201; phaseStart = now; step = 0;
+		break;
+	}
+	case 201:   // Animation survey : next clip.
+		if ( step >= g_animClipCount ) {
+			g_animSurveyClip = 0;
+			mp_log( "[AT] ANIM : done, %d clips filmed.\n", g_animClipCount );
+			InterlockedExchange( &g_autotestDone, 1 );
+			break;
+		}
+		g_animSurveyClip = g_animClips[step].crc;
+		phase = 202; phaseStart = now; snapped = false;
+		lastHarryTicks = 0;   // Frames taken of this clip.
+		break;
+	case 202: {   // Animation survey : film it.
+		static const int FRAMES = 6;
+		static const DWORD FIRST_FRAME_MS = 200, FRAME_GAP_MS = 500;
+		if ( lastHarryTicks >= FRAMES ) { step++; phase = 201; break; }
+		if ( now - phaseStart < FIRST_FRAME_MS + (DWORD) lastHarryTicks * FRAME_GAP_MS || g_cropPending ) break;
+		// Around the puppet : its name tag point is just above its head.
+		const Peer* pe = g_cur;
+		float cx = 880.0F, top = 300.0F;
+		if ( pe->beast && pe->tagFrame ) { cx = pe->tagX; top = pe->tagY - 200.0F; }
+		g_crop.left = (LONG) (cx - 260.0F); g_crop.right = g_crop.left + 520;
+		g_crop.top = (LONG) top; g_crop.bottom = g_crop.top + 620;
+		sprintf_s( g_cropName, "anim_%03d_f%d", step, (int) lastHarryTicks );
+		InterlockedExchange( &g_cropPending, 1 );
+		lastHarryTicks++;
+		break;
+	}
 
 	case 1:   // Walk Harry with the keyboard; the puppet replays it ~1s later.
 		if ( now - phaseStart >= 500 && !snapped && step == 0 ) {
@@ -2838,6 +2929,10 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 	}
 
 	UpdateLocomotion( self );
+	if ( g_animSurveyClip && g_haveCamera ) {   // Animation survey : face the camera.
+		const Matrix4f& cam = g_cameraWorld;
+		g_cur->heading = atan2f( cam.data[3][1] - self->EIBeast::m_position.y, cam.data[3][0] - self->EIBeast::m_position.x );
+	}
 
 	if ( g_cur->forcedState >= 0 && self->m_stateIndexCurrent != g_cur->forcedState ) {
 		if ( g_cur->lastRequested != g_cur->forcedState ) {
@@ -2975,6 +3070,7 @@ static uint32_t WithAlpha( uint32_t color, float alpha )
 
 static void DrawOverlay( IDirect3DDevice9* dev )
 {
+	if ( g_animSurvey ) return;   // Clean frames.
 	uint32_t now = NetNowMs();
 	bool any = g_showList;
 	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame == g_presentCount;
@@ -3211,6 +3307,12 @@ public:
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
+			if ( GetEnvironmentVariableA( "PTLE_MP_ANIMSURVEY", env, sizeof(env) ) && env[0] == '1' ) {
+				g_animSurvey = true;
+				g_puppetOffset.x = 6.0F;   // Placed beside Harry, from the camera, when the survey starts.
+				AUTOTEST_TOTAL_TIMEOUT_MS = 3600000;
+				mp_log( "[AT] Animation survey mode.\n" );
+			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_SURVEY", env, sizeof(env) ) && env[0] == '1' ) {
 				g_survey = true;
 				AUTOTEST_TOTAL_TIMEOUT_MS = 1200000;
