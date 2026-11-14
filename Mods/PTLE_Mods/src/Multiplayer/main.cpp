@@ -225,6 +225,7 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 // Harry, played in turn on the puppet (which then stops copying Harry's pose), each
 // filmed in a few cropped frames (logs\shots\anim_<n>_f<k>.bmp).
 static bool g_animSurvey = false;
+static bool g_viewerTest = false;                // PTLE_MP_VIEWERTEST=1 : the autotest drives the animation viewer.
 static uint32_t g_animSurveyClip = 0;            // The clip the puppet plays (0 : normal).
 static volatile LONG g_cropPending = 0;          // A cropped grab, taken in Present.
 static char g_cropName[64];
@@ -352,6 +353,21 @@ struct CurrentPeer
 	explicit CurrentPeer( Peer* p ) : saved( g_cur ) { g_cur = p; }
 	~CurrentPeer() { g_cur = saved; }
 };
+
+// Animation viewer (F10) : a puppet pinned beside Harry plays one clip at a time,
+// for going through Harry's animations and noting what they are.
+static bool g_animViewer = false;
+static Peer* g_viewerPeer = 0;          // The puppet it uses.
+static Vector3f g_viewerPin;            // Where that puppet stands.
+
+static bool IsViewerPeer( const Peer* p ) { return g_animViewer && p == g_viewerPeer; }
+
+// The clip the current peer's puppet is made to play (survey, viewer), else 0.
+static uint32_t ForcedClip()
+{
+	if ( g_animSurvey ) return g_animSurveyClip;
+	return IsViewerPeer( g_cur ) ? g_animSurveyClip : 0;
+}
 
 static Peer* FindPeer( const void* beast )
 {
@@ -730,6 +746,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 static const PlayerSnapshot* GetPuppetTarget()
 {
+	if ( !g_cur->target && IsViewerPeer( g_cur ) && g_haveLocal ) return &g_local;
 	return g_cur->target;
 }
 
@@ -883,6 +900,7 @@ static bool GetPuppetTargetPosition( Vector3f* out )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
 	if ( !t ) return false;
+	if ( IsViewerPeer( g_cur ) ) { *out = g_viewerPin; return true; }
 	if ( g_puppetPinned ) {
 		*out = g_puppetPin;
 		if ( g_puppetStaysHere ) out->z += t->lift;   // F8 : still jumps and climbs, in place.
@@ -1058,7 +1076,8 @@ static const int MIRROR_LAYERS[2] = { 200, 201 };
 static bool ApplyMirroredClip( EIEvilHarryP* p )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
-	uint32_t clip = g_animSurveyClip ? g_animSurveyClip : (t ? t->clipCRC : 0);
+	uint32_t forced = ForcedClip();
+	uint32_t clip = forced ? forced : (t ? t->clipCRC : 0);
 	if ( !g_mirrorClips || !clip ) return false;
 
 	int current = FIELD( p, int, BEAST_CUR_LAYER );
@@ -1546,10 +1565,11 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 	const PlayerSnapshot* t = GetPuppetTarget();
 	// Online with nobody to show here (they left, or are in another level) : not drawn.
 	if ( g_networked && !t ) return;
-	if ( t && !g_animSurveyClip ) ApplyPuppetPose( self, t );
+	bool viewer = IsViewerPeer( peer );   // No pose copy, name tag or items : just the clip.
+	if ( t && !ForcedClip() ) ApplyPuppetPose( self, t );
 	g_origEvilHarryRender( self, context, arg );
-	if ( t ) NoteNameTag( peer, self );
-	if ( t && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
+	if ( t && !viewer ) NoteNameTag( peer, self );
+	if ( t && !viewer && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
 }
 
 static void InstallItemDrawHooks()
@@ -1608,6 +1628,8 @@ static volatile LONG g_reqDelay = 0;
 static volatile LONG g_reqStay = 0;
 static volatile LONG g_reqList = 0;
 static bool g_showList = false;   // F9.
+static volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
+                     g_reqReplay = 0, g_reqStarredOnly = 0;
 static volatile LONG g_harryTicks = 0;
 
 static bool GameHasFocus()
@@ -1621,21 +1643,28 @@ static bool GameHasFocus()
 
 static DWORD WINAPI HotkeyThread( void* )
 {
-	static const int NUM_KEYS = 5;
-	bool wasDown[NUM_KEYS] = { false, false, false, false, false };
-	const int keys[NUM_KEYS] = { VK_F5, VK_F6, VK_F7, VK_F8, VK_F9 };
-	volatile LONG* reqs[NUM_KEYS] = { &g_reqSpawn, &g_reqState, &g_reqDelay, &g_reqStay, &g_reqList };
+	// The animation viewer's keys ([ ] \ ') only matter while it's open.
+	static const int NUM_KEYS = 11;
+	bool wasDown[NUM_KEYS] = { false, };
+	const int keys[NUM_KEYS] = { VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_OEM_4, VK_OEM_6, VK_OEM_5, VK_OEM_7 };
+	const char* names[NUM_KEYS] = { "F5", "F6", "F7", "F8", "F9", "F10", "F11", "[", "]", "\\", "'" };
+	volatile LONG* reqs[NUM_KEYS] = { &g_reqSpawn, &g_reqState, &g_reqDelay, &g_reqStay, &g_reqList,
+		&g_reqViewer, &g_reqStar, &g_reqPrev, &g_reqNext, &g_reqReplay, &g_reqStarredOnly };
 
 	for ( ;; ) {
 		for ( int i = 0; i < NUM_KEYS; i++ ) {
 			bool down = (GetAsyncKeyState( keys[i] ) & 0x8000) != 0;
 			if ( down && !wasDown[i] ) {
 				if ( GameHasFocus() ) {
-					InterlockedIncrement( reqs[i] );
-					mp_log( "[MP] F%d pressed (Harry ticks so far : %ld).\n", 5 + i, g_harryTicks );
+					volatile LONG* req = reqs[i];
+					bool shift = (GetAsyncKeyState( VK_SHIFT ) & 0x8000) != 0;   // Shift + [ ] : by ten.
+					if ( shift && req == &g_reqPrev ) req = &g_reqPrev10;
+					if ( shift && req == &g_reqNext ) req = &g_reqNext10;
+					InterlockedIncrement( req );
+					if ( i <= 6 ) mp_log( "[MP] %s pressed (Harry ticks so far : %ld).\n", names[i], g_harryTicks );
 				}
-				else {
-					mp_log( "[MP] F%d ignored : game window not focused.\n", 5 + i );
+				else if ( i <= 6 ) {
+					mp_log( "[MP] %s ignored : game window not focused.\n", names[i] );
 				}
 			}
 			wasDown[i] = down;
@@ -1645,6 +1674,233 @@ static DWORD WINAPI HotkeyThread( void* )
 	return 0;
 }
 
+// --------------------------------------------------------------------------------
+// Animation viewer (F10). Its clip list and notes are in
+// Documents\PTLE Multiplayer\anim-notes.txt, one clip per line :
+//     <number> <clip id> <where found> [*] [notes]
+// The numbers are the animation survey's. Edited by hand (reloaded when it changes)
+// and by F11 (star). Clips found on Harry and not in it yet are added.
+// --------------------------------------------------------------------------------
+struct AnimNote
+{
+	int num;
+	uint32_t crc;
+	char source[24];
+	bool star;
+	char note[200];
+};
+static const int MAX_ANIM_NOTES = 1024;
+static AnimNote g_animNotes[MAX_ANIM_NOTES];
+static int g_animNoteCount = 0;
+static int g_animIndex = 0;
+static bool g_animStarredOnly = false;
+static char g_animNotesPath[MAX_PATH];
+static FILETIME g_animNotesTime;
+static uint32_t g_animNotesChecked = 0;
+
+static bool AnimNotesFileTime( FILETIME* t )
+{
+	WIN32_FILE_ATTRIBUTE_DATA a;
+	if ( !GetFileAttributesExA( g_animNotesPath, GetFileExInfoStandard, &a ) ) return false;
+	*t = a.ftLastWriteTime;
+	return true;
+}
+
+static void LoadAnimNotes()
+{
+	if ( !g_animNotesPath[0] ) {
+		if ( FAILED( SHGetFolderPathA( 0, CSIDL_PERSONAL, 0, 0, g_animNotesPath ) ) ) return;
+		strcat_s( g_animNotesPath, "\\PTLE Multiplayer\\anim-notes.txt" );
+	}
+	uint32_t keep = (g_animIndex < g_animNoteCount) ? g_animNotes[g_animIndex].crc : 0;
+	FILE* f = 0;
+	if ( fopen_s( &f, g_animNotesPath, "r" ) != 0 || !f ) return;
+	g_animNoteCount = 0;
+	char line[512];
+	while ( fgets( line, sizeof(line), f ) && g_animNoteCount < MAX_ANIM_NOTES ) {
+		AnimNote& n = g_animNotes[g_animNoteCount];
+		int used = 0;
+		if ( line[0] == '#' ) continue;
+		if ( sscanf_s( line, "%d %x %23s %n", &n.num, &n.crc, n.source, (unsigned) sizeof(n.source), &used ) < 3 ) continue;
+		char* rest = line + used;
+		n.star = (rest[0] == '*');
+		if ( n.star ) rest++;
+		while ( *rest == ' ' || *rest == '\t' ) rest++;
+		size_t len = strlen( rest );
+		while ( len && (rest[len - 1] == '\n' || rest[len - 1] == '\r' || rest[len - 1] == ' ') ) rest[--len] = 0;
+		strncpy_s( n.note, rest, _TRUNCATE );
+		g_animNoteCount++;
+	}
+	fclose( f );
+	AnimNotesFileTime( &g_animNotesTime );
+	g_animIndex = 0;
+	for ( int i = 0; i < g_animNoteCount; i++ ) if ( g_animNotes[i].crc == keep ) g_animIndex = i;
+	mp_log( "[MP] Animation notes : %d clips read.\n", g_animNoteCount );
+}
+
+static void SaveAnimNotes()
+{
+	FILE* f = 0;
+	if ( fopen_s( &f, g_animNotesPath, "w" ) != 0 || !f ) { Toast( "Couldn't write anim-notes.txt" ); return; }
+	fprintf( f, "# Harry's animations : number, clip id, where it was found (layer), * if starred, then notes.\n" );
+	fprintf( f, "# Edit freely, even while the game runs (it reloads). In the game : F10 opens the viewer,\n" );
+	fprintf( f, "# [ ] previous / next (Shift : by 10), \\ replays, F11 stars, ' shows only starred ones.\n" );
+	fprintf( f, "# Other lines starting with # are not kept.\n" );
+	for ( int i = 0; i < g_animNoteCount; i++ ) {
+		const AnimNote& n = g_animNotes[i];
+		fprintf( f, "%03d 0x%.8X %-14s %s%s%s\n", n.num, n.crc, n.source, n.star ? "*" : "", (n.star && n.note[0]) ? " " : "", n.note );
+	}
+	fclose( f );
+	AnimNotesFileTime( &g_animNotesTime );
+}
+
+// Clips loaded on these characters and not in the notes yet.
+static void AddFoundClips( EICharacter* harry, EICharacter* beast )
+{
+	int added = 0, next = 0;
+	for ( int i = 0; i < g_animNoteCount; i++ ) if ( g_animNotes[i].num >= next ) next = g_animNotes[i].num + 1;
+	EICharacter* owners[2] = { harry, beast };
+	const char* ownerNames[2] = { "harry", "evilharry" };
+	for ( int o = 0; o < 2; o++ ) {
+		if ( !owners[o] ) continue;
+		for ( int key = 0; key < 4096 && g_animNoteCount < MAX_ANIM_NOTES; key++ ) {
+			if ( o == 1 && (key == MIRROR_LAYERS[0] || key == MIRROR_LAYERS[1]) ) continue;
+			uint8_t* layer = GetAnimLayer( owners[o], key );
+			uint32_t crc = layer ? GetLayerClipCRC( layer ) : 0;
+			if ( !crc ) continue;
+			bool known = false;
+			for ( int i = 0; i < g_animNoteCount && !known; i++ ) known = g_animNotes[i].crc == crc;
+			if ( known ) continue;
+			AnimNote& n = g_animNotes[g_animNoteCount++];
+			n.num = next++;
+			n.crc = crc;
+			sprintf_s( n.source, "%s/%d", ownerNames[o], key );
+			n.star = false;
+			n.note[0] = 0;
+			added++;
+		}
+	}
+	if ( added ) {
+		mp_log( "[MP] Animation notes : %d new clips added.\n", added );
+		SaveAnimNotes();
+	}
+}
+
+static void ShowAnimClip( bool restart )
+{
+	if ( g_animIndex >= g_animNoteCount ) return;
+	g_animSurveyClip = g_animNotes[g_animIndex].crc;
+	if ( restart && g_viewerPeer ) g_viewerPeer->mirrorClip = 0;   // Loads it again, from the start.
+}
+
+// Moves through the list (only starred clips if asked, when there are some).
+static void StepAnimClip( int by )
+{
+	if ( !g_animNoteCount ) return;
+	bool anyStar = false;
+	for ( int i = 0; i < g_animNoteCount && !anyStar; i++ ) anyStar = g_animNotes[i].star;
+	bool starred = g_animStarredOnly && anyStar;
+	int dir = by > 0 ? 1 : -1, steps = by > 0 ? by : -by;
+	int i = g_animIndex;
+	while ( steps-- > 0 ) {
+		int tries = g_animNoteCount;
+		do { i = (i + dir + g_animNoteCount) % g_animNoteCount; } while ( starred && !g_animNotes[i].star && --tries > 0 );
+	}
+	g_animIndex = i;
+	ShowAnimClip( true );
+}
+
+static void CloseAnimViewer( const char* why )
+{
+	if ( !g_animViewer ) return;
+	g_animViewer = false;
+	g_animSurveyClip = 0;
+	if ( g_viewerPeer ) g_viewerPeer->mirrorClip = 0;
+	g_viewerPeer = 0;
+	mp_log( "[MP] Animation viewer closed (%s).\n", why );
+}
+
+static void OpenAnimViewer( EIHarry* harry )
+{
+	// Its puppet : offline the main one (it replays Harry); online one of a free
+	// player slot, so other players' puppets are left alone.
+	Peer* vp = MainPeer();
+	if ( g_networked ) {
+		int me = g_transport ? g_transport->PlayerId() : -1;
+		vp = 0;
+		for ( int i = MAX_PEERS - 1; i >= 0 && !vp; i-- )
+			if ( i != me && !g_players[i].present && !g_peers[i].heard && !g_peers[i].target ) vp = &g_peers[i];
+		if ( !vp ) { Toast( "No room for the animation viewer (8 players)" ); return; }
+	}
+	g_viewerPeer = vp;
+	g_animViewer = true;
+	{
+		CurrentPeer current( vp );
+		if ( !vp->beast ) SpawnPuppet( harry );
+	}
+	if ( !vp->beast ) { CloseAnimViewer( "no puppet" ); Toast( "Evil Harry can't be placed here" ); return; }
+
+	// Beside Harry as the camera sees him (along its right axis), facing the camera.
+	float rx = 1.0F, ry = 0.0F;
+	if ( g_haveCamera ) {
+		float x = g_cameraWorld.data[0][0], y = g_cameraWorld.data[0][1], l = sqrtf( x * x + y * y );
+		if ( l > 0.01F ) { rx = x / l; ry = y / l; }
+	}
+	g_viewerPin = harry->m_position;
+	g_viewerPin.x += rx * 7.0F;
+	g_viewerPin.y += ry * 7.0F;
+	g_autoLocomotion = true;
+
+	LoadAnimNotes();
+	AddFoundClips( harry, vp->beast );
+	if ( !g_animNoteCount ) { CloseAnimViewer( "no clips" ); Toast( "No animations found" ); return; }
+	if ( g_animIndex >= g_animNoteCount ) g_animIndex = 0;
+	ShowAnimClip( true );
+	mp_log( "[MP] Animation viewer open : puppet of slot %d, %d clips.\n", vp->id, g_animNoteCount );
+}
+
+static void HandleAnimViewer( EIHarry* harry )
+{
+	bool open    = InterlockedExchange( &g_reqViewer, 0 ) != 0;
+	bool star    = InterlockedExchange( &g_reqStar, 0 ) != 0;
+	int  by      = InterlockedExchange( &g_reqNext, 0 ) - InterlockedExchange( &g_reqPrev, 0 )
+	             + 10 * (InterlockedExchange( &g_reqNext10, 0 ) - InterlockedExchange( &g_reqPrev10, 0 ));
+	bool replay  = InterlockedExchange( &g_reqReplay, 0 ) != 0;
+	bool starred = InterlockedExchange( &g_reqStarredOnly, 0 ) != 0;
+
+	if ( open ) {
+		if ( g_animViewer ) CloseAnimViewer( "F10" );
+		else OpenAnimViewer( harry );
+	}
+	if ( !g_animViewer ) return;
+	if ( !g_viewerPeer || !g_viewerPeer->beast ) { CloseAnimViewer( "puppet gone" ); return; }
+
+	uint32_t now = NetNowMs();
+	if ( now - g_animNotesChecked >= 1000 ) {   // Edited by hand ?
+		g_animNotesChecked = now;
+		FILETIME t;
+		if ( AnimNotesFileTime( &t ) && CompareFileTime( &t, &g_animNotesTime ) != 0 ) {
+			LoadAnimNotes();
+			ShowAnimClip( false );
+		}
+	}
+	if ( !g_animNoteCount ) return;
+	if ( starred ) {
+		g_animStarredOnly = !g_animStarredOnly;
+		if ( g_animStarredOnly && !g_animNotes[g_animIndex].star ) StepAnimClip( 1 );
+	}
+	if ( by ) StepAnimClip( by );
+	if ( replay ) ShowAnimClip( true );
+	if ( star ) {
+		FILETIME t;   // Take hand edits first.
+		if ( AnimNotesFileTime( &t ) && CompareFileTime( &t, &g_animNotesTime ) != 0 ) LoadAnimNotes();
+		AnimNote& n = g_animNotes[g_animIndex];
+		n.star = !n.star;
+		SaveAnimNotes();
+		Toast( "#%03d %s", n.num, n.star ? "starred" : "unstarred" );
+	}
+}
+
 static void HandleHotkeys( EIHarry* harry )
 {
 	bool f5 = InterlockedExchange( &g_reqSpawn, 0 ) != 0;
@@ -1652,6 +1908,7 @@ static void HandleHotkeys( EIHarry* harry )
 	bool f7 = InterlockedExchange( &g_reqDelay, 0 ) != 0;
 	bool f8 = InterlockedExchange( &g_reqStay, 0 ) != 0;
 	if ( InterlockedExchange( &g_reqList, 0 ) ) g_showList = !g_showList;
+	HandleAnimViewer( harry );
 
 	// The puppet went with the last level : F8's "stay here" goes too.
 	if ( !g_cur->beast && g_puppetStaysHere ) g_puppetPinned = g_puppetStaysHere = false;
@@ -2388,6 +2645,7 @@ static void AutotestStep( EIHarry* harry )
 			return;
 		}
 		if ( g_animSurvey ) { phase = 200; phaseStart = now; step = 0; break; }
+		if ( g_viewerTest ) { phase = 300; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
 		break;
 
@@ -2426,6 +2684,35 @@ static void AutotestStep( EIHarry* harry )
 			mp_log( "[AT] ANIM %03d : clip 0x%.8X (%s, layer %d)\n", i, g_animClips[i].crc, ownerNames[g_animClips[i].owner], g_animClips[i].layer );
 		}
 		phase = 201; phaseStart = now; step = 0;
+		break;
+	}
+	case 300: {   // Animation viewer : keys pressed in turn, a picture after each.
+		static const struct { DWORD at; volatile LONG* key; const char* shot; } SCRIPT[] = {
+			{ 1500, &g_reqViewer, 0 },      { 3000, 0, "viewer_1_open" },
+			{ 3500, &g_reqNext10, 0 },      { 5000, 0, "viewer_2_plus10" },
+			{ 5500, &g_reqStarredOnly, 0 }, { 7000, 0, "viewer_3_starred" },
+			{ 7500, &g_reqNext, 0 },        { 9000, 0, "viewer_4_next_starred" },
+			{ 9500, &g_reqStar, 0 },        { 10500, 0, "viewer_5_unstarred" },
+			{ 11000, &g_reqStar, 0 },       { 11500, &g_reqReplay, 0 },
+			{ 12000, &g_reqViewer, 0 },     { 13500, 0, "viewer_6_closed" },
+		};
+		static const int NUM = sizeof(SCRIPT) / sizeof(SCRIPT[0]);
+		if ( step >= NUM ) {
+			bool ok = !g_animViewer && g_animNoteCount > 0;
+			mp_log( "[AT] Viewer : %s (%d clips).\n", ok ? "closed again" : "FAIL : still open or no clips", g_animNoteCount );
+			InterlockedExchange( &g_autotestDone, ok ? 1 : 2 );
+			break;
+		}
+		if ( now - phaseStart < SCRIPT[step].at ) break;
+		if ( SCRIPT[step].key ) InterlockedIncrement( SCRIPT[step].key );
+		if ( SCRIPT[step].shot ) {
+			RequestSnapshot( SCRIPT[step].shot );
+			const AnimNote* n = g_animIndex < g_animNoteCount ? &g_animNotes[g_animIndex] : 0;
+			mp_log( "[AT] Viewer %s : open %d, clip #%d 0x%.8X star %d, playing 0x%.8X on layer %d.\n", SCRIPT[step].shot,
+				(int) g_animViewer, n ? n->num : -1, n ? n->crc : 0, n ? (int) n->star : -1,
+				g_viewerPeer ? g_viewerPeer->mirrorClip : 0, g_cur->beast ? FIELD( g_cur->beast, int, BEAST_CUR_LAYER ) : -1 );
+		}
+		step++;
 		break;
 	}
 	case 201:   // Animation survey : next clip.
@@ -2929,7 +3216,7 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 	}
 
 	UpdateLocomotion( self );
-	if ( g_animSurveyClip && g_haveCamera ) {   // Animation survey : face the camera.
+	if ( ForcedClip() && g_haveCamera ) {   // Animation survey, viewer : face the camera.
 		const Matrix4f& cam = g_cameraWorld;
 		g_cur->heading = atan2f( cam.data[3][1] - self->EIBeast::m_position.y, cam.data[3][0] - self->EIBeast::m_position.x );
 	}
@@ -3072,7 +3359,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 {
 	if ( g_animSurvey ) return;   // Clean frames.
 	uint32_t now = NetNowMs();
-	bool any = g_showList;
+	bool any = g_showList || g_animViewer;
 	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame == g_presentCount;
 	for ( int i = 0; i < MAX_TOASTS && !any; i++ ) any = g_toasts[i].text[0] && now - g_toasts[i].time < TOAST_MS;
 	if ( !any ) return;
@@ -3099,18 +3386,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		OverlayText( x, y, name, WithAlpha( 0xFFFFFFFF, alpha ) );
 	}
 
-	// Messages, top middle.
-	float ty = h;
-	for ( int i = 0; i < MAX_TOASTS; i++ ) {
-		if ( !g_toasts[i].text[0] || now - g_toasts[i].time >= TOAST_MS ) continue;
-		float alpha = (TOAST_MS - (now - g_toasts[i].time)) / 1000.0F;   // Fades out over the last second.
-		float w = OverlayTextWidth( g_toasts[i].text );
-		float x = floorf( (sw - w) * 0.5F );
-		OverlayRect( x - pad, ty - pad * 0.5F, w + 2.0F * pad, h + pad, WithAlpha( 0xA0000000, alpha ) );
-		OverlayText( x, ty, g_toasts[i].text, WithAlpha( 0xFFFFE080, alpha ) );
-		ty += h * 1.4F;
-	}
-
+	float listLeft = sw;   // Messages stay clear of the player list.
 	// The player list, top right.
 	if ( g_showList ) {
 		static const int MAX_ROWS = MAX_PEERS + 3;
@@ -3163,12 +3439,52 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		float gap = h * 1.5F;
 		float bw = wl + gap + wr + 2.0F * pad, bh = rows * h * 1.3F + 2.0F * pad;
 		float bx = floorf( sw - bw - h ), by = h;
+		listLeft = bx - pad;
 		OverlayRect( bx, by, bw, bh, 0xA0000000 );
 		for ( int r = 0; r < rows; r++ ) {
 			float y = by + pad + r * h * 1.3F;
 			OverlayText( bx + pad, y, left[r], colors[r] );
 			OverlayText( bx + bw - pad - OverlayTextWidth( right[r] ), y, right[r], colors[r] );
 		}
+	}
+
+	// Messages, top middle (of the room the player list leaves).
+	float ty = h;
+	for ( int i = 0; i < MAX_TOASTS; i++ ) {
+		if ( !g_toasts[i].text[0] || now - g_toasts[i].time >= TOAST_MS ) continue;
+		float alpha = (TOAST_MS - (now - g_toasts[i].time)) / 1000.0F;   // Fades out over the last second.
+		float w = OverlayTextWidth( g_toasts[i].text );
+		float x = floorf( (listLeft - w) * 0.5F );
+		if ( x < pad ) x = pad;
+		OverlayRect( x - pad, ty - pad * 0.5F, w + 2.0F * pad, h + pad, WithAlpha( 0xA0000000, alpha ) );
+		OverlayText( x, ty, g_toasts[i].text, WithAlpha( 0xFFFFE080, alpha ) );
+		ty += h * 1.4F;
+	}
+
+	// The animation viewer, bottom left.
+	if ( g_animViewer && g_animIndex < g_animNoteCount ) {
+		const AnimNote& n = g_animNotes[g_animIndex];
+		int stars = 0, place = 0;
+		for ( int i = 0; i < g_animNoteCount; i++ ) {
+			if ( g_animNotes[i].star ) { stars++; if ( i <= g_animIndex ) place++; }
+		}
+		char line[3][256];
+		uint32_t colors[3] = { n.star ? 0xFFFFE080 : 0xFFFFFFFF, 0xFFFFFFFF, 0xFFB0B0B0 };
+		if ( g_animStarredOnly && stars )
+			sprintf_s( line[0], "%sAnimation #%03d   (starred %d of %d)   0x%.8X   %s", n.star ? "* " : "", n.num, place, stars, n.crc, n.source );
+		else
+			sprintf_s( line[0], "%sAnimation #%03d   (%d of %d)   0x%.8X   %s", n.star ? "* " : "", n.num, g_animIndex + 1, g_animNoteCount, n.crc, n.source );
+		if ( n.note[0] ) sprintf_s( line[1], "%s", n.note );
+		else sprintf_s( line[1], "(no notes yet : Documents\\PTLE Multiplayer\\anim-notes.txt)" );
+		colors[1] = n.note[0] ? 0xFFFFFFFF : 0xFFB0B0B0;
+		sprintf_s( line[2], "[ ] : previous / next (Shift : 10)   \\ : replay   F11 : star   ' : %s   F10 : close",
+			g_animStarredOnly ? "all clips" : "starred only" );
+		float w = 0.0F;
+		for ( int r = 0; r < 3; r++ ) { float a = OverlayTextWidth( line[r] ); if ( a > w ) w = a; }
+		float bw = w + 2.0F * pad, bh = 3 * h * 1.3F + 2.0F * pad;
+		float bx = h, by = floorf( sh - bh - h );
+		OverlayRect( bx, by, bw, bh, 0xA0000000 );
+		for ( int r = 0; r < 3; r++ ) OverlayText( bx + pad, by + pad + r * h * 1.3F, line[r], colors[r] );
 	}
 
 	OverlayEnd();
@@ -3307,6 +3623,10 @@ public:
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
+			if ( GetEnvironmentVariableA( "PTLE_MP_VIEWERTEST", env, sizeof(env) ) && env[0] == '1' ) {
+				g_viewerTest = true;
+				mp_log( "[AT] Animation viewer test.\n" );
+			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_ANIMSURVEY", env, sizeof(env) ) && env[0] == '1' ) {
 				g_animSurvey = true;
 				g_puppetOffset.x = 6.0F;   // Placed beside Harry, from the camera, when the survey starts.
