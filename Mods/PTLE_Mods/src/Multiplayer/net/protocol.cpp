@@ -1,4 +1,5 @@
 #include "net/protocol.h"
+#include "net/affine.h"
 
 #include <math.h>
 #include <string.h>
@@ -90,62 +91,10 @@ static void PutMatrix( Writer& w, const Matrix4f& m, bool perAxis )
 		for ( int j = 0; j < (perAxis ? 3 : 1); j++ ) w.put<uint16_t>( 0 );
 		return;
 	}
-	const float (*a)[4] = m.data;
-	float len[3];
-	for ( int i = 0; i < 3; i++ ) len[i] = sqrtf( a[i][0] * a[i][0] + a[i][1] * a[i][1] + a[i][2] * a[i][2] );
-	float scale = (len[0] + len[1] + len[2]) / 3.0F;
-	if ( !perAxis ) len[0] = len[1] = len[2] = scale;
-	float det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
-	          - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
-	          + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
-	bool mirrored = det < 0.0F;
-
-	// The rotation (a mirrored matrix is minus a rotation).
-	float r[3][3];
-	bool flat = false;
-	for ( int i = 0; i < 3; i++ ) {
-		if ( len[i] <= 1e-6F ) flat = true;
-		float k = len[i] > 1e-6F ? (mirrored ? -1.0F : 1.0F) / len[i] : 0.0F;
-		for ( int j = 0; j < 3; j++ ) r[i][j] = a[i][j] * k;
-	}
-
-	float q[4];   // x, y, z, w.
-	if ( flat ) {
-		q[0] = q[1] = q[2] = 0.0F; q[3] = 1.0F;
-	}
-	else {
-		float trace = r[0][0] + r[1][1] + r[2][2];
-		if ( trace > 0.0F ) {
-			float s = 0.5F / sqrtf( trace + 1.0F );
-			q[3] = 0.25F / s;
-			q[0] = (r[2][1] - r[1][2]) * s;
-			q[1] = (r[0][2] - r[2][0]) * s;
-			q[2] = (r[1][0] - r[0][1]) * s;
-		}
-		else if ( r[0][0] > r[1][1] && r[0][0] > r[2][2] ) {
-			float s = 2.0F * sqrtf( 1.0F + r[0][0] - r[1][1] - r[2][2] );
-			q[3] = (r[2][1] - r[1][2]) / s;
-			q[0] = 0.25F * s;
-			q[1] = (r[0][1] + r[1][0]) / s;
-			q[2] = (r[0][2] + r[2][0]) / s;
-		}
-		else if ( r[1][1] > r[2][2] ) {
-			float s = 2.0F * sqrtf( 1.0F + r[1][1] - r[0][0] - r[2][2] );
-			q[3] = (r[0][2] - r[2][0]) / s;
-			q[0] = (r[0][1] + r[1][0]) / s;
-			q[1] = 0.25F * s;
-			q[2] = (r[1][2] + r[2][1]) / s;
-		}
-		else {
-			float s = 2.0F * sqrtf( 1.0F + r[2][2] - r[0][0] - r[1][1] );
-			q[3] = (r[1][0] - r[0][1]) / s;
-			q[0] = (r[0][2] + r[2][0]) / s;
-			q[1] = (r[1][2] + r[2][1]) / s;
-			q[2] = 0.25F * s;
-		}
-		float n = sqrtf( q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3] );
-		for ( int i = 0; i < 4; i++ ) q[i] /= n;
-	}
+	Affine a;
+	DecomposeAffine( m, &a, perAxis );
+	bool mirrored = a.scale[0] < 0.0F;
+	const float* q = a.q;
 
 	// Smallest three : drop the largest component (made positive), keep the others.
 	int largest = 0;
@@ -164,56 +113,41 @@ static void PutMatrix( Writer& w, const Matrix4f& m, bool perAxis )
 	}
 	w.put<uint32_t>( packed );
 
-	for ( int j = 0; j < 3; j++ ) w.put<int16_t>( ToInt16( a[3][j], TRANSLATION_STEP ) );
+	for ( int j = 0; j < 3; j++ ) w.put<int16_t>( ToInt16( a.t[j], TRANSLATION_STEP ) );
 
-	w.put<uint16_t>( (uint16_t) (PackScale( len[0] ) | (mirrored ? SCALE_MIRRORED : 0)) );
+	w.put<uint16_t>( (uint16_t) (PackScale( fabsf( a.scale[0] ) ) | (mirrored ? SCALE_MIRRORED : 0)) );
 	if ( perAxis ) {
-		w.put<uint16_t>( PackScale( len[1] ) );
-		w.put<uint16_t>( PackScale( len[2] ) );
+		w.put<uint16_t>( PackScale( fabsf( a.scale[1] ) ) );
+		w.put<uint16_t>( PackScale( fabsf( a.scale[2] ) ) );
 	}
 }
 
 static void GetMatrix( Reader& r, Matrix4f* out, bool perAxis )
 {
+	Affine a;
 	uint32_t packed = r.get<uint32_t>();
 	int16_t t[3];
 	for ( int j = 0; j < 3; j++ ) t[j] = r.get<int16_t>();
 	uint16_t sv = r.get<uint16_t>();
-	float scale[3];
-	scale[0] = (float) (sv & 0x7FFF) * SCALE_STEP;
-	scale[1] = perAxis ? (float) (r.get<uint16_t>() & 0x7FFF) * SCALE_STEP : scale[0];
-	scale[2] = perAxis ? (float) (r.get<uint16_t>() & 0x7FFF) * SCALE_STEP : scale[0];
-	if ( sv & SCALE_MIRRORED ) for ( int i = 0; i < 3; i++ ) scale[i] = -scale[i];
+	a.scale[0] = (float) (sv & 0x7FFF) * SCALE_STEP;
+	a.scale[1] = perAxis ? (float) (r.get<uint16_t>() & 0x7FFF) * SCALE_STEP : a.scale[0];
+	a.scale[2] = perAxis ? (float) (r.get<uint16_t>() & 0x7FFF) * SCALE_STEP : a.scale[0];
+	if ( sv & SCALE_MIRRORED ) for ( int i = 0; i < 3; i++ ) a.scale[i] = -a.scale[i];
 
-	float q[4];
 	int largest = (int) (packed >> 30);
 	int shift = 20;
 	float sum = 0.0F;
 	for ( int i = 0; i < 4; i++ ) {
 		if ( i == largest ) continue;
 		int iv = (int) ((packed >> shift) & QUAT_MAX);
-		q[i] = ((float) iv / QUAT_MAX * 2.0F - 1.0F) * QUAT_RANGE;
-		sum += q[i] * q[i];
+		a.q[i] = ((float) iv / QUAT_MAX * 2.0F - 1.0F) * QUAT_RANGE;
+		sum += a.q[i] * a.q[i];
 		shift -= QUAT_BITS;
 	}
-	q[largest] = sum < 1.0F ? sqrtf( 1.0F - sum ) : 0.0F;
-
-	float x = q[0], y = q[1], z = q[2], wq = q[3];
-	float (*a)[4] = out->data;
-	a[0][0] = (1.0F - 2.0F * (y * y + z * z)) * scale[0];
-	a[0][1] = 2.0F * (x * y - z * wq) * scale[0];
-	a[0][2] = 2.0F * (x * z + y * wq) * scale[0];
-	a[1][0] = 2.0F * (x * y + z * wq) * scale[1];
-	a[1][1] = (1.0F - 2.0F * (x * x + z * z)) * scale[1];
-	a[1][2] = 2.0F * (y * z - x * wq) * scale[1];
-	a[2][0] = 2.0F * (x * z - y * wq) * scale[2];
-	a[2][1] = 2.0F * (y * z + x * wq) * scale[2];
-	a[2][2] = (1.0F - 2.0F * (x * x + y * y)) * scale[2];
-	for ( int j = 0; j < 3; j++ ) {
-		a[3][j] = t[j] * TRANSLATION_STEP;
-		a[j][3] = 0.0F;
-	}
-	a[3][3] = 1.0F;
+	a.q[largest] = sum < 1.0F ? sqrtf( 1.0F - sum ) : 0.0F;
+	for ( int j = 0; j < 3; j++ ) a.t[j] = t[j] * TRANSLATION_STEP;
+	a.flat = false;
+	ComposeAffine( a, out );
 }
 
 static void PutFullMatrix( Writer& w, const Matrix4f& m )

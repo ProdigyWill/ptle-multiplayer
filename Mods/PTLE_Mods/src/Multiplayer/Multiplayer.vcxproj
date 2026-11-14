@@ -79,12 +79,14 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="net\affine.cpp" />
     <ClCompile Include="net\protocol.cpp" />
     <ClCompile Include="net\remote.cpp" />
     <ClCompile Include="net\transport.cpp" />
     <ClCompile Include="net\udp_transport.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="net\affine.h" />
     <ClInclude Include="net\protocol.h" />
     <ClInclude Include="net\remote.h" />
     <ClInclude Include="net\snapshot.h" />

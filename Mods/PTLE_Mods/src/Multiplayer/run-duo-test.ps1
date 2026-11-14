@@ -75,7 +75,7 @@ foreach ($name in 'a', 'b') {
 	$stats = ($log | Select-String 'Player \d+ : received (\d+), lost (\d+)' | Select-Object -Last 1).Matches
 	$received = if ($stats) { [int] $stats.Groups[1].Value } else { 0 }
 	$lost = if ($stats) { [int] $stats.Groups[2].Value } else { 0 }
-	$good = $me -ne $null -and $shown -ne $null -and $me -ne $shown -and $received -gt 5000 -and $lost -lt $received / 20
+	$good = $me -ne $null -and $shown -ne $null -and $me -ne $shown -and $received -gt 2500 -and $lost -lt $received / 20
 	Write-Host ("== Game {0} : player {1}, showed player {2}, received {3}, lost {4} : {5}" -f $name, $me, $shown, $received, $lost, $(if ($good) { 'ok' } else { 'WRONG' }))
 	if (-not $good) { $ok = $false }
 }

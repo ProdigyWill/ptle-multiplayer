@@ -6,6 +6,9 @@
 // delay), so late, lost or reordered packets don't make the puppet stutter. The
 // playback clock runs on this computer's clock and is only nudged towards
 // "newest - delay", so the two computers' clocks never need to agree.
+//
+// Between two snapshots, the puppet is shown blended from one to the next, so it
+// moves smoothly at any frame rate however few snapshots per second arrive.
 
 #include "net/snapshot.h"
 
@@ -21,13 +24,16 @@ public:
 	void Add( const PlayerSnapshot& s, uint32_t sequence );
 
 	// Moves the playback clock to now (ms, this computer) and returns the snapshot
-	// to show, or 0 if there's none yet. Valid until the next Add() or Update().
+	// to show (blended between the two around the playback time), or 0 if there's
+	// none yet. Valid until the next Add() or Update().
 	const PlayerSnapshot* Update( uint32_t nowMs, int delayMs );
 
 	// Stats.
 	uint32_t received;     // Packets kept.
 	uint32_t late;         // Arrived after their time was shown : dropped.
 	uint32_t reordered;    // Arrived after a newer one.
+	uint32_t blended;      // Updates that blended two snapshots.
+	uint32_t held;         // Updates with no newer snapshot to blend to (the delay is too short).
 	uint32_t Lost() const; // Sequence numbers never received (so far).
 
 private:
@@ -49,4 +55,5 @@ private:
 	bool m_clockStarted;
 	double m_playTime;       // Sender's time being shown.
 	uint32_t m_lastNow;
+	PlayerSnapshot m_blend;
 };

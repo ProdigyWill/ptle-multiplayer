@@ -225,12 +225,17 @@ static RemotePlayer g_remote;                  // The one puppet's player (for n
 static const PlayerSnapshot* g_target = 0;     // What the puppet shows this tick (see NetUpdate).
 
 static const int DELAY_CHOICES[] = { 133, 250, 500, 1000, 1500, 3000 };   // Playback delay (ms).
-static int g_delayIndex = 3;
+static int g_delayIndex = 1;   // 250 ms (Multiplayer.ini : Delay).
 
 // The network side.
 static Transport* g_transport = 0;
 static bool g_networked = false;               // Through a server (not the loopback).
 static uint32_t g_sendSequence = 0;
+// Snapshots go out at most this often (30 per second : the game runs at 60, the
+// receiver blends between them). A little under, so frame timing jitter at 60 fps
+// doesn't skip one.
+static const uint32_t SEND_INTERVAL_MS = 33 - 8;
+static uint32_t g_lastSentTime = 0;
 static int g_remoteId = -1;                    // The player the puppet shows (-1 : none yet).
 static uint32_t g_remoteLastHeard = 0;
 static const uint32_t REMOTE_SILENT_MS = 5000; // Then : forget them.
@@ -273,6 +278,8 @@ static void SendLocalSnapshot()
 	if ( !g_haveLocal || !g_transport ) return;
 	int me = g_transport->PlayerId();
 	if ( me < 0 ) return;   // Not in a room yet.
+	if ( g_netStats.sent && g_local.time - g_lastSentTime < SEND_INTERVAL_MS ) return;
+	g_lastSentTime = g_local.time;
 	uint8_t packet[MAX_PACKET];
 	int length = EncodeSnapshot( g_local, (uint8_t) me, ++g_sendSequence, packet, sizeof(packet) );
 	if ( !length ) {
@@ -295,10 +302,10 @@ static void SendLocalSnapshot()
 static void LogNetStats()
 {
 	const NetStats& n = g_netStats;
-	mp_log( "[NET] Sent %u snapshots (avg %u bytes, max %u, %u too big). Player %d : received %u, lost %u, late %u, reordered %u. Bad %u, from others %u. Ping %d ms. Max packing error %.4f.\n",
+	mp_log( "[NET] Sent %u snapshots (avg %u bytes, max %u, %u too big). Player %d : received %u, lost %u, late %u, reordered %u. Bad %u, from others %u. Ping %d ms. Max packing error %.4f. Playback : blended %u, held %u (delay %d ms).\n",
 		n.sent, n.sent ? n.sentBytes / n.sent : 0, n.maxBytes, n.tooBig, g_remoteId,
 		g_remote.received, g_remote.Lost(), g_remote.late, g_remote.reordered, n.badPackets, n.otherPlayers,
-		g_transport ? g_transport->RoundTripMs() : -1, n.maxPackingError );
+		g_transport ? g_transport->RoundTripMs() : -1, n.maxPackingError, g_remote.blended, g_remote.held, DELAY_CHOICES[g_delayIndex] );
 }
 
 // Takes in what arrived and picks what the puppet shows this tick.
@@ -2546,6 +2553,7 @@ struct NetConfig
 	char room[64];
 	char name[64];
 	bool echo;
+	int delayMs;   // Playback delay, 0 : the default.
 };
 
 static const char DEFAULT_INI[] =
@@ -2558,7 +2566,11 @@ static const char DEFAULT_INI[] =
 	"Name=Harry\r\n"
 	"; 1 : the server sends your own moves back to you (Evil Harry replays you\r\n"
 	"; through the internet, to test alone).\r\n"
-	"Echo=0\r\n";
+	"Echo=0\r\n"
+	"; How far behind the other players are shown (ms) : 133, 250, 500, 1000, 1500\r\n"
+	"; or 3000 (F7 cycles through them). Shorter : closer to where they really are,\r\n"
+	"; but they stutter when the connection does.\r\n"
+	"Delay=250\r\n";
 
 static void GetEnvOverride( const char* var, char* value, int size )
 {
@@ -2601,6 +2613,10 @@ static void ReadNetConfig( NetConfig* c )
 	GetEnvOverride( "PTLE_MP_ROOM", c->room, sizeof(c->room) );
 	GetEnvOverride( "PTLE_MP_NAME", c->name, sizeof(c->name) );
 	GetEnvOverride( "PTLE_MP_ECHO", echo, sizeof(echo) );
+	char delay[16] = { 0, };
+	GetPrivateProfileStringA( "Network", "Delay", "", delay, sizeof(delay), ini );
+	GetEnvOverride( "PTLE_MP_DELAY", delay, sizeof(delay) );
+	c->delayMs = atoi( delay );
 	c->echo = echo[0] == '1';
 }
 
@@ -2609,6 +2625,20 @@ static void ReadNetConfig( NetConfig* c )
 // --------------------------------------------------------------------------------
 // Plugin.
 // --------------------------------------------------------------------------------
+// The PC game has one retail build, 1.0.12.18-1 : every address in this mod is
+// that build's. Its version string, in .rdata.
+static const uint32_t GAME_VERSION_ADDRESS = 0x887B5C;
+static const char GAME_VERSION[] = "Pitfall Harry    1.0.12.18-1";
+
+static bool IsKnownGameVersion()
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if ( !VirtualQuery( (void*) GAME_VERSION_ADDRESS, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT
+		|| (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ) return false;
+	if ( (uint8_t*) mbi.BaseAddress + mbi.RegionSize < (uint8_t*) GAME_VERSION_ADDRESS + sizeof(GAME_VERSION) ) return false;
+	return memcmp( (void*) GAME_VERSION_ADDRESS, GAME_VERSION, sizeof(GAME_VERSION) ) == 0;
+}
+
 class MultiplayerPlugin : public GizmodPlugin, public ILoadLevelListener, public ILevelLoadedListener
 {
 public:
@@ -2619,6 +2649,13 @@ public:
 	virtual void onEnable()
 	{
 		OpenLogFile();
+		if ( !IsKnownGameVersion() ) {
+			mp_log( "[MP] This isn't the game version the mod was made for (PC 1.0.12.18-1) : the mod is off.\n" );
+			MessageBoxA( 0, "The Multiplayer mod was made for Pitfall: The Lost Expedition PC version 1.0.12.18-1, "
+				"and this copy of the game is a different version.\n\nThe mod is turned off. The game will run without it.",
+				"Multiplayer mod", MB_OK | MB_ICONWARNING );
+			return;
+		}
 		AddVectoredExceptionHandler( 1, CrashLogger );
 
 		register_types();
@@ -2650,6 +2687,13 @@ public:
 		g_netLog = mp_log;
 		NetConfig config;
 		ReadNetConfig( &config );
+		if ( config.delayMs > 0 ) {   // The nearest choice.
+			int n = sizeof(DELAY_CHOICES) / sizeof(DELAY_CHOICES[0]);
+			for ( int i = 0; i < n; i++ ) {
+				if ( abs( DELAY_CHOICES[i] - config.delayMs ) < abs( DELAY_CHOICES[g_delayIndex] - config.delayMs ) ) g_delayIndex = i;
+			}
+		}
+		mp_log( "[NET] Playback delay : %d ms.\n", DELAY_CHOICES[g_delayIndex] );
 		if ( config.server[0] ) {
 			g_networked = true;
 			g_transport = CreateUdpTransport( config.server, config.room, config.name, config.echo );
