@@ -16,6 +16,21 @@ static void BlendMatrix( const Matrix4f& a, const Matrix4f& b, float f, Matrix4f
 	else *out = f < 0.5F ? a : b;
 }
 
+// A bone's matrix is a skinning matrix : it takes a vertex from where the model was
+// built to where the bone carries it, so its translation depends on its rotation
+// (the bone turns about its joint, not about the origin). Blending the two
+// separately (BlendAffine) moved bones off their joints whenever a limb turned
+// fast between two snapshots, the more so the further the bone is from the model's
+// origin : hands, feet and the backpack stretched away and snapped back, worst when
+// a snapshot was lost. Blending the matrix as a whole keeps every joint in one
+// piece : a point shared by two bones lands at the same place through either.
+static void BlendBone( const Matrix4f& a, const Matrix4f& b, float f, Matrix4f* out )
+{
+	if ( !IsSaneMatrix( a ) || !IsSaneMatrix( b ) ) { *out = f < 0.5F ? a : b; return; }
+	for ( int i = 0; i < 4; i++ )
+		for ( int j = 0; j < 4; j++ ) out->data[i][j] = a.data[i][j] + (b.data[i][j] - a.data[i][j]) * f;
+}
+
 static float BlendAngle( float a, float b, float f )   // Radians, the shorter way round.
 {
 	const float PI = 3.14159265F;
@@ -39,14 +54,14 @@ static void BlendSnapshots( const PlayerSnapshot& a, const PlayerSnapshot& b, fl
 	out->lift = a.lift + (b.lift - a.lift) * f;
 	if ( a.clipCRC == b.clipCRC ) out->clipWeight = a.clipWeight + (b.clipWeight - a.clipWeight) * f;
 	if ( a.bones == b.bones ) {
-		for ( int i = 0; i < a.bones; i++ ) BlendMatrix( a.pose[i], b.pose[i], f, &out->pose[i] );
+		for ( int i = 0; i < a.bones; i++ ) BlendBone( a.pose[i], b.pose[i], f, &out->pose[i] );
 	}
 	BlendMatrix( a.handR, b.handR, f, &out->handR );
 	BlendMatrix( a.handL, b.handL, f, &out->handL );
 	bool sameItem = a.drawnSlot == b.drawnSlot && a.itemState == b.itemState && a.heldItem == b.heldItem;
 	if ( sameItem && a.drawnSlot >= 0 ) BlendMatrix( a.itemLocal, b.itemLocal, f, &out->itemLocal );
 	if ( sameItem && a.itemBones == b.itemBones ) {
-		for ( int i = 0; i < a.itemBones; i++ ) BlendMatrix( a.itemPose[i], b.itemPose[i], f, &out->itemPose[i] );
+		for ( int i = 0; i < a.itemBones; i++ ) BlendBone( a.itemPose[i], b.itemPose[i], f, &out->itemPose[i] );
 	}
 }
 

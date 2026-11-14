@@ -1398,6 +1398,7 @@ static int g_puppetPoseCopies = 0;   // For the autotest.
 
 static void ApplyPuppetPose( EIEvilHarryP* p, const PlayerSnapshot* t )
 {
+
 	uint8_t* animCtrl = (uint8_t*) p + CHAR_ANIMCTRL;
 	int bones = 0;
 	Matrix4f* pose = GetPose( animCtrl, &bones );
@@ -2449,39 +2450,55 @@ static IDirect3DTexture9* RetroTexture( IDirect3DDevice9* dev, int slot, const u
 }
 
 // Whose piece is about to be drawn : the palette of the Retro character it belongs
-// to (0 : the game's own, they kept its colours). A character's 15 pieces are drawn
-// in a row, body and legs first : those report a spot within a step of where the
-// character stands, which says whose they are. The arms report one a few units to
-// the side (nearer a neighbour, sometimes), so they go to whoever the piece before
-// them belonged to.
+// to (0 : the game's own, they kept its colours). The piece's first bone (constants
+// c44..c46) is one of its character's bone matrices as they are right now, so the
+// character is the one whose pose has that very matrix : no guessing from where
+// players stand, which mixed their colours up when they stood close together. A
+// piece whose bone isn't found (not seen so far) goes to the previous piece's owner :
+// a character's 15 pieces are drawn in a row.
 static int g_retroOwner = -1;   // The slot of g_retroTex (-1 : nobody yet since the palette was set).
 static const uint8_t (*g_retroOwnerColors)[3] = 0;
+static int g_retroMatched = 0, g_retroUnmatched = 0;   // For the autotest.
+
+static bool HasBoneAt( EICharacter* c, const float bone[3][4] )
+{
+	int bones = 0;
+	const Matrix4f* pose = GetPose( (uint8_t*) c + CHAR_ANIMCTRL, &bones );
+	if ( !pose || bones <= 0 || bones > MAX_CHAR_BONES ) return false;
+	for ( int i = 0; i < bones; i++ ) {
+		const float* t = pose[i].data[3];
+		if ( fabsf( t[0] - bone[0][3] ) < 0.01F && fabsf( t[1] - bone[1][3] ) < 0.01F && fabsf( t[2] - bone[2][3] ) < 0.01F ) return true;
+	}
+	return false;
+}
 
 static IDirect3DTexture9* RetroTextureHere( IDirect3DDevice9* dev )
 {
 	float bone[3][4];   // Rows : the translation is each row's w.
 	if ( FAILED( dev->GetVertexShaderConstantF( 44, &bone[0][0], 3 ) ) ) return 0;
 	int me = g_transport ? g_transport->PlayerId() : -1;
-	float best = 2.5F * 2.5F;
-	for ( int i = -1; i < MAX_PEERS; i++ ) {   // -1 : our own Harry.
-		Vector3f at;
+	bool found = false;
+	for ( int i = -1; i < MAX_PEERS && !found; i++ ) {   // -1 : our own Harry.
+		EICharacter* who;
 		const uint8_t (*c)[3];
 		if ( i < 0 ) {
 			EIHarry* harry = Gizmod::getHarry();
 			if ( !harry || g_myWornOutfit != RETRO_OUTFIT ) continue;
-			at = harry->m_position;
+			who = harry;
 			c = g_myColors;
 		}
 		else {
 			const Peer& p = g_peers[i];
 			if ( !p.beast || p.shownOutfit != RETRO_OUTFIT ) continue;
-			at = p.beast->EIBeast::m_position;
+			who = p.beast;
 			c = (i == me || !g_networked || !g_players[i].present) ? g_myColors : g_players[i].colors;
 		}
-		float dx = bone[0][3] - at.x, dy = bone[1][3] - at.y, dz = bone[2][3] - at.z;
-		float d = dx * dx + dy * dy;
-		if ( d < best && fabsf( dz ) < 8.0F ) { best = d; g_retroOwner = i < 0 ? MAX_PEERS : i; g_retroOwnerColors = c; }
+		if ( !HasBoneAt( who, bone ) ) continue;
+		g_retroOwner = i < 0 ? MAX_PEERS : i;
+		g_retroOwnerColors = c;
+		found = true;
 	}
+	if ( found ) g_retroMatched++; else g_retroUnmatched++;
 	if ( g_retroOwner < 0 || memcmp( g_retroOwnerColors, RETRO_DEFAULT, sizeof(RETRO_DEFAULT) ) == 0 ) return 0;
 	return RetroTexture( dev, g_retroOwner, g_retroOwnerColors );
 }
@@ -3116,13 +3133,14 @@ static void AutotestStep( EIHarry* harry )
 			SpawnPuppet( harry );   // It replays us : Retro too.
 			static const uint8_t TEST[RETRO_PARTS][3] = { { 245, 245, 245 }, { 255, 161, 123 }, { 220, 50, 40 }, { 50, 100, 220 } };
 			memcpy( g_myColors, TEST, sizeof(g_myColors) );   // White hair, red shirt, blue trousers.
-			g_retroSwaps = 0;
+			g_retroSwaps = g_retroMatched = g_retroUnmatched = 0;
 			step++; phaseStart = now;
 		}
 		else {
 			if ( t < 3000 ) break;
-			bool ok = b && g_cur->shownOutfit == 3 && g_retroSwaps > 100;
-			mp_log( "[AT] Outfit : the puppet that replays us, both in our colours (%d pieces drawn with them) : %s\n", g_retroSwaps, ok ? "ok" : "WRONG" );
+			bool ok = b && g_cur->shownOutfit == 3 && g_retroSwaps > 100 && g_retroUnmatched * 50 < g_retroMatched;
+			mp_log( "[AT] Outfit : the puppet that replays us, both in our colours (%d pieces drawn with them; owner found for %d, not for %d) : %s\n",
+				g_retroSwaps, g_retroMatched, g_retroUnmatched, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_5_ours" );
 			g_myOutfit = 0;
