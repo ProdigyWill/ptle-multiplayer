@@ -3457,7 +3457,10 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 	}
 	DropLostPuppets();
 
-	if ( !g_origPresent ) HookPresent();   // The overlay draws as frames are presented.
+	if ( !g_origPresent ) {   // The overlay draws as frames are presented.
+		HookPresent();
+		InterlockedExchange( &g_reqMenu, 0 );   // An F1 pressed before there was anything to draw (the main menu) doesn't count.
+	}
 	PushLocalSnapshot( self );
 	NetUpdate();
 	// Another player in this level : show them (Evil Harry appears on his own).
