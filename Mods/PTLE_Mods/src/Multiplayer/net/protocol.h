@@ -29,7 +29,10 @@ enum PacketType : uint8_t
 	PACKET_LEAVE    = 5,   // To the server : we leave. From it : that player left.
 	PACKET_PING     = 6,   // Payload sent back as is in a PONG.
 	PACKET_PONG     = 7,
+	PACKET_INFO     = 8,   // u32 level CRC (0 : none), u8 name length, name. About once a second.
 };
+
+static const int MAX_NAME = 31;   // Display names, in bytes.
 
 static const uint8_t JOIN_ECHO = 1;          // The server sends our packets back to us too.
 static const uint8_t REJECT_ROOM_FULL = 1;

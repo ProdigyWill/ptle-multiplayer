@@ -79,6 +79,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="overlay.cpp" />
     <ClCompile Include="net\affine.cpp" />
     <ClCompile Include="net\protocol.cpp" />
     <ClCompile Include="net\remote.cpp" />
@@ -87,6 +88,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="net\affine.h" />
+    <ClInclude Include="overlay.h" />
     <ClInclude Include="net\protocol.h" />
     <ClInclude Include="net\remote.h" />
     <ClInclude Include="net\snapshot.h" />

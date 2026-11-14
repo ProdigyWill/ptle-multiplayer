@@ -89,6 +89,12 @@ foreach ($name in $names) {
 	}
 	$others = @($byPlayer.Keys | Sort-Object)
 	$good = $me -ne $null -and $others.Count -eq ($Players - 1)
+	# Their names (PACKET_INFO) : every other game's "player-x".
+	$named = @($log | Select-String 'Player (\d+) is "(player-[a-h])"' | ForEach-Object { $_.Matches.Groups[2].Value } | Sort-Object -Unique)
+	$expected = @($names | Where-Object { $_ -ne $name } | ForEach-Object { "player-$_" })
+	$missing = @($expected | Where-Object { $named -notcontains $_ })
+	Write-Host ("== Game {0} : knows the names {1} : {2}" -f $name, ($named -join ', '), $(if ($missing.Count -eq 0) { 'ok' } else { 'WRONG' }))
+	if ($missing.Count -ne 0) { $good = $false }
 	foreach ($id in $others) {
 		$e = $byPlayer[$id]
 		$fine = $e.received -gt 2500 -and $e.lost -lt $e.received / 20 -and $e.shown

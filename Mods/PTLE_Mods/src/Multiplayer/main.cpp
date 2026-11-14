@@ -58,6 +58,8 @@
 #include "net/remote.h"
 #include "net/snapshot.h"
 #include "net/transport.h"
+#include "overlay.h"
+#include "ptle/levels/level_info.h"
 
 
 #define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
@@ -258,8 +260,72 @@ struct Peer
 	int mirrorSlot;
 	uint32_t mirrorClip;
 	int lastLoggedState, lastRequested;
+
+	// Where their name tag goes (screen pixels), noted when the puppet renders.
+	float tagX, tagY, tagDepth;
+	uint32_t tagFrame;                 // g_presentCount then.
 };
 static Peer g_peers[MAX_PEERS];        // Static : big, and 16-byte aligned.
+
+// Who is in the room (from their PACKET_INFO), kept across levels. Presence goes by
+// those packets (sent even while a player's game is loading or paused), not by
+// snapshots.
+static const uint32_t INFO_INTERVAL_MS = 1000;
+static const uint32_t INFO_TIMEOUT_MS = 15000;
+struct PlayerInfo
+{
+	bool present;
+	char name[MAX_NAME + 1];
+	uint32_t level;
+	uint32_t lastInfo;
+};
+static PlayerInfo g_players[MAX_PEERS];
+static char g_myName[MAX_NAME + 1] = "Harry";
+static char g_roomName[64] = "";
+static uint32_t g_lastInfoSent = 0;
+static uint32_t g_lastNetUpdate = 0;
+
+// Messages shown for a few seconds ("Bob joined").
+static const int MAX_TOASTS = 4;
+static const uint32_t TOAST_MS = 5000;
+static struct { char text[96]; uint32_t time; } g_toasts[MAX_TOASTS];
+
+static void Toast( const char* fmt, ... )
+{
+	for ( int i = MAX_TOASTS - 1; i > 0; i-- ) g_toasts[i] = g_toasts[i - 1];
+	va_list args;
+	va_start( args, fmt );
+	vsnprintf_s( g_toasts[0].text, _TRUNCATE, fmt, args );
+	va_end( args );
+	g_toasts[0].time = NetNowMs();
+}
+
+// Names : printable ASCII only (the font has nothing else), never empty.
+static void CleanName( const char* in, int length, char* out )
+{
+	int n = 0;
+	for ( int i = 0; i < length && n < MAX_NAME; i++ ) {
+		char c = in[i];
+		if ( c >= 32 && c <= 126 ) out[n++] = c;
+	}
+	while ( n > 0 && out[n - 1] == ' ' ) n--;
+	out[n] = 0;
+}
+
+static const char* PlayerName( int id )
+{
+	static char fallback[16];
+	if ( id >= 0 && id < MAX_PEERS && g_players[id].name[0] ) return g_players[id].name;
+	sprintf_s( fallback, "Player %d", id + 1 );
+	return fallback;
+}
+
+static const char* LevelName( uint32_t crc )
+{
+	if ( !crc ) return "loading";
+	uint32_t id = level_get_by_crc( crc );
+	return id == (uint32_t) -1 ? "somewhere" : level_get_name( id );
+}
 
 // The peer being ticked or drawn. Between those : the main peer, the one F5, F6, F8
 // and the autotest work on (the first player heard from).
@@ -303,6 +369,7 @@ static void ResetPeer( Peer* p, int id )   // Forgets them (their puppet is left
 	p->lastSpawnTry = 0;
 	p->forcedState = -1;
 	p->lastLoggedState = p->lastRequested = -2;
+	p->tagFrame = 0;
 }
 
 static const int DELAY_CHOICES[] = { 133, 250, 500, 1000, 1500, 3000 };   // Playback delay (ms).
@@ -405,6 +472,7 @@ static void NetUpdate()
 	int length;
 	uint32_t now = NetNowMs();
 	if ( !g_transport ) return;
+	g_lastNetUpdate = now;
 	g_transport->Update();
 	int me = g_transport->PlayerId();
 	bool echo = g_transport->Echoes();
@@ -414,9 +482,32 @@ static void NetUpdate()
 		if ( h.player >= MAX_PEERS ) { g_netStats.badPackets++; continue; }
 		Peer* peer = &g_peers[h.player];
 		if ( h.type == PACKET_LEAVE ) {
-			if ( peer->heard ) {
+			if ( peer->heard || g_players[h.player].present ) {
 				mp_log( "[NET] Player %d left.\n", h.player );
+				if ( g_players[h.player].present ) Toast( "%s left", PlayerName( h.player ) );
 				ResetPeer( peer, h.player );   // Their puppet stays hidden (no target).
+			}
+			g_players[h.player].present = false;
+			g_players[h.player].name[0] = 0;
+			continue;
+		}
+		if ( h.type == PACKET_INFO ) {
+			if ( h.player == me && !echo ) continue;
+			if ( length < PACKET_HEADER_SIZE + 5 ) { g_netStats.badPackets++; continue; }
+			const uint8_t* q = packet + PACKET_HEADER_SIZE;
+			int nameLength = q[4];
+			if ( PACKET_HEADER_SIZE + 5 + nameLength > length ) { g_netStats.badPackets++; continue; }
+			PlayerInfo& info = g_players[h.player];
+			char name[MAX_NAME + 1];
+			CleanName( (const char*) q + 5, nameLength, name );
+			if ( !name[0] ) sprintf_s( name, "Player %d", h.player + 1 );
+			memcpy( &info.level, q, 4 );
+			info.lastInfo = now;
+			if ( !info.present || strcmp( info.name, name ) != 0 ) {
+				mp_log( "[NET] Player %d is \"%s\", in %s.\n", h.player, name, LevelName( info.level ) );
+				if ( !info.present && h.player != me ) Toast( "%s joined", name );
+				strcpy_s( info.name, name );
+				info.present = true;
 			}
 			continue;
 		}
@@ -439,6 +530,26 @@ static void NetUpdate()
 		peer->lastHeard = now;
 	}
 	uint32_t level = Gizmod::getCurrentLevelCRC();
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		PlayerInfo& info = g_players[i];
+		if ( info.present && now - info.lastInfo > INFO_TIMEOUT_MS ) {
+			mp_log( "[NET] No news from player %d (\"%s\") for %u s : they're gone.\n", i, info.name, INFO_TIMEOUT_MS / 1000 );
+			Toast( "%s left (connection lost)", info.name );
+			info.present = false;
+			info.name[0] = 0;
+		}
+	}
+	if ( me >= 0 && now - g_lastInfoSent >= INFO_INTERVAL_MS ) {   // Who we are, where.
+		g_lastInfoSent = now;
+		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME];
+		EncodeHeader( PACKET_INFO, (uint8_t) me, 0, info );
+		uint32_t where = g_haveLocal ? level : 0;
+		memcpy( info + PACKET_HEADER_SIZE, &where, 4 );
+		int n = (int) strlen( g_myName );
+		info[PACKET_HEADER_SIZE + 4] = (uint8_t) n;
+		memcpy( info + PACKET_HEADER_SIZE + 5, g_myName, n );
+		g_transport->Send( info, PACKET_HEADER_SIZE + 5 + n );
+	}
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer* peer = &g_peers[i];
 		if ( peer->heard && now - peer->lastHeard > REMOTE_SILENT_MS ) {
@@ -1322,6 +1433,101 @@ static void* const ITEM_DRAW_HOOKS[] = {
 };
 static_assert( sizeof(ITEM_DRAW_HOOKS) / sizeof(ITEM_DRAW_HOOKS[0]) == NUM_DRAWN_ITEMS, "one hook per drawn item" );
 
+// --------------------------------------------------------------------------------
+// Name tags : where the top of a puppet's head lands on screen, from the camera
+// matrices the game rendered it with. Drawn when the frame is presented.
+// --------------------------------------------------------------------------------
+static const uint32_t RENDERER_DEVICE = 0x926790 + 0x74;
+static const float TAG_ABOVE_FEET = 5.6F;   // The top of Harry's head (measured on screenshots).
+static uint32_t g_presentCount = 1;
+
+// The camera : the game builds its matrix each frame with a look-at (0x6EE560,
+// called from 0x449B9A : eye, target, up), the camera's own world matrix (it looks
+// down its -Z). Its projection is captured below (right-handed : w is minus the
+// view depth; 50 degrees, 4:3, whatever the window's shape). The matrix at 0x926A40
+// looks like one but isn't the main view's.
+typedef Matrix4f* (__thiscall *LookAtFunc)( Matrix4f*, Vector3f*, Vector3f*, Vector3f* );
+static const uint32_t CAMERA_LOOKAT_CALL = 0x449B9A;
+static const LookAtFunc CameraLookAt = (LookAtFunc) 0x6EE560;
+static Matrix4f g_cameraWorld;
+static bool g_haveCamera = false;
+
+static Matrix4f* __fastcall CameraLookAt_Hook( Matrix4f* self, void*, Vector3f* eye, Vector3f* target, Vector3f* up )
+{
+	Matrix4f* m = CameraLookAt( self, eye, target, up );
+	g_cameraWorld = *m;
+	g_haveCamera = true;
+	return m;
+}
+
+// The perspective matrix, built at 0x6EE990 (called from 0x634B1C) : captured.
+typedef Matrix4f* (__thiscall *PerspectiveFunc)( Matrix4f*, float, float, float, float );
+static const uint32_t PERSPECTIVE_CALL = 0x634B1C;
+static const PerspectiveFunc MakePerspective = (PerspectiveFunc) 0x6EE990;
+static Matrix4f g_cameraProj;
+static bool g_haveProj = false;
+
+static Matrix4f* __fastcall Perspective_Hook( Matrix4f* self, void*, float a, float b, float c, float d )
+{
+	Matrix4f* m = MakePerspective( self, a, b, c, d );
+	g_cameraProj = *m;
+	static int logged = 0;
+	if ( logged < 2 ) {
+		logged++;
+		const float (*p)[4] = m->data;
+		mp_log( "[MP] Perspective (%.3f, %.3f, %.3f, %.3f) : %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f\n", a, b, c, d,
+			p[0][0], p[1][1], p[2][0], p[2][1], p[2][2], p[2][3], p[3][2], p[3][3] );
+	}
+	g_haveProj = true;
+	return m;
+}
+
+static void HookCamera()
+{
+	static const uint8_t PERSPECTIVE_ORIGINAL[5] = { 0xE8, 0x6F, 0x9E, 0x0B, 0x00 };   // call 0x6EE990.
+	if ( memcmp( (void*) PERSPECTIVE_CALL, PERSPECTIVE_ORIGINAL, 5 ) == 0 ) injector::MakeCALL( PERSPECTIVE_CALL, &Perspective_Hook );
+	else mp_log( "[MP] The perspective call isn't what we expect.\n" );
+
+	static const uint8_t ORIGINAL[5] = { 0xE8, 0xC1, 0x49, 0x2A, 0x00 };   // call 0x6EE560.
+	if ( memcmp( (void*) CAMERA_LOOKAT_CALL, ORIGINAL, 5 ) != 0 ) {
+		mp_log( "[MP] The camera call isn't what we expect (free camera on?) : no name tags.\n" );
+		return;
+	}
+	injector::MakeCALL( CAMERA_LOOKAT_CALL, &CameraLookAt_Hook );
+}
+
+static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
+{
+	Matrix4f view;
+	if ( !g_haveCamera || !MatInverseAffine( g_cameraWorld, &view ) ) return;
+	if ( !g_haveProj ) return;
+	const float* proj = &g_cameraProj.data[0][0];
+	IDirect3DDevice9* dev = *(IDirect3DDevice9**) RENDERER_DEVICE;
+	D3DVIEWPORT9 vp;
+	if ( !dev || FAILED( dev->GetViewport( &vp ) ) ) return;
+
+	// Above his head : his transform is at his feet. (The highest bone isn't reliable :
+	// some bones, not drawn, sit far above him in some poses.)
+	const Matrix4f& m = p->m_transformMatrix;
+	float x = m.data[3][0], y = m.data[3][1], z = m.data[3][2] + TAG_ABOVE_FEET;
+
+	float v[4], c[4];   // Row vector times view, times projection.
+	for ( int j = 0; j < 4; j++ ) v[j] = x * view.data[0][j] + y * view.data[1][j] + z * view.data[2][j] + view.data[3][j];
+	for ( int j = 0; j < 4; j++ ) c[j] = v[0] * proj[j] + v[1] * proj[4 + j] + v[2] * proj[8 + j] + v[3] * proj[12 + j];
+	if ( c[3] < 0.1F ) return;   // Behind the camera.
+	peer->tagX = vp.X + (c[0] / c[3] + 1.0F) * 0.5F * vp.Width;
+	peer->tagY = vp.Y + (1.0F - c[1] / c[3]) * 0.5F * vp.Height;
+	peer->tagDepth = c[3];
+	peer->tagFrame = g_presentCount;
+
+	static int logged = 0;
+	if ( logged < 3 ) {
+		logged++;
+		mp_log( "[MP] Name tag : head (%.1f, %.1f, %.1f) at screen (%.0f, %.0f), depth %.1f, viewport %ux%u.\n",
+			x, y, z, peer->tagX, peer->tagY, peer->tagDepth, vp.Width, vp.Height );
+	}
+}
+
 static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* context, void* arg )
 {
 	Peer* peer = FindPeer( self );
@@ -1332,6 +1538,7 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 	if ( g_networked && !t ) return;
 	if ( t ) ApplyPuppetPose( self, t );
 	g_origEvilHarryRender( self, context, arg );
+	if ( t ) NoteNameTag( peer, self );
 	if ( t && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
 }
 
@@ -1389,6 +1596,8 @@ static volatile LONG g_reqSpawn = 0;
 static volatile LONG g_reqState = 0;
 static volatile LONG g_reqDelay = 0;
 static volatile LONG g_reqStay = 0;
+static volatile LONG g_reqList = 0;
+static bool g_showList = false;   // F9.
 static volatile LONG g_harryTicks = 0;
 
 static bool GameHasFocus()
@@ -1402,10 +1611,10 @@ static bool GameHasFocus()
 
 static DWORD WINAPI HotkeyThread( void* )
 {
-	static const int NUM_KEYS = 4;
-	bool wasDown[NUM_KEYS] = { false, false, false, false };
-	const int keys[NUM_KEYS] = { VK_F5, VK_F6, VK_F7, VK_F8 };
-	volatile LONG* reqs[NUM_KEYS] = { &g_reqSpawn, &g_reqState, &g_reqDelay, &g_reqStay };
+	static const int NUM_KEYS = 5;
+	bool wasDown[NUM_KEYS] = { false, false, false, false, false };
+	const int keys[NUM_KEYS] = { VK_F5, VK_F6, VK_F7, VK_F8, VK_F9 };
+	volatile LONG* reqs[NUM_KEYS] = { &g_reqSpawn, &g_reqState, &g_reqDelay, &g_reqStay, &g_reqList };
 
 	for ( ;; ) {
 		for ( int i = 0; i < NUM_KEYS; i++ ) {
@@ -1432,6 +1641,7 @@ static void HandleHotkeys( EIHarry* harry )
 	bool f6 = InterlockedExchange( &g_reqState, 0 ) != 0;
 	bool f7 = InterlockedExchange( &g_reqDelay, 0 ) != 0;
 	bool f8 = InterlockedExchange( &g_reqStay, 0 ) != 0;
+	if ( InterlockedExchange( &g_reqList, 0 ) ) g_showList = !g_showList;
 
 	// The puppet went with the last level : F8's "stay here" goes too.
 	if ( !g_cur->beast && g_puppetStaysHere ) g_puppetPinned = g_puppetStaysHere = false;
@@ -1621,7 +1831,6 @@ static void GrabScreen( const char* name )
 // Windows can capture of it), so the frame is copied from the back buffer right
 // before the game presents it. The renderer is a static object at 0x926790 with
 // its IDirect3DDevice9 at +0x74 (filled by CreateDevice at 0x697FB2).
-static const uint32_t RENDERER_DEVICE = 0x926790 + 0x74;
 static const int VTABLE_SLOT_PRESENT = 17;   // IDirect3DDevice9::Present.
 typedef HRESULT (__stdcall *PresentFunc)( IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA* );
 static PresentFunc g_origPresent = 0;
@@ -1678,8 +1887,15 @@ static void GrabBackBuffer( IDirect3DDevice9* dev )
 	back->Release();
 }
 
+static void DrawOverlay( IDirect3DDevice9* dev );
+
 static HRESULT __stdcall Present_Hook( IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty )
 {
+	// Loading, menus, pause : Harry doesn't tick, but the room still hears from us
+	// (and we from it).
+	if ( NetNowMs() - g_lastNetUpdate > 250 ) NetUpdate();
+	DrawOverlay( dev );
+	g_presentCount++;
 	if ( g_grabRequested ) {
 		GrabBackBuffer( dev );
 		InterlockedExchange( &g_grabRequested, 0 );
@@ -2584,6 +2800,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 		}
 	}
 
+	if ( !g_origPresent ) HookPresent();   // The overlay draws as frames are presented.
 	PushLocalSnapshot( self );
 	NetUpdate();
 	// Another player in this level : show them (Evil Harry appears on his own).
@@ -2742,6 +2959,125 @@ static bool IsKnownGameVersion()
 	return memcmp( (void*) GAME_VERSION_ADDRESS, GAME_VERSION, sizeof(GAME_VERSION) ) == 0;
 }
 
+// --------------------------------------------------------------------------------
+// The overlay : name tags over the other players, the player list (F9), and
+// "joined" / "left" messages.
+// --------------------------------------------------------------------------------
+static const float TAG_FADE_START = 150.0F;   // Camera distance : tags fade out from here...
+static const float TAG_FADE_END = 300.0F;    // ...to here.
+
+static uint32_t WithAlpha( uint32_t color, float alpha )
+{
+	if ( alpha < 0.0F ) alpha = 0.0F;
+	if ( alpha > 1.0F ) alpha = 1.0F;
+	return (color & 0x00FFFFFF) | ((uint32_t) (((color >> 24) & 0xFF) * alpha + 0.5F) << 24);
+}
+
+static void DrawOverlay( IDirect3DDevice9* dev )
+{
+	uint32_t now = NetNowMs();
+	bool any = g_showList;
+	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame == g_presentCount;
+	for ( int i = 0; i < MAX_TOASTS && !any; i++ ) any = g_toasts[i].text[0] && now - g_toasts[i].time < TOAST_MS;
+	if ( !any ) return;
+
+	D3DVIEWPORT9 vp;
+	if ( FAILED( dev->GetViewport( &vp ) ) ) return;
+	float h = vp.Height / 38.0F;
+	if ( h < 14.0F ) h = 14.0F;
+	if ( !OverlayBegin( dev, h ) ) return;
+	float sw, sh;
+	OverlayScreenSize( &sw, &sh );
+	float pad = h * 0.3F;
+
+	// Name tags.
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		const Peer& p = g_peers[i];
+		if ( !p.beast || p.tagFrame != g_presentCount ) continue;
+		float alpha = 1.0F - (p.tagDepth - TAG_FADE_START) / (TAG_FADE_END - TAG_FADE_START);
+		if ( alpha <= 0.0F ) continue;
+		const char* name = PlayerName( p.id );
+		float w = OverlayTextWidth( name );
+		float x = floorf( p.tagX - w * 0.5F ), y = floorf( p.tagY - h * 1.2F );
+		OverlayRect( x - pad, y - pad * 0.5F, w + 2.0F * pad, h + pad, WithAlpha( 0x80000000, alpha ) );
+		OverlayText( x, y, name, WithAlpha( 0xFFFFFFFF, alpha ) );
+	}
+
+	// Messages, top middle.
+	float ty = h;
+	for ( int i = 0; i < MAX_TOASTS; i++ ) {
+		if ( !g_toasts[i].text[0] || now - g_toasts[i].time >= TOAST_MS ) continue;
+		float alpha = (TOAST_MS - (now - g_toasts[i].time)) / 1000.0F;   // Fades out over the last second.
+		float w = OverlayTextWidth( g_toasts[i].text );
+		float x = floorf( (sw - w) * 0.5F );
+		OverlayRect( x - pad, ty - pad * 0.5F, w + 2.0F * pad, h + pad, WithAlpha( 0xA0000000, alpha ) );
+		OverlayText( x, ty, g_toasts[i].text, WithAlpha( 0xFFFFE080, alpha ) );
+		ty += h * 1.4F;
+	}
+
+	// The player list, top right.
+	if ( g_showList ) {
+		static const int MAX_ROWS = MAX_PEERS + 3;
+		char left[MAX_ROWS][96], right[MAX_ROWS][64];
+		uint32_t colors[MAX_ROWS];
+		int rows = 0;
+		int me = g_transport ? g_transport->PlayerId() : -1;
+		uint32_t here = Gizmod::getCurrentLevelCRC();
+		int count = me >= 0 ? 1 : 0;
+		for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_players[i].present && i != me ) count++;
+
+		if ( !g_networked ) {
+			sprintf_s( left[rows], "Not online" );
+			sprintf_s( right[rows], "(no Server in Multiplayer.ini)" );
+		}
+		else if ( me < 0 ) {
+			sprintf_s( left[rows], "Room \"%s\"", g_roomName );
+			sprintf_s( right[rows], "connecting..." );
+		}
+		else {
+			sprintf_s( left[rows], "Room \"%s\"", g_roomName );
+			sprintf_s( right[rows], "%d player%s", count, count == 1 ? "" : "s" );
+		}
+		colors[rows++] = 0xFFFFE080;
+		if ( me >= 0 ) {
+			sprintf_s( left[rows], "%s (you)", g_myName );
+			sprintf_s( right[rows], "%s", LevelName( g_haveLocal ? here : 0 ) );
+			colors[rows++] = 0xFFA0FFA0;
+		}
+		for ( int i = 0; i < MAX_PEERS; i++ ) {
+			const PlayerInfo& info = g_players[i];
+			if ( !info.present || i == me ) continue;
+			sprintf_s( left[rows], "%s", info.name );
+			if ( info.level && info.level == here ) sprintf_s( right[rows], "here" );
+			else sprintf_s( right[rows], "%s", LevelName( info.level ) );
+			colors[rows++] = 0xFFFFFFFF;
+		}
+		int ping = g_transport ? g_transport->RoundTripMs() : -1;
+		if ( ping >= 0 ) sprintf_s( left[rows], "Ping %d ms", ping );
+		else left[rows][0] = 0;
+		sprintf_s( right[rows], "F9 : hide" );
+		colors[rows++] = 0xFFB0B0B0;
+
+		float wl = 0.0F, wr = 0.0F;
+		for ( int r = 0; r < rows; r++ ) {
+			float a = OverlayTextWidth( left[r] ), b = OverlayTextWidth( right[r] );
+			if ( a > wl ) wl = a;
+			if ( b > wr ) wr = b;
+		}
+		float gap = h * 1.5F;
+		float bw = wl + gap + wr + 2.0F * pad, bh = rows * h * 1.3F + 2.0F * pad;
+		float bx = floorf( sw - bw - h ), by = h;
+		OverlayRect( bx, by, bw, bh, 0xA0000000 );
+		for ( int r = 0; r < rows; r++ ) {
+			float y = by + pad + r * h * 1.3F;
+			OverlayText( bx + pad, y, left[r], colors[r] );
+			OverlayText( bx + bw - pad - OverlayTextWidth( right[r] ), y, right[r], colors[r] );
+		}
+	}
+
+	OverlayEnd();
+}
+
 // Leaving the room when the game closes, so the others drop our puppet at once
 // instead of after a timeout. The game ends through kernel32's ExitProcess (from
 // its own import table, patched below), and so does the autotest (QuitGame).
@@ -2816,6 +3152,7 @@ public:
 		injector::WriteMemory( harrySlot, &HarryTick_Hook, true );
 		injector::WriteMemory( evilSlot,  &EvilHarryTick_Hook, true );
 		InstallItemDrawHooks();
+		HookCamera();
 
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
 		Gizmod::getInstance()->getEventListener()->registerEvent<LevelLoadedEvent>( this );
@@ -2835,6 +3172,9 @@ public:
 		NetConfig config;
 		ReadNetConfig( &config );
 		ResetHistory();
+		CleanName( config.name, (int) strlen( config.name ), g_myName );
+		if ( !g_myName[0] ) strcpy_s( g_myName, "Harry" );
+		strncpy_s( g_roomName, config.room, _TRUNCATE );
 		if ( !HookGameExitProcess() ) mp_log( "[NET] Couldn't hook the game's exit : the others drop us after a timeout.\n" );
 		if ( config.delayMs > 0 ) {   // The nearest choice.
 			int n = sizeof(DELAY_CHOICES) / sizeof(DELAY_CHOICES[0]);
@@ -2869,6 +3209,7 @@ public:
 				PatchWindowNoActivate();
 			}
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
+			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
 			if ( GetEnvironmentVariableA( "PTLE_MP_SURVEY", env, sizeof(env) ) && env[0] == '1' ) {
 				g_survey = true;
@@ -2878,7 +3219,7 @@ public:
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
 		}
 
-		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F5 spawn, F6 state, F7 delay, F8 stay here.\n",
+		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F5 spawn, F6 state, F7 delay, F8 stay here, F9 player list.\n",
 			(uint32_t) g_origHarryTick, (uint32_t) g_origEvilHarryTick );
 	}
 
