@@ -1371,12 +1371,13 @@ static Matrix4f g_puppetItemPose[MAX_ITEM_BONES];     // The copy's bones (stati
 
 // "anim" : offset of the item's animated model (an EAnimController), 0 if none.
 // "shown" : a byte its draw needs set (cleared as soon as Harry's is put away, so
-// the copy forces it), 0 if none. (The raft's, +0x108, can't be forced.)
+// the copy forces it), 0 if none. (The raft's is "inflated" : without it, its draw
+// only poses it.)
 // The stink bomb isn't in the wheel menu, but costs nothing to cover.
 static const struct { int item; uint32_t vtable; uint32_t anim; uint32_t shown; } DRAWN_ITEMS[] = {
 	{ ITEM_TORCH,      0x89A200, 0,    0     },
 	{ ITEM_TNT,        0x89A160, 0,    0     },
-	{ ITEM_RAFT,       0x8949B0, 0xA4, 0     },
+	{ ITEM_RAFT,       0x8949B0, 0xA4, 0x108 },
 	{ ITEM_SLING,      0x8971D0, 0xA0, 0x104 },
 	{ ITEM_SHIELD,     0x896F90, 0xA4, 0x108 },
 	{ ITEM_GAS_MASK,   0x87CAD8, 0,    0     },
@@ -1441,18 +1442,14 @@ static void DrawItemAt( int slot, const PlayerSnapshot* t, const Matrix4f& base,
 	EIHarry* harry = Gizmod::getHarry();
 	if ( !item || !harry ) return;
 
-	// The raft's animated model only exists in a drawable state while Harry's own
-	// raft is inflated (forcing it earlier crashes the renderer) : no copy otherwise.
-	if ( index == ITEM_RAFT && !FIELD( item, uint8_t, RAFT_INFLATED ) ) return;
-
 	// Animated items : the snapshot's bones, marked posed so the draw keeps them.
 	uint8_t* anim = DRAWN_ITEMS[slot].anim ? item + DRAWN_ITEMS[slot].anim : 0;
 	Matrix4f* harryPose = 0;
 	uint32_t stamp = 0;
 	if ( anim ) {
 		int bones = 0;
-		harryPose = GetPose( anim, &bones );
-		if ( !harryPose || !t->itemBones || bones != t->itemBones ) return;
+		harryPose = GetPose( anim, &bones );   // (None yet if Harry never took his out : the copy brings its own.)
+		if ( !t->itemBones || bones != t->itemBones ) return;
 		MatsMul( t->itemPose, bones, base, g_puppetItemPose );
 		stamp = FIELD( anim, uint32_t, ANIMCTRL_STAMP );
 		FIELD( anim, Matrix4f*, ANIMCTRL_POSE ) = g_puppetItemPose;
@@ -1501,24 +1498,14 @@ static void DrawPuppetItem( int slot, void* context, void* arg )
 	DrawItemAt( slot, t, g_cur->beast->m_transformMatrix, context, arg );
 }
 
-static void DrawPuppetRafts( int slot, void* context, void* arg )
-{
-	for ( int i = 0; i < MAX_PEERS; i++ ) {
-		if ( !g_peers[i].beast ) continue;
-		CurrentPeer current( &g_peers[i] );
-		DrawPuppetItem( slot, context, arg );
-	}
-}
-
-// The raft's copy is drawn right after Harry's raft (drawing it from the puppet's
-// render crashed the renderer while flushing the frame), so it only shows while
-// Harry's raft is out too. The other items are drawn by the puppet's render.
+// The copies are drawn by the puppets' render (the raft's too : it used to be drawn
+// right after Harry's own raft, so the other players' rafts vanished whenever Harry
+// put his away).
 #define ITEM_DRAW_HOOK( n ) \
 	static void __fastcall ItemDraw_Hook##n( void* item, void*, void* context, void* arg ) \
 	{ \
 		g_origItemDraw[n]( item, context, arg ); \
 		NoteHarryItemDraw( n, item ); \
-		if ( DRAWN_ITEMS[n].item == ITEM_RAFT ) DrawPuppetRafts( n, context, arg ); \
 	}
 ITEM_DRAW_HOOK( 0 )
 ITEM_DRAW_HOOK( 1 )
@@ -1642,7 +1629,7 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 	if ( t && !ForcedClip() ) ApplyPuppetPose( self, t );
 	g_origEvilHarryRender( self, context, arg );
 	if ( t && !viewer ) NoteNameTag( peer, self );
-	if ( t && !viewer && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
+	if ( t && !viewer && t->drawnSlot >= 0 ) DrawPuppetItem( t->drawnSlot, context, arg );
 }
 
 static void InstallItemDrawHooks()
@@ -3073,7 +3060,7 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedExchange( &g_tapKey, STEPS[step - 1].key );   // ...while the arrow is tapped.
 		}
 		else if ( t >= 1300 && t < 1400 && !snapped && step >= 2 && STEPS[step - 1].expect < 0 && STEPS[step - 2].expect >= 0
-		          && STEPS[step - 2].expect != ITEM_RAFT && STEPS[step - 1].upItem == KEEP ) {
+		          && STEPS[step - 1].upItem == KEEP ) {
 			// Harry has put it away; Evil Harry, a second behind, still holds it.
 			char name[48];
 			sprintf_s( name, "09_item_%02d_%s_lag", step - 1, STEPS[step - 1].name );
@@ -3096,9 +3083,9 @@ static void AutotestStep( EIHarry* harry )
 			int draws = g_puppetItemDraws - drawsAtStart;   // Puppet copies drawn over the last 0.9 s.
 			int poses = g_puppetPoseCopies - posesAtStart;
 			int want = STEPS[i].expect;
-			// Put away (but the raft, whose copy needs Harry's) : the copy outlives Harry's item.
+			// Put away : the copy outlives Harry's item.
 			int prev = i > 0 ? STEPS[i - 1].expect : -1;
-			bool putAway = want < 0 && prev >= 0 && prev != ITEM_RAFT && STEPS[i].upItem == KEEP;
+			bool putAway = want < 0 && prev >= 0 && STEPS[i].upItem == KEEP;
 			int alone = g_copyDrawsAlone - aloneAtStart;
 			bool ok = held == want && !shown && (want >= 0 ? draws > 30 : draws == 0) && poses > 30 && (!putAway || alone > 5);
 			if ( !ok ) g_itemFailures++;
