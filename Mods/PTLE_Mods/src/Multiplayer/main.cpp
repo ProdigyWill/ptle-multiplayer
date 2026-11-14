@@ -142,6 +142,19 @@ static void mp_log( const char* fmt, ... )
 	LeaveCriticalSection( &g_logLock );
 }
 
+// "name.dll+0x1234" for an address inside a loaded module (a crash in a mod or a
+// system DLL : their addresses change from one PC to the next), else false.
+static bool DescribeAddress( uint32_t address, char* out, int size )
+{
+	HMODULE module = 0;
+	if ( !GetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) address, &module ) || !module ) return false;
+	char path[MAX_PATH] = { 0, };
+	GetModuleFileNameA( module, path, MAX_PATH );
+	const char* name = strrchr( path, '\\' );
+	sprintf_s( out, size, "%s+0x%X", name ? name + 1 : path, address - (uint32_t) module );
+	return true;
+}
+
 // Records access violations (address + registers) before Gizmod's crash handler
 // runs. First-chance only, and capped, so handled exceptions don't flood the log.
 static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
@@ -158,12 +171,20 @@ static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
 		(uint32_t) e->ExceptionRecord->ExceptionInformation[1],
 		c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Esp );
 
-	// A few return addresses from the stack help locate the caller.
+	char where[MAX_PATH + 16];
+	if ( DescribeAddress( c->Eip, where, sizeof(where) ) ) mp_log( "[MP]   in %s\n", where );
+
+	// Return addresses from the stack help locate the caller (in the game, or in a
+	// mod's or a system DLL's code).
 	uint32_t* sp = (uint32_t*) c->Esp;
-	for ( int i = 0; i < 24; i++ ) {
+	for ( int i = 0, shown = 0; i < 96 && shown < 16; i++ ) {
 		uint32_t v = 0;
 		if ( !IsBadReadPtr( sp + i, 4 ) ) v = sp[i];
-		if ( v >= 0x401000 && v < 0x869000 ) mp_log( "[MP]   stack+%02X : 0x%.8X\n", i * 4, v );
+		if ( v >= 0x401000 && v < 0x869000 ) { mp_log( "[MP]   stack+%02X : 0x%.8X\n", i * 4, v ); shown++; }
+		else if ( v >= 0x10000 && !IsBadCodePtr( (FARPROC) v ) && DescribeAddress( v, where, sizeof(where) ) ) {
+			mp_log( "[MP]   stack+%02X : 0x%.8X %s\n", i * 4, v, where );
+			shown++;
+		}
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
