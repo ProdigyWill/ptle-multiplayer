@@ -2112,6 +2112,7 @@ static const SurveyLevel SURVEY_BIG[] = {
 	{ 0x07ECCC35, "a05_mama_oullo_tower" },
 	{ 0x3292B6C9, "great_tree" },
 	{ 0x69F0CDE2, "battered_bridge" },
+	{ 0xCD944049, "butterfly_glade" },
 };
 static const SurveyLevel* SURVEY_LEVELS = SURVEY_ALL;
 static int NUM_SURVEY_LEVELS = sizeof(SURVEY_ALL) / sizeof(SURVEY_ALL[0]);
