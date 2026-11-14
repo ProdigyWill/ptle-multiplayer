@@ -1,4 +1,4 @@
-"""Starts Documents\\PTLE Multiplayer\\anim-notes.txt (the in-game animation viewer's
+"""Starts %LOCALAPPDATA%\\PTLE Multiplayer\\anim-notes.txt (the in-game animation viewer's
 list, F10) from the animation survey's log, so its numbers match the survey's. A
 few clips that looked like emotes in the survey are starred, with a guess ending
 in "?". Won't overwrite an existing file unless given --force.
@@ -9,7 +9,7 @@ import os
 import re
 import sys
 
-DOCS = os.path.join(os.path.expanduser('~'), 'Documents', 'PTLE Multiplayer')
+DOCS = os.path.join(os.environ['LOCALAPPDATA'], 'PTLE Multiplayer')   # Where the mod keeps its files.
 LOG = os.path.join(DOCS, 'logs', 'multiplayer.log')
 OUT = os.path.join(DOCS, 'anim-notes.txt')
 

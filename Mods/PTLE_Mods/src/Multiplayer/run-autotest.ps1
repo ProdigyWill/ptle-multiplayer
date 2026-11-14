@@ -18,7 +18,7 @@
 # others without taking focus, and its keys are fed to it directly, so the computer
 # stays usable. -Foreground brings the game to the front and sends real key presses.
 #
-# Results : Documents\PTLE Multiplayer\logs\multiplayer.log and logs\shots\*.png
+# Results : %LOCALAPPDATA%\PTLE Multiplayer\logs\multiplayer.log and logs\shots\*.png
 
 param(
 	[switch] $NoBuild,
@@ -36,7 +36,7 @@ $modsDir  = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $gameDir  = 'C:\Program Files (x86)\Aspyr\PITFALL The Lost Expedition\Game'
 $gameExe  = Join-Path $gameDir 'PITFALL The Lost Expedition.exe'
 $msbuild  = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe'
-$logDir   = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PTLE Multiplayer\logs'
+$logDir   = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'PTLE Multiplayer\logs'
 $logFile  = Join-Path $logDir 'multiplayer.log'
 $shotsDir = Join-Path $logDir 'shots'
 

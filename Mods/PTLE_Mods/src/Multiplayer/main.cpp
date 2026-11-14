@@ -6,7 +6,9 @@
 // as a snapshot packet (net/protocol.h) through a transport (net/transport.h), and
 // the puppet replays the snapshots that come in (net/remote.h).
 //
-// Settings : mods\Multiplayer.ini (written with defaults the first time), section
+// Settings : config\Multiplayer\Multiplayer.ini in the game folder (written with
+// defaults the first time; mods\Multiplayer.ini, where it used to be, is still read
+// if that's the only one), section
 // [Network] : Server (relay server "host:port", see server/relay.py), Room, Name,
 // Echo (1 : the server sends our own moves back, to test alone). Environment
 // variables PTLE_MP_SERVER, PTLE_MP_ROOM, PTLE_MP_NAME, PTLE_MP_ECHO override them.
@@ -91,22 +93,29 @@ static Logger* logger() { return Gizmod::getInstance()->getLogger(); }
 
 
 // --------------------------------------------------------------------------------
-// Logging : Gizmod console + Documents\PTLE Multiplayer\logs\multiplayer.log
-// (the game folder isn't writable without admin rights).
+// Logging : Gizmod console + %LOCALAPPDATA%\PTLE Multiplayer\logs\multiplayer.log
+// (the game folder isn't writable without admin rights, and nothing of the mod's
+// belongs in the player's Documents).
 // --------------------------------------------------------------------------------
 static FILE* g_logFile = 0;
 static CRITICAL_SECTION g_logLock;
 static char g_logDir[MAX_PATH] = { 0, };
+
+// %LOCALAPPDATA%\PTLE Multiplayer (created) : what the mod writes goes there.
+static bool GetDataDir( char* path )   // MAX_PATH.
+{
+	if ( FAILED( SHGetFolderPathA( 0, CSIDL_LOCAL_APPDATA, 0, 0, path ) ) ) return false;
+	strcat_s( path, MAX_PATH, "\\PTLE Multiplayer" );
+	CreateDirectoryA( path, 0 );
+	return true;
+}
 
 static void OpenLogFile()
 {
 	InitializeCriticalSection( &g_logLock );
 
 	char path[MAX_PATH];
-	if ( FAILED( SHGetFolderPathA( 0, CSIDL_PERSONAL, 0, 0, path ) ) ) return;
-
-	strcat_s( path, "\\PTLE Multiplayer" );
-	CreateDirectoryA( path, 0 );
+	if ( !GetDataDir( path ) ) return;
 	strcat_s( path, "\\logs" );
 	CreateDirectoryA( path, 0 );
 	// PTLE_MP_INSTANCE=<name> : logs\<name>\ (several games running at once).
@@ -1736,7 +1745,7 @@ static DWORD WINAPI HotkeyThread( void* )
 
 // --------------------------------------------------------------------------------
 // Animation viewer (F10). Its clip list and notes are in
-// Documents\PTLE Multiplayer\anim-notes.txt, one clip per line :
+// %LOCALAPPDATA%\PTLE Multiplayer\anim-notes.txt, one clip per line :
 //     <number> <clip id> <where found> [*] [notes]
 // The numbers are the animation survey's. Edited by hand (reloaded when it changes)
 // and by F11 (star). Clips found on Harry and not in it yet are added.
@@ -1769,8 +1778,8 @@ static bool AnimNotesFileTime( FILETIME* t )
 static void LoadAnimNotes()
 {
 	if ( !g_animNotesPath[0] ) {
-		if ( FAILED( SHGetFolderPathA( 0, CSIDL_PERSONAL, 0, 0, g_animNotesPath ) ) ) return;
-		strcat_s( g_animNotesPath, "\\PTLE Multiplayer\\anim-notes.txt" );
+		if ( !GetDataDir( g_animNotesPath ) ) return;
+		strcat_s( g_animNotesPath, "\\anim-notes.txt" );
 	}
 	uint32_t keep = (g_animIndex < g_animNoteCount) ? g_animNotes[g_animIndex].crc : 0;
 	FILE* f = 0;
@@ -3379,15 +3388,29 @@ static void GetEnvOverride( const char* var, char* value, int size )
 
 static void ReadNetConfig( NetConfig* c )
 {
-	// mods\Multiplayer.ini, next to this plugin.
-	char ini[MAX_PATH] = { 0, };
+	// config\Multiplayer\Multiplayer.ini in the game folder (this plugin is in its
+	// mods folder), like the other mods' settings. It used to be mods\Multiplayer.ini :
+	// that one is still read if it's the only one there.
+	char ini[MAX_PATH] = { 0, }, old[MAX_PATH] = { 0, }, dir[MAX_PATH] = { 0, };
 	HMODULE self = 0;
 	GetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) &ReadNetConfig, &self );
-	GetModuleFileNameA( self, ini, MAX_PATH );
-	char* slash = strrchr( ini, '\\' );
-	if ( slash ) strcpy_s( slash + 1, MAX_PATH - (slash + 1 - ini), "Multiplayer.ini" );
+	GetModuleFileNameA( self, dir, MAX_PATH );
+	char* slash = strrchr( dir, '\\' );
+	if ( slash ) *slash = 0;                                    // ...\Game\mods
+	sprintf_s( old, "%s\\Multiplayer.ini", dir );
+	slash = strrchr( dir, '\\' );
+	if ( slash ) *slash = 0;                                    // ...\Game
+	strcat_s( dir, "\\config" );
+	CreateDirectoryA( dir, 0 );
+	strcat_s( dir, "\\Multiplayer" );
+	CreateDirectoryA( dir, 0 );
+	sprintf_s( ini, "%s\\Multiplayer.ini", dir );
 
-	if ( GetFileAttributesA( ini ) == INVALID_FILE_ATTRIBUTES ) {
+	if ( GetFileAttributesA( ini ) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA( old ) != INVALID_FILE_ATTRIBUTES ) {
+		strcpy_s( ini, old );
+		mp_log( "[NET] Settings : %s (the old place; they now belong in config\\Multiplayer).\n", ini );
+	}
+	else if ( GetFileAttributesA( ini ) == INVALID_FILE_ATTRIBUTES ) {
 		FILE* f = 0;
 		if ( fopen_s( &f, ini, "wb" ) == 0 && f ) {
 			fwrite( DEFAULT_INI, 1, sizeof(DEFAULT_INI) - 1, f );
@@ -3571,7 +3594,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		else
 			sprintf_s( line[0], "%sAnimation #%03d   (%d of %d)   0x%.8X   %s", n.star ? "* " : "", n.num, g_animIndex + 1, g_animNoteCount, n.crc, n.source );
 		if ( n.note[0] ) sprintf_s( line[1], "%s", n.note );
-		else sprintf_s( line[1], "(no notes yet : Documents\\PTLE Multiplayer\\anim-notes.txt)" );
+		else sprintf_s( line[1], "(no notes yet : %%LOCALAPPDATA%%\\PTLE Multiplayer\\anim-notes.txt)" );
 		colors[1] = n.note[0] ? 0xFFFFFFFF : 0xFFB0B0B0;
 		sprintf_s( line[2], "[ ] : previous / next (Shift : 10)   \\ : replay   F11 : star   ' : %s   F10 : close",
 			g_animStarredOnly ? "all clips" : "starred only" );

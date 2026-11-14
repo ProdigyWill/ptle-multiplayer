@@ -3,7 +3,7 @@ clip, numbered, with its clip id (run-autotest.ps1 with PTLE_MP_ANIMSURVEY=1 fir
 
     python make-anim-sheet.py
 
-Reads  Documents\\PTLE Multiplayer\\logs\\shots\\anim_<n>_f<k>.png (or .bmp) and the log.
+Reads  %LOCALAPPDATA%\\PTLE Multiplayer\\logs\\shots\\anim_<n>_f<k>.png (or .bmp) and the log.
 Writes Documents\\PTLE Multiplayer\\anim-survey\\index.html and its GIFs.
 """
 import html
@@ -13,8 +13,9 @@ import re
 from PIL import Image
 
 DOCS = os.path.join(os.path.expanduser('~'), 'Documents', 'PTLE Multiplayer')
-SHOTS = os.path.join(DOCS, 'logs', 'shots')
-LOG = os.path.join(DOCS, 'logs', 'multiplayer.log')
+DATA = os.path.join(os.environ['LOCALAPPDATA'], 'PTLE Multiplayer')   # Where the mod keeps its files.
+SHOTS = os.path.join(DATA, 'logs', 'shots')
+LOG = os.path.join(DATA, 'logs', 'multiplayer.log')
 OUT = os.path.join(DOCS, 'anim-survey')
 FRAME_MS = 500   # The survey films a frame every 500 ms.
 SCALE = 0.6

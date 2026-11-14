@@ -5,7 +5,7 @@
 #
 #   powershell -ExecutionPolicy Bypass -File run-duo-test.ps1 [-Server 127.0.0.1:27777] [-Players 2] [-TimeoutSec 480]
 #
-# Results : Documents\PTLE Multiplayer\logs\a\, logs\b\... (log + screenshots).
+# Results : %LOCALAPPDATA%\PTLE Multiplayer\logs\a\, logs\b\... (log + screenshots).
 
 param(
 	[string] $Server = '127.0.0.1:27777',
@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 
 $gameDir = 'C:\Program Files (x86)\Aspyr\PITFALL The Lost Expedition\Game'
 $gameExe = Join-Path $gameDir 'PITFALL The Lost Expedition.exe'
-$logDir  = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PTLE Multiplayer\logs'
+$logDir  = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'PTLE Multiplayer\logs'
 
 if (Get-Process -Name 'PITFALL The Lost Expedition' -ErrorAction SilentlyContinue) {
 	throw 'The game is already running. Close it first.'

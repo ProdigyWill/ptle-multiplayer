@@ -22,6 +22,7 @@ $zip     = Join-Path $outDir 'PTLE_Multiplayer.zip'
 
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force (Join-Path $stage 'mods') | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $stage 'config\Multiplayer') | Out-Null
 
 Copy-Item (Join-Path $bin 'binkw32.dll') $stage                       # The mod loader.
 Copy-Item (Join-Path $modsDir 'src\ModLoader\config.ini') $stage
@@ -41,7 +42,7 @@ Name=$Name
 ; 1 : the server sends your own moves back to you (Evil Harry replays you
 ; through the internet, to test alone).
 Echo=0
-"@ -replace "`r?`n", "`r`n" | Set-Content -Encoding ascii (Join-Path $stage 'mods\Multiplayer.ini')
+"@ -replace "`r?`n", "`r`n" | Set-Content -Encoding ascii (Join-Path $stage 'config\Multiplayer\Multiplayer.ini')
 
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
