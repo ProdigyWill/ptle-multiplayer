@@ -322,8 +322,11 @@ static Peer g_peers[MAX_PEERS];        // Static : big, and 16-byte aligned.
 // snapshots.
 static const uint32_t INFO_INTERVAL_MS = 1000;
 static const uint32_t INFO_TIMEOUT_MS = 15000;
-// Outfits. The game has three besides Harry's own, each a cheat (a flag, read when a
-// level loads : Harry gets that model, 0x4ADB38). A character's model is its CRC at
+// Outfits. Harry's own comes from the level : his jungle clothes, or his snowy
+// ones in the snowy levels (White Valley...), which is also the model Evil Harry
+// has. The game has three more, each a cheat (a flag, read when a level loads :
+// Harry gets that model, 0x4ADB38). "Harry" here is the level's own; "Snowy Harry"
+// makes it the snowy one everywhere (HarryModel_Hook). A character's model is its CRC at
 // +0x130 for Harry, +0x2F4 for a beast; 0x60F770( character, crc ) changes a
 // beast's on the spot (Evil Harry's Init does it to match Harry, 0x47A90D), which is
 // how each puppet wears its own player's outfit. All four share Harry's skeleton.
@@ -333,7 +336,10 @@ static const Outfit OUTFITS[] = {
 	{ "Nicole",      0x7BBEDDE3, 0x90DA18 },
 	{ "Native",      0x182A7689, 0x90DA19 },
 	{ "Retro Harry", 0xBF8D2C68, 0x90DA1F },
+	{ "Snowy Harry", 0x94DB2F98, 0 },
 };
+static const int SNOWY_OUTFIT = 4;
+static uint32_t g_forceHarryModel = 0;   // The model Harry gets instead of the level's, when a level loads (0 : the level's).
 static const int NUM_OUTFITS = sizeof(OUTFITS) / sizeof(OUTFITS[0]);
 static const uint32_t HARRY_MODEL = 0x130, BEAST_MODEL = 0x2F4, CHAR_MODEL_SET = 0x12C;
 static int g_myOutfit = 0;       // The one chosen (Multiplayer.ini, [Appearance] Outfit) : worn from the next level load.
@@ -774,7 +780,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 	int worn = 0;
 	for ( int i = 1; i < NUM_OUTFITS; i++ ) if ( FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[i].model ) worn = i;
-	if ( worn != g_myWornOutfit || !g_haveLocal ) mp_log( "[MP] Harry wears the %s outfit (chosen : %s).\n", OUTFITS[worn].name, OUTFITS[g_myOutfit].name );
+	if ( worn != g_myWornOutfit || !g_haveLocal ) mp_log( "[MP] Harry wears the %s outfit (model 0x%.8X; chosen : %s).\n", OUTFITS[worn].name, FIELD( harry, uint32_t, HARRY_MODEL ), OUTFITS[g_myOutfit].name );
 	g_myWornOutfit = worn;
 	ApplyMyOutfit();
 
@@ -2192,6 +2198,7 @@ static const SurveyLevel SURVEY_BIG[] = {
 	{ 0x3292B6C9, "great_tree" },
 	{ 0x69F0CDE2, "battered_bridge" },
 	{ 0xCD944049, "butterfly_glade" },
+	{ 0x62548B77, "white_valley" },
 };
 static const SurveyLevel* SURVEY_LEVELS = SURVEY_ALL;
 static int NUM_SURVEY_LEVELS = sizeof(SURVEY_ALL) / sizeof(SURVEY_ALL[0]);
@@ -3125,6 +3132,20 @@ static void AutotestStep( EIHarry* harry )
 			ScheduleWorldLoad( (void*) 0x917028, Gizmod::getCurrentLevelCRC(), false );
 			step++; phaseStart = now;
 		}
+		else if ( step == 100 ) {
+			if ( t < 9000 ) break;
+			bool ok = g_myWornOutfit == SNOWY_OUTFIT;
+			mp_log( "[AT] Outfit : Snowy Harry chosen, after the level loaded again (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			if ( !ok ) failures++;
+			RequestSnapshot( "outfit_6_snowy" );
+			g_myOutfit = 0;
+			ApplyMyOutfit();
+			step = 101; phaseStart = now;
+		}
+		else if ( step == 101 ) {
+			if ( t < 1000 ) break;
+			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+		}
 		else if ( step == NUM_OUTFITS + 1 ) {
 			if ( t < 9000 ) break;
 			bool ok = g_myWornOutfit == 3 && FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[3].model;
@@ -3143,9 +3164,10 @@ static void AutotestStep( EIHarry* harry )
 				g_retroSwaps, g_retroMatched, g_retroUnmatched, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_5_ours" );
-			g_myOutfit = 0;
+			g_myOutfit = SNOWY_OUTFIT;   // Then Snowy Harry, in a level that isn't snowy.
 			ApplyMyOutfit();
-			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+			ScheduleWorldLoad( (void*) 0x917028, Gizmod::getCurrentLevelCRC(), false );
+			step = 100; phaseStart = now;
 		}
 		break;
 	}
@@ -3994,7 +4016,24 @@ static uint32_t WithAlpha( uint32_t color, float alpha )
 // when the next level loads.
 static void ApplyMyOutfit()
 {
-	for ( int i = 1; i < NUM_OUTFITS; i++ ) *(uint8_t*) OUTFITS[i].cheatFlag = (i == g_myOutfit) ? 1 : 0;
+	for ( int i = 1; i < NUM_OUTFITS; i++ ) if ( OUTFITS[i].cheatFlag ) *(uint8_t*) OUTFITS[i].cheatFlag = (i == g_myOutfit) ? 1 : 0;
+	g_forceHarryModel = OUTFITS[g_myOutfit].cheatFlag ? 0 : (g_myOutfit == 0 ? 0 : OUTFITS[g_myOutfit].model);
+}
+
+// Without a cheat, Harry's model is the level's (0x4ADC1E : mov [ecx+0x130], eax, the
+// CRC from the level's data). Ours instead, when one is chosen that has no cheat.
+static const uint32_t HARRY_MODEL_STORE = 0x4ADC1E;
+
+static __declspec(naked) void HarryModel_Hook()
+{
+	__asm {
+		cmp dword ptr [g_forceHarryModel], 0
+		je keep
+		mov eax, dword ptr [g_forceHarryModel]
+	keep:
+		mov dword ptr [ecx + 0x130], eax
+		ret
+	}
 }
 
 // The menu's settings, kept in the ini (not the autotests' : they leave it alone).
@@ -4111,11 +4150,12 @@ static void DrawMenu( float sw, float sh, float h )
 	if ( g_menu.Page( "Appearance" ) ) {
 		static const char* names[NUM_OUTFITS];
 		for ( int i = 0; i < NUM_OUTFITS; i++ ) names[i] = OUTFITS[i].name;
-		if ( g_menu.Choice( "Outfit", &g_myOutfit, names, NUM_OUTFITS, "What you look like, to you and to the others. Changes the next time you go to another area." ) ) {
+		if ( g_menu.Choice( "Outfit", &g_myOutfit, names, NUM_OUTFITS, "What you look like, to you and to the others. Changes the next time you go to another area. Harry : jungle or snowy clothes, as the area has it." ) ) {
 			ApplyMyOutfit();
 			SaveSettings();
 		}
-		if ( g_myOutfit != g_myWornOutfit ) {
+		if ( g_myOutfit == 0 && g_myWornOutfit == SNOWY_OUTFIT ) g_menu.Info( "", "his snowy clothes, in this area", Menu::DIM );
+		else if ( g_myOutfit != g_myWornOutfit ) {
 			char now[64];
 			sprintf_s( now, "%s until then", OUTFITS[g_myWornOutfit].name );
 			g_menu.Info( "", now, Menu::DIM );
@@ -4435,6 +4475,12 @@ public:
 		static const uint8_t POLL_ORIGINAL[1] = { 0xE8 };
 		if ( memcmp( (void*) POLL_KEYBOARD_CALL, POLL_ORIGINAL, 1 ) == 0 ) injector::MakeCALL( POLL_KEYBOARD_CALL, &PollKeyboard_Hook );
 		else mp_log( "[MP] The keyboard poll call isn't what we expect : keys reach the game while the menu is open.\n" );
+		static const uint8_t MODEL_ORIGINAL[6] = { 0x89, 0x81, 0x30, 0x01, 0x00, 0x00 };   // mov [ecx+0x130], eax.
+		if ( memcmp( (void*) HARRY_MODEL_STORE, MODEL_ORIGINAL, 6 ) == 0 ) {
+			injector::MakeCALL( HARRY_MODEL_STORE, &HarryModel_Hook );
+			injector::MakeNOP( HARRY_MODEL_STORE + 5, 1 );
+		}
+		else mp_log( "[MP] Harry's model isn't stored where we expect : no Snowy Harry outfit for us.\n" );
 		static const uint8_t PAD_ORIGINAL[5] = { 0xE8, 0xAE, 0x4A, 0x08, 0x00 };   // call 0x6E8660.
 		if ( memcmp( (void*) POLL_GAMEPAD_CALL, PAD_ORIGINAL, 5 ) == 0 ) injector::MakeCALL( POLL_GAMEPAD_CALL, &PollGamepad_Hook );
 		else mp_log( "[MP] The gamepad poll call isn't what we expect : the gamepad reaches the game while the menu is open.\n" );
