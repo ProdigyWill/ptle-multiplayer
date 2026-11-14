@@ -259,6 +259,7 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 static bool g_animSurvey = false;
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
+static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
 static bool g_menuTest = false;                  // PTLE_MP_MENUTEST=1 : the autotest drives the menu (F1).
 static bool g_viewerTest = false;                // PTLE_MP_VIEWERTEST=1 : the autotest drives the animation viewer.
 static uint32_t g_animSurveyClip = 0;            // The clip the puppet plays (0 : normal).
@@ -285,6 +286,7 @@ struct Peer
 	// Their puppet, and where it was spawned : a puppet whose level is gone was
 	// freed with it.
 	EIEvilHarryP* beast;
+	int shownOutfit;                   // The outfit its model is (-1 : whatever the game gave it).
 	EIEvilHarryP* limbo;               // Set aside when the game announced a level load (see SuspectPuppets).
 	uint32_t limboSince;
 	int limboTicks;
@@ -320,12 +322,31 @@ static Peer g_peers[MAX_PEERS];        // Static : big, and 16-byte aligned.
 // snapshots.
 static const uint32_t INFO_INTERVAL_MS = 1000;
 static const uint32_t INFO_TIMEOUT_MS = 15000;
+// Outfits. The game has three besides Harry's own, each a cheat (a flag, read when a
+// level loads : Harry gets that model, 0x4ADB38). A character's model is its CRC at
+// +0x130 for Harry, +0x2F4 for a beast; 0x60F770( character, crc ) changes a
+// beast's on the spot (Evil Harry's Init does it to match Harry, 0x47A90D), which is
+// how each puppet wears its own player's outfit. All four share Harry's skeleton.
+struct Outfit { const char* name; uint32_t model; uint32_t cheatFlag; };
+static const Outfit OUTFITS[] = {
+	{ "Harry",       0xC9252A08, 0 },
+	{ "Nicole",      0x7BBEDDE3, 0x90DA18 },
+	{ "Native",      0x182A7689, 0x90DA19 },
+	{ "Retro Harry", 0xBF8D2C68, 0x90DA1F },
+};
+static const int NUM_OUTFITS = sizeof(OUTFITS) / sizeof(OUTFITS[0]);
+static const uint32_t HARRY_MODEL = 0x130, BEAST_MODEL = 0x2F4, CHAR_MODEL_SET = 0x12C;
+static int g_myOutfit = 0;       // The one chosen (Multiplayer.ini, [Appearance] Outfit) : worn from the next level load.
+static int g_myWornOutfit = 0;   // The one Harry wears now : what the others are told.
+static int g_testOutfit = -1;    // Autotest : every puppet wears this.
+
 struct PlayerInfo
 {
 	bool present;
 	char name[MAX_NAME + 1];
 	uint32_t level;
 	uint32_t lastInfo;
+	uint8_t outfit;
 };
 static PlayerInfo g_players[MAX_PEERS];
 static char g_myName[MAX_NAME + 1] = "Harry";
@@ -566,6 +587,8 @@ static void NetUpdate()
 			if ( !name[0] ) sprintf_s( name, "Player %d", h.player + 1 );
 			memcpy( &info.level, q, 4 );
 			info.lastInfo = now;
+			int extra = PACKET_HEADER_SIZE + 5 + nameLength;   // After the name : the outfit (not sent by older builds).
+			info.outfit = (extra < length && packet[extra] < NUM_OUTFITS) ? packet[extra] : 0;
 			if ( !info.present || strcmp( info.name, name ) != 0 ) {
 				mp_log( "[NET] Player %d is \"%s\", in %s.\n", h.player, name, LevelName( info.level ) );
 				if ( !info.present && h.player != me ) Toast( "%s joined", name );
@@ -604,14 +627,15 @@ static void NetUpdate()
 	}
 	if ( me >= 0 && now - g_lastInfoSent >= INFO_INTERVAL_MS ) {   // Who we are, where.
 		g_lastInfoSent = now;
-		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME];
+		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1];
 		EncodeHeader( PACKET_INFO, (uint8_t) me, 0, info );
 		uint32_t where = g_haveLocal ? level : 0;
 		memcpy( info + PACKET_HEADER_SIZE, &where, 4 );
 		int n = (int) strlen( g_myName );
 		info[PACKET_HEADER_SIZE + 4] = (uint8_t) n;
 		memcpy( info + PACKET_HEADER_SIZE + 5, g_myName, n );
-		g_transport->Send( info, PACKET_HEADER_SIZE + 5 + n );
+		info[PACKET_HEADER_SIZE + 5 + n] = (uint8_t) g_myWornOutfit;
+		g_transport->Send( info, PACKET_HEADER_SIZE + 5 + n + 1 );
 	}
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer* peer = &g_peers[i];
@@ -730,9 +754,17 @@ static int GetHeldItem( EIHarry* harry )
 	return -1;
 }
 
+static void ApplyMyOutfit();
+
 static void PushLocalSnapshot( EIHarry* harry )
 {
 	SendLocalSnapshot();   // The previous one, complete now.
+
+	int worn = 0;
+	for ( int i = 1; i < NUM_OUTFITS; i++ ) if ( FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[i].model ) worn = i;
+	if ( worn != g_myWornOutfit || !g_haveLocal ) mp_log( "[MP] Harry wears the %s outfit (chosen : %s).\n", OUTFITS[worn].name, OUTFITS[g_myOutfit].name );
+	g_myWornOutfit = worn;
+	ApplyMyOutfit();
 
 	PlayerSnapshot& s = g_local;
 	s.time          = NetNowMs();
@@ -872,6 +904,7 @@ static void SpawnPuppet( EIHarry* harry )
 	p->m_beastTypeName = GAME_EMPTY_STRING;
 
 	g_cur->beast = p;
+	g_cur->shownOutfit = -1;
 	g_puppetsSpawned++;
 	g_cur->world = harry->m_world;
 	g_cur->level = Gizmod::getCurrentLevelCRC();
@@ -2653,6 +2686,8 @@ static const int MAX_ANIM_CLIPS = 1024;
 static struct { uint32_t crc; int owner; int layer; } g_animClips[MAX_ANIM_CLIPS];
 static int g_animClipCount = 0;
 
+static void ApplyMyOutfit();
+
 static void AutotestStep( EIHarry* harry )
 {
 	static const LONG WALK_KEYS[] = { 'W', 'A', 'S', 'D' };   // Arrow keys don't move Harry.
@@ -2788,6 +2823,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_animSurvey ) { phase = 200; phaseStart = now; step = 0; break; }
 		if ( g_viewerTest ) { phase = 300; phaseStart = now; step = 0; break; }
 		if ( g_menuTest ) { phase = 600; phaseStart = now; step = 0; break; }
+		if ( g_skinTest ) { phase = 700; phaseStart = now; step = 0; break; }
 		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
@@ -2876,6 +2912,50 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
+		break;
+	}
+	case 700: {   // Outfits : the puppet wears each in turn; then ours, which a level load puts on Harry.
+		static int failures = 0;
+		DWORD t = now - phaseStart;
+		EIEvilHarryP* b = g_cur->beast;
+		if ( step < NUM_OUTFITS ) {
+			if ( !b ) { InterlockedExchange( &g_autotestDone, 2 ); break; }
+			g_testOutfit = step;
+			if ( t < 2500 ) break;
+			bool ok = g_cur->shownOutfit == step && FIELD( b, uint32_t, BEAST_MODEL ) == OUTFITS[step].model;
+			mp_log( "[AT] Outfit : the puppet as %s : %s\n", OUTFITS[step].name, ok ? "ok" : "WRONG" );
+			if ( !ok ) failures++;
+			char name[40];
+			sprintf_s( name, "outfit_%d_%s", step, OUTFITS[step].name );
+			for ( char* c = name; *c; c++ ) if ( *c == ' ' ) *c = '_';
+			RequestSnapshot( name );
+			step++; phaseStart = now;
+		}
+		else if ( step == NUM_OUTFITS ) {   // Ours : Retro, then the level again.
+			g_testOutfit = -1;
+			g_myOutfit = 3;
+			ApplyMyOutfit();
+			ScheduleWorldLoad( (void*) 0x917028, Gizmod::getCurrentLevelCRC(), false );
+			step++; phaseStart = now;
+		}
+		else if ( step == NUM_OUTFITS + 1 ) {
+			if ( t < 9000 ) break;
+			bool ok = g_myWornOutfit == 3 && FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[3].model;
+			mp_log( "[AT] Outfit : Harry after the level loaded again (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			if ( !ok ) failures++;
+			SpawnPuppet( harry );   // It replays us : Retro too.
+			step++; phaseStart = now;
+		}
+		else {
+			if ( t < 3000 ) break;
+			bool ok = b && g_cur->shownOutfit == 3;
+			mp_log( "[AT] Outfit : the puppet that replays us : %s\n", ok ? "ok" : "WRONG" );
+			if ( !ok ) failures++;
+			RequestSnapshot( "outfit_5_ours" );
+			g_myOutfit = 0;
+			ApplyMyOutfit();
+			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+		}
 		break;
 	}
 	case 600: {   // The menu : keys, the mouse, and Harry standing still meanwhile.
@@ -3482,6 +3562,23 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 	HandleHotkeys( self );
 }
 
+// The puppet wears its player's outfit (ours, when it replays us).
+static void ApplyPuppetOutfit( EIEvilHarryP* p )
+{
+	int me = g_transport ? g_transport->PlayerId() : -1;
+	bool ours = g_cur->id == me || !g_networked;   // It replays us (echo, the loopback).
+	if ( !ours && !g_players[g_cur->id].present && g_testOutfit < 0 ) return;   // They left : as it is.
+	int outfit = ours ? g_myWornOutfit : g_players[g_cur->id].outfit;
+	if ( g_testOutfit >= 0 ) outfit = g_testOutfit;
+	if ( outfit == g_cur->shownOutfit ) return;
+	uint32_t model = OUTFITS[outfit].model;
+	FIELD( p, uint32_t, BEAST_MODEL ) = model;
+	FIELD( p, uint32_t, CHAR_MODEL_SET ) = model;
+	((void (__thiscall *)( void*, uint32_t )) 0x60F770)( p, model );
+	mp_log( "[MP] Player %d's puppet wears the %s outfit.\n", g_cur->id, OUTFITS[outfit].name );
+	g_cur->shownOutfit = outfit;
+}
+
 static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 {
 	Peer* peer = FindPeer( self );
@@ -3505,8 +3602,10 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 		mp_log( "[MP] Player %d's puppet lost its pickaxe models (Harry died ?) : making new ones.\n", g_cur->id );
 		self->Init();
 		g_cur->lastRequested = -2;
+		g_cur->shownOutfit = -1;   // Init gave it our Harry's outfit.
 		if ( !self->m_pickaxeModel0 || !self->m_pickaxeModel1 ) return;   // Still none : its tick would crash.
 	}
+	ApplyPuppetOutfit( self );
 
 	UpdateLocomotion( self );
 	if ( ForcedClip() && g_haveCamera ) {   // Animation survey, viewer : face the camera.
@@ -3607,6 +3706,11 @@ static void ReadNetConfig( NetConfig* c )
 		}
 	}
 	strcpy_s( g_iniPath, ini );
+	g_myOutfit = GetPrivateProfileIntA( "Appearance", "Outfit", 0, ini );
+	char outfit[8] = { 0, };
+	GetEnvOverride( "PTLE_MP_OUTFIT", outfit, sizeof(outfit) );   // Tests.
+	if ( outfit[0] ) g_myOutfit = atoi( outfit );
+	if ( g_myOutfit < 0 || g_myOutfit >= NUM_OUTFITS ) g_myOutfit = 0;
 	g_showTags = GetPrivateProfileIntA( "Display", "NameTags", 1, ini ) != 0;
 	g_showList = GetPrivateProfileIntA( "Display", "PlayerList", 0, ini ) != 0;
 	GetPrivateProfileStringA( "Network", "Server", "", c->server, sizeof(c->server), ini );
@@ -3665,10 +3769,20 @@ static uint32_t WithAlpha( uint32_t color, float alpha )
 	return (color & 0x00FFFFFF) | ((uint32_t) (((color >> 24) & 0xFF) * alpha + 0.5F) << 24);
 }
 
+// Our outfit : the game's cheat flag for it (and none of the others). Harry changes
+// when the next level loads.
+static void ApplyMyOutfit()
+{
+	for ( int i = 1; i < NUM_OUTFITS; i++ ) *(uint8_t*) OUTFITS[i].cheatFlag = (i == g_myOutfit) ? 1 : 0;
+}
+
 // The menu's settings, kept in the ini (not the autotests' : they leave it alone).
 static void SaveSettings()
 {
 	if ( g_autotest || !g_iniPath[0] ) return;
+	char outfit[16];
+	sprintf_s( outfit, "%d", g_myOutfit );
+	WritePrivateProfileStringA( "Appearance", "Outfit", outfit, g_iniPath );
 	char delay[16];
 	sprintf_s( delay, "%d", DELAY_CHOICES[g_delayIndex] );
 	WritePrivateProfileStringA( "Display", "NameTags", g_showTags ? "1" : "0", g_iniPath );
@@ -3766,6 +3880,19 @@ static void DrawMenu( float sw, float sh, float h )
 	g_menu.Begin( in, sw, sh, h, "Multiplayer", right[0][0] ? right[0] : 0 );
 	if ( g_menu.Page( "Players" ) ) {
 		for ( int r = 0; r < rows; r++ ) g_menu.Info( left[r], r == 0 ? "" : right[r], colors[r] );
+	}
+	if ( g_menu.Page( "Appearance" ) ) {
+		static const char* names[NUM_OUTFITS];
+		for ( int i = 0; i < NUM_OUTFITS; i++ ) names[i] = OUTFITS[i].name;
+		if ( g_menu.Choice( "Outfit", &g_myOutfit, names, NUM_OUTFITS, "What you look like, to you and to the others. Changes the next time you go to another area." ) ) {
+			ApplyMyOutfit();
+			SaveSettings();
+		}
+		if ( g_myOutfit != g_myWornOutfit ) {
+			char now[64];
+			sprintf_s( now, "%s until then", OUTFITS[g_myWornOutfit].name );
+			g_menu.Info( "", now, Menu::DIM );
+		}
 	}
 	if ( g_menu.Page( "Display" ) ) {
 		static const char* const DELAYS[] = { "133 ms", "250 ms", "500 ms", "1 s", "1.5 s", "3 s" };
@@ -4008,6 +4135,7 @@ public:
 		g_netLog = mp_log;
 		NetConfig config;
 		ReadNetConfig( &config );
+		ApplyMyOutfit();   // Before the first level loads.
 		ResetHistory();
 		CleanName( config.name, (int) strlen( config.name ), g_myName );
 		if ( !g_myName[0] ) strcpy_s( g_myName, "Harry" );
@@ -4060,6 +4188,11 @@ public:
 				g_distTest = true;
 				mp_log( "[AT] Distance test.\n" );
 			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_SKINTEST", env, sizeof(env) ) && env[0] == '1' ) {
+				g_skinTest = true;
+				g_showList = false;
+				mp_log( "[AT] Outfit test.\n" );
+			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_MENUTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_menuTest = true;
 				g_showList = false;
@@ -4090,6 +4223,7 @@ public:
 
 	virtual void onLoadLevel( LoadLevelEvent& e )
 	{
+		ApplyMyOutfit();   // The game clears its cheats while it starts : set again before each level loads.
 		SuspectPuppets();
 	}
 
