@@ -34,6 +34,10 @@ public:
 
 	// True if every packet we send also comes back to us (the puppet shows us).
 	virtual bool Echoes() const = 0;
+
+	// Tells the server we leave (the game is closing), so the others drop our
+	// puppet at once. Safe from any thread; only the first call sends.
+	virtual void Leave() {}
 };
 
 // Network conditions to simulate on top of the transport.

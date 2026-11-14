@@ -221,14 +221,96 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 
 static PlayerSnapshot g_local;                 // Static storage keeps Matrix4f 16-byte aligned.
 static bool g_haveLocal = false;
-static RemotePlayer g_remote;                  // The one puppet's player (for now : ourselves, looped back).
-static const PlayerSnapshot* g_target = 0;     // What the puppet shows this tick (see NetUpdate).
+
+// One per player id the relay hands out (its rooms hold 8). Each other player in
+// the room gets their own puppet; with echo (or the loopback), our own id gets one
+// too and replays us.
+class EIEvilHarryP;
+static const int MAX_PEERS = 8;
+struct Peer
+{
+	int id;
+	bool heard;                        // Snapshots are coming in from them.
+	uint32_t lastHeard;
+	RemotePlayer remote;
+	const PlayerSnapshot* target;      // What their puppet shows this tick (see NetUpdate).
+
+	// Their puppet, and where it was spawned : a puppet whose level is gone was
+	// freed with it.
+	EIEvilHarryP* beast;
+	void* world;
+	uint32_t level;
+	uint32_t lastSpawnTry;
+	int forcedState;
+
+	// Locomotion (see UpdateLocomotion).
+	int idleState, runLayer, idleLayer, sprintLayer, airLayer;
+	float velX, velY;                  // Smoothed, units per tick.
+	float moveSpeed;
+	float heading;                     // Direction of travel, atan2( y, x ).
+	bool moving, sprinting;
+	float peakSpeed;                   // Fastest speed of the current move (logged).
+	bool haveLastTarget;
+	Vector3f lastTarget;
+	bool airborne;
+	int airTicks;
+	float airStartZ, prevZ;
+	int mirrorSlot;
+	uint32_t mirrorClip;
+	int lastLoggedState, lastRequested;
+};
+static Peer g_peers[MAX_PEERS];        // Static : big, and 16-byte aligned.
+
+// The peer being ticked or drawn. Between those : the main peer, the one F5, F6, F8
+// and the autotest work on (the first player heard from).
+static Peer* g_cur = &g_peers[0];
+static int g_mainId = -1;
+
+static Peer* MainPeer()
+{
+	return &g_peers[g_mainId >= 0 ? g_mainId : 0];
+}
+
+struct CurrentPeer
+{
+	Peer* saved;
+	explicit CurrentPeer( Peer* p ) : saved( g_cur ) { g_cur = p; }
+	~CurrentPeer() { g_cur = saved; }
+};
+
+static Peer* FindPeer( const void* beast )
+{
+	if ( !beast ) return 0;
+	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].beast == beast ) return &g_peers[i];
+	return 0;
+}
+
+// Hands a puppet (and its locomotion state, everything from "beast" on) to another peer.
+static void MovePuppet( Peer* from, Peer* to )
+{
+	size_t start = (uint8_t*) &from->beast - (uint8_t*) from;
+	memcpy( (uint8_t*) to + start, (uint8_t*) from + start, sizeof(Peer) - start );
+	from->beast = 0;
+}
+
+static void ResetPeer( Peer* p, int id )   // Forgets them (their puppet is left alone).
+{
+	p->id = id;
+	p->heard = false;
+	p->lastHeard = 0;
+	p->remote.Reset();
+	p->target = 0;
+	p->lastSpawnTry = 0;
+	p->forcedState = -1;
+	p->lastLoggedState = p->lastRequested = -2;
+}
 
 static const int DELAY_CHOICES[] = { 133, 250, 500, 1000, 1500, 3000 };   // Playback delay (ms).
 static int g_delayIndex = 1;   // 250 ms (Multiplayer.ini : Delay).
 
 // The network side.
 static Transport* g_transport = 0;
+static void QuitGame( UINT code );   // Leaves the room, then ends the game.
 static bool g_networked = false;               // Through a server (not the loopback).
 static uint32_t g_sendSequence = 0;
 // Snapshots go out at most this often (30 per second : the game runs at 60, the
@@ -236,8 +318,6 @@ static uint32_t g_sendSequence = 0;
 // doesn't skip one.
 static const uint32_t SEND_INTERVAL_MS = 33 - 8;
 static uint32_t g_lastSentTime = 0;
-static int g_remoteId = -1;                    // The player the puppet shows (-1 : none yet).
-static uint32_t g_remoteLastHeard = 0;
 static const uint32_t REMOTE_SILENT_MS = 5000; // Then : forget them.
 static struct NetStats {
 	uint32_t sent, sentBytes, maxBytes, tooBig, badPackets, otherPlayers;
@@ -253,9 +333,9 @@ static PlayerSnapshot* LatestSnapshot()
 static void ResetHistory()
 {
 	g_haveLocal = false;
-	g_remote.Reset();
-	g_remoteId = -1;
-	g_target = 0;
+	for ( int i = 0; i < MAX_PEERS; i++ ) ResetPeer( &g_peers[i], i );
+	g_mainId = -1;
+	g_cur = MainPeer();
 }
 
 // Autotest : how much packing a matrix loses (logs the worst ones).
@@ -302,10 +382,19 @@ static void SendLocalSnapshot()
 static void LogNetStats()
 {
 	const NetStats& n = g_netStats;
-	mp_log( "[NET] Sent %u snapshots (avg %u bytes, max %u, %u too big). Player %d : received %u, lost %u, late %u, reordered %u. Bad %u, from others %u. Ping %d ms. Max packing error %.4f. Playback : blended %u, held %u (delay %d ms).\n",
-		n.sent, n.sent ? n.sentBytes / n.sent : 0, n.maxBytes, n.tooBig, g_remoteId,
-		g_remote.received, g_remote.Lost(), g_remote.late, g_remote.reordered, n.badPackets, n.otherPlayers,
-		g_transport ? g_transport->RoundTripMs() : -1, n.maxPackingError, g_remote.blended, g_remote.held, DELAY_CHOICES[g_delayIndex] );
+	int shown = 0;
+	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].heard ) shown++;
+	mp_log( "[NET] Sent %u snapshots (avg %u bytes, max %u, %u too big). Bad %u. Ping %d ms. Max packing error %.4f. Delay %d ms. %d player(s) :\n",
+		n.sent, n.sent ? n.sentBytes / n.sent : 0, n.maxBytes, n.tooBig, n.badPackets,
+		g_transport ? g_transport->RoundTripMs() : -1, n.maxPackingError, DELAY_CHOICES[g_delayIndex], shown );
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		const Peer& p = g_peers[i];
+		if ( !p.heard ) continue;
+		const RemotePlayer& r = p.remote;
+		mp_log( "[NET]   Player %d : received %u, lost %u, late %u, reordered %u. Playback : blended %u, held %u. Puppet %s.\n",
+			p.id, r.received, r.Lost(), r.late, r.reordered, r.blended, r.held,
+			p.beast ? "shown" : p.target ? "not spawned" : "not here" );
+	}
 }
 
 // Takes in what arrived and picks what the puppet shows this tick.
@@ -322,33 +411,43 @@ static void NetUpdate()
 	while ( (length = g_transport->Receive( packet, sizeof(packet) )) > 0 ) {
 		PacketHeader h;
 		if ( !DecodeHeader( packet, length, &h ) ) { g_netStats.badPackets++; continue; }
+		if ( h.player >= MAX_PEERS ) { g_netStats.badPackets++; continue; }
+		Peer* peer = &g_peers[h.player];
 		if ( h.type == PACKET_LEAVE ) {
-			if ( h.player == g_remoteId ) {
-				mp_log( "[NET] Player %d left.\n", g_remoteId );
-				g_remote.Reset();
-				g_remoteId = -1;
+			if ( peer->heard ) {
+				mp_log( "[NET] Player %d left.\n", h.player );
+				ResetPeer( peer, h.player );   // Their puppet stays hidden (no target).
 			}
 			continue;
 		}
 		if ( h.type != PACKET_SNAPSHOT ) continue;
 		if ( h.player == me && !echo ) continue;   // Ourselves.
-		if ( g_remoteId < 0 ) {
-			g_remoteId = h.player;
-			mp_log( "[NET] Showing player %d.\n", g_remoteId );
-		}
-		else if ( h.player != g_remoteId ) { g_netStats.otherPlayers++; continue; }   // One other player for now.
 		if ( !DecodeSnapshot( packet, length, &incoming ) ) { g_netStats.badPackets++; continue; }
-		g_remote.Add( incoming, h.sequence );
-		g_remoteLastHeard = now;
+		if ( !peer->heard ) {
+			peer->heard = true;
+			mp_log( "[NET] Showing player %d.\n", h.player );
+			if ( g_mainId < 0 ) {
+				// A puppet spawned before anyone was heard from (F5, the autotest) is
+				// peer 0's : it now shows this player.
+				Peer* first = &g_peers[0];
+				if ( h.player != 0 && first->beast && !first->heard && !peer->beast ) MovePuppet( first, peer );
+				g_mainId = h.player;
+				g_cur = MainPeer();
+			}
+		}
+		peer->remote.Add( incoming, h.sequence );
+		peer->lastHeard = now;
 	}
-	if ( g_remoteId >= 0 && now - g_remoteLastHeard > REMOTE_SILENT_MS ) {
-		mp_log( "[NET] Nothing from player %d for %u s : forgetting them.\n", g_remoteId, REMOTE_SILENT_MS / 1000 );
-		g_remote.Reset();
-		g_remoteId = -1;
+	uint32_t level = Gizmod::getCurrentLevelCRC();
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		Peer* peer = &g_peers[i];
+		if ( peer->heard && now - peer->lastHeard > REMOTE_SILENT_MS ) {
+			mp_log( "[NET] Nothing from player %d for %u s : forgetting them.\n", i, REMOTE_SILENT_MS / 1000 );
+			ResetPeer( peer, i );
+		}
+		peer->target = peer->remote.Update( now, DELAY_CHOICES[g_delayIndex] );
+		if ( peer->target && peer->target->level != level ) peer->target = 0;   // Another level : not shown.
 	}
-
-	g_target = g_remote.Update( now, DELAY_CHOICES[g_delayIndex] );
-	if ( g_target && g_target->level != Gizmod::getCurrentLevelCRC() ) g_target = 0;   // Another level : not shown.
 
 	static uint32_t lastStats = now;
 	if ( now - lastStats >= 10000 ) {
@@ -511,7 +610,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 static const PlayerSnapshot* GetPuppetTarget()
 {
-	return g_target;
+	return g_cur->target;
 }
 
 
@@ -519,11 +618,6 @@ static const PlayerSnapshot* GetPuppetTarget()
 // --------------------------------------------------------------------------------
 // Puppet.
 // --------------------------------------------------------------------------------
-static EIEvilHarryP* g_puppet = 0;
-// Where it was spawned : a puppet whose level is gone was freed with it.
-static void*    g_puppetWorld = 0;
-static uint32_t g_puppetLevel = 0;
-static int g_forcedState = -1;
 
 // Index of a state by its short name ("idle left" matches "evil harry.idle left").
 static int FindStateIndex( EIBeast* beast, const char* shortName )
@@ -558,8 +652,8 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry );
 
 static void SpawnPuppet( EIHarry* harry )
 {
-	if ( g_puppet ) {
-		mp_log( "[MP] Puppet already spawned in this level.\n" );
+	if ( g_cur->beast ) {
+		mp_log( "[MP] Player %d's puppet already spawned in this level.\n", g_cur->id );
 		return;
 	}
 	if ( !harry->m_world ) {
@@ -601,14 +695,18 @@ static void SpawnPuppet( EIHarry* harry )
 	p->Init();
 	p->m_beastTypeName = GAME_EMPTY_STRING;
 
-	g_puppet = p;
-	g_puppetWorld = harry->m_world;
-	g_puppetLevel = Gizmod::getCurrentLevelCRC();
+	g_cur->beast = p;
+	g_cur->world = harry->m_world;
+	g_cur->level = Gizmod::getCurrentLevelCRC();
+	g_cur->lastLoggedState = g_cur->lastRequested = -2;
+	int count = 0;
+	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].beast ) count++;
+	mp_log( "[MP] Player %d's puppet spawned (%d puppet(s) in this level).\n", g_cur->id, count );
 
 	// Its default state (21, "get ready for boss fight") draws it as a black
 	// silhouette. Start calm and lit instead.
-	g_forcedState = FindStateIndex( p, "idle left" );
-	mp_log( "[MP] Puppet starts in state %d (idle left).\n", g_forcedState );
+	g_cur->forcedState = FindStateIndex( p, "idle left" );
+	mp_log( "[MP] Puppet starts in state %d (idle left).\n", g_cur->forcedState );
 	InitLocomotion( p, harry );
 
 	mp_log( "[MP] Puppet spawned at 0x%.8X (m_beastTypeName offset 0x%X, expected 0x%X).\n",
@@ -618,6 +716,7 @@ static void SpawnPuppet( EIHarry* harry )
 		(unsigned) offsetof(EICharacter, m_position), (unsigned) offsetof(EICharacter, m_transformMatrix),
 		(unsigned) offsetof(EIBeast, m_position), (unsigned) offsetof(EIBeast, m_rotation) );
 
+	if ( count > 1 ) return;
 	// Raw dump of the transform-related area, before we touch anything.
 	const uint32_t ranges[][2] = { { 0x120, 0x1B0 }, { 0x2F0, 0x350 } };
 	for ( int r = 0; r < 2; r++ ) {
@@ -633,10 +732,12 @@ static void SpawnPuppet( EIHarry* harry )
 // gone by now : don't touch it).
 static void ForgetPuppet()
 {
-	if ( g_puppet ) {
-		mp_log( "[MP] New level, the puppet went with the old one.\n" );
+	int count = 0;
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		if ( g_peers[i].beast ) count++;
+		g_peers[i].beast = 0;
 	}
-	g_puppet = 0;
+	if ( count ) mp_log( "[MP] New level, %d puppet(s) went with the old one.\n", count );
 	ResetHistory();
 }
 
@@ -693,22 +794,7 @@ static const uint32_t BEAST_PREV_POS    = 0x370;   // Vector3f.
 static const float MP_PI = 3.14159265F;
 
 static bool  g_autoLocomotion = true;   // F6 switches to hand-forced states.
-static int   g_idleState = -1;
-static int   g_runLayer = -1;                // Animation layers (see below).
-static int   g_idleLayer = -1;
-static int   g_sprintLayer = -1;
-static float g_velX = 0.0F, g_velY = 0.0F;   // Smoothed, units per tick.
-static float g_moveSpeed = 0.0F;
-static float g_heading = 0.0F;               // Direction of travel, atan2( y, x ).
-static bool  g_moving = false;
-static bool  g_sprinting = false;
-static float g_peakSpeed = 0.0F;             // Fastest speed of the current move (logged).
-static bool  g_haveLastTarget = false;
-static Vector3f g_lastTarget;
-static int   g_airLayer = -1;
-static bool  g_airborne = false;
-static int   g_airTicks = 0;
-static float g_airStartZ = 0.0F;
+// The rest of the locomotion state is per puppet (Peer).
 static const int AIRBORNE_MIN_TICKS = 6;   // Slopes and bumps blip for up to ~5 ticks.
 static const float JUMP_RISE_SPEED  = 0.10F;   // Units per tick upward while off the ground.
 
@@ -725,13 +811,13 @@ static float g_forwardLocalAngle = -MP_PI / 2.0F;
 
 static void ResetLocomotion()
 {
-	g_velX = g_velY = g_moveSpeed = 0.0F;
-	g_moving = false;
-	g_sprinting = false;
-	g_peakSpeed = 0.0F;
-	g_airborne = false;
-	g_airTicks = 0;
-	g_haveLastTarget = false;
+	g_cur->velX = g_cur->velY = g_cur->moveSpeed = 0.0F;
+	g_cur->moving = false;
+	g_cur->sprinting = false;
+	g_cur->peakSpeed = 0.0F;
+	g_cur->airborne = false;
+	g_cur->airTicks = 0;
+	g_cur->haveLastTarget = false;
 }
 
 static void UpdateLocomotion( EIEvilHarryP* p )
@@ -739,73 +825,72 @@ static void UpdateLocomotion( EIEvilHarryP* p )
 	Vector3f pos;
 	if ( !GetPuppetTargetPosition( &pos ) ) return;
 
-	if ( g_haveLastTarget ) {
-		float dx = pos.x - g_lastTarget.x;
-		float dy = pos.y - g_lastTarget.y;
+	if ( g_cur->haveLastTarget ) {
+		float dx = pos.x - g_cur->lastTarget.x;
+		float dy = pos.y - g_cur->lastTarget.y;
 		if ( dx * dx + dy * dy > TELEPORT_DIST * TELEPORT_DIST ) dx = dy = 0.0F;
 
-		g_velX = g_velX * 0.75F + dx * 0.25F;
-		g_velY = g_velY * 0.75F + dy * 0.25F;
-		g_moveSpeed = sqrtf( g_velX * g_velX + g_velY * g_velY );
-		if ( g_moveSpeed > 0.01F ) g_heading = atan2f( g_velY, g_velX );
+		g_cur->velX = g_cur->velX * 0.75F + dx * 0.25F;
+		g_cur->velY = g_cur->velY * 0.75F + dy * 0.25F;
+		g_cur->moveSpeed = sqrtf( g_cur->velX * g_cur->velX + g_cur->velY * g_cur->velY );
+		if ( g_cur->moveSpeed > 0.01F ) g_cur->heading = atan2f( g_cur->velY, g_cur->velX );
 	}
 	if ( g_puppetStaysHere ) {
 		// Not moving : face where Harry faced. His transform's row 1 points opposite
 		// to where he walks (see InitLocomotion).
 		const PlayerSnapshot* f = GetPuppetTarget();
-		if ( f ) g_heading = atan2f( -f->transform.data[1][1], -f->transform.data[1][0] );
+		if ( f ) g_cur->heading = atan2f( -f->transform.data[1][1], -f->transform.data[1][0] );
 	}
-	g_lastTarget = pos;
-	g_haveLastTarget = true;
+	g_cur->lastTarget = pos;
+	g_cur->haveLastTarget = true;
 
-	bool wasMoving = g_moving;
-	if ( g_moving && g_moveSpeed < RUN_STOP_SPEED ) g_moving = false;
-	else if ( !g_moving && g_moveSpeed > RUN_START_SPEED ) g_moving = true;
-	if ( g_moving != wasMoving ) {
-		if ( g_moving ) {
-			mp_log( "[MP] Puppet starts moving (speed %.3f/tick, heading %.0f deg).\n", g_moveSpeed, g_heading * 180.0F / MP_PI );
-			g_peakSpeed = 0.0F;
+	bool wasMoving = g_cur->moving;
+	if ( g_cur->moving && g_cur->moveSpeed < RUN_STOP_SPEED ) g_cur->moving = false;
+	else if ( !g_cur->moving && g_cur->moveSpeed > RUN_START_SPEED ) g_cur->moving = true;
+	if ( g_cur->moving != wasMoving ) {
+		if ( g_cur->moving ) {
+			mp_log( "[MP] Puppet %d starts moving (speed %.3f/tick, heading %.0f deg).\n", g_cur->id, g_cur->moveSpeed,g_cur->heading * 180.0F / MP_PI );
+			g_cur->peakSpeed = 0.0F;
 		}
 		else {
-			mp_log( "[MP] Puppet stops (top speed %.3f/tick).\n", g_peakSpeed );
+			mp_log( "[MP] Puppet %d stops (top speed %.3f/tick).\n", g_cur->id, g_cur->peakSpeed );
 		}
 	}
-	if ( g_moving && g_moveSpeed > g_peakSpeed ) g_peakSpeed = g_moveSpeed;
+	if ( g_cur->moving && g_cur->moveSpeed > g_cur->peakSpeed ) g_cur->peakSpeed = g_cur->moveSpeed;
 
 	// Airborne : the replayed player has been off the ground for a few ticks
 	// (ignores one-tick blips on bumps and slopes). Landing is immediate.
 	const PlayerSnapshot* t = GetPuppetTarget();
-	bool wasAirborne = g_airborne;
-	g_airTicks = (t && !t->onGround) ? g_airTicks + 1 : 0;
+	bool wasAirborne = g_cur->airborne;
+	g_cur->airTicks = (t && !t->onGround) ? g_cur->airTicks + 1 : 0;
 	// A real jump rises fast from its first tick (~0.25/tick) : switch at once then,
 	// instead of waiting AIRBORNE_MIN_TICKS (which lands near the top of the jump).
-	static float prevZ = 0.0F;
-	float dz = pos.z - prevZ;
-	prevZ = pos.z;
-	if ( g_airTicks == 0 ) g_airborne = false;
-	else if ( g_airTicks >= AIRBORNE_MIN_TICKS || dz > JUMP_RISE_SPEED ) g_airborne = true;
-	if ( g_airborne != wasAirborne ) {
-		if ( g_airborne ) {
-			g_airStartZ = pos.z;
+	float dz = pos.z - g_cur->prevZ;
+	g_cur->prevZ = pos.z;
+	if ( g_cur->airTicks == 0 ) g_cur->airborne = false;
+	else if ( g_cur->airTicks >= AIRBORNE_MIN_TICKS || dz > JUMP_RISE_SPEED ) g_cur->airborne = true;
+	if ( g_cur->airborne != wasAirborne ) {
+		if ( g_cur->airborne ) {
+			g_cur->airStartZ = pos.z;
 			mp_log( "[MP] Puppet leaves the ground (z %.2f).\n", pos.z );
 		}
 		else {
-			mp_log( "[MP] Puppet lands (z %.2f, %.2f from take-off).\n", pos.z, pos.z - g_airStartZ );
+			mp_log( "[MP] Puppet lands (z %.2f, %.2f from take-off).\n", pos.z, pos.z - g_cur->airStartZ );
 		}
 	}
 
-	bool wasSprinting = g_sprinting;
-	if ( !g_moving || (g_sprinting && g_moveSpeed < SPRINT_STOP_SPEED) ) g_sprinting = false;
-	else if ( !g_sprinting && g_moveSpeed > SPRINT_START_SPEED ) g_sprinting = true;
-	if ( g_sprinting != wasSprinting && g_moving ) {
-		mp_log( "[MP] Puppet %s (speed %.3f/tick).\n", g_sprinting ? "sprints" : "back to running", g_moveSpeed );
+	bool wasSprinting = g_cur->sprinting;
+	if ( !g_cur->moving || (g_cur->sprinting && g_cur->moveSpeed < SPRINT_STOP_SPEED) ) g_cur->sprinting = false;
+	else if ( !g_cur->sprinting && g_cur->moveSpeed > SPRINT_START_SPEED ) g_cur->sprinting = true;
+	if ( g_cur->sprinting != wasSprinting && g_cur->moving ) {
+		mp_log( "[MP] Puppet %s (speed %.3f/tick).\n", g_cur->sprinting ? "sprints" : "back to running", g_cur->moveSpeed );
 	}
 
 	// The state machine always stays in a calm idle state : forcing boss-fight
 	// states like "runner" crashes (they expect setup we don't do). Running is
 	// done by switching animation layers instead (ApplyLocomotionAnim).
 	if ( g_autoLocomotion ) {
-		g_forcedState = g_idleState;
+		g_cur->forcedState = g_cur->idleState;
 	}
 }
 
@@ -849,8 +934,6 @@ static void PlayAnimLayer( EIEvilHarryP* p, int layer )
 // turns so the old clip can fade out while the new one fades in.
 static bool g_mirrorClips = true;
 static const int MIRROR_LAYERS[2] = { 200, 201 };
-static int g_mirrorSlot = 0;
-static uint32_t g_mirrorClip = 0;
 
 static bool ApplyMirroredClip( EIEvilHarryP* p )
 {
@@ -858,14 +941,14 @@ static bool ApplyMirroredClip( EIEvilHarryP* p )
 	if ( !g_mirrorClips || !t || !t->clipCRC ) return false;
 
 	int current = FIELD( p, int, BEAST_CUR_LAYER );
-	if ( t->clipCRC == g_mirrorClip && current == MIRROR_LAYERS[g_mirrorSlot] ) return true;
+	if ( t->clipCRC == g_cur->mirrorClip && current == MIRROR_LAYERS[g_cur->mirrorSlot] ) return true;
 
 	EAnimController* ctrl = &FIELD( p, EAnimController, BEAST_ANIMCTRL );
-	int next = (current == MIRROR_LAYERS[g_mirrorSlot]) ? 1 - g_mirrorSlot : g_mirrorSlot;
+	int next = (current == MIRROR_LAYERS[g_cur->mirrorSlot]) ? 1 - g_cur->mirrorSlot : g_cur->mirrorSlot;
 	AnimCtrl_SetClip( ctrl, MIRROR_LAYERS[next], t->clipCRC );
 	PlayAnimLayer( p, MIRROR_LAYERS[next] );
-	g_mirrorSlot = next;
-	g_mirrorClip = t->clipCRC;
+	g_cur->mirrorSlot = next;
+	g_cur->mirrorClip = t->clipCRC;
 	return true;
 }
 
@@ -874,14 +957,14 @@ static void ApplyLocomotionAnim( EIEvilHarryP* p )
 	static int overridden = 0;
 	if ( ApplyMirroredClip( p ) ) return;
 
-	int wanted = g_idleLayer;
-	if ( g_airborne && g_airLayer >= 0 ) wanted = g_airLayer;
-	else if ( g_moving ) wanted = (g_sprinting && g_sprintLayer >= 0) ? g_sprintLayer : g_runLayer;
+	int wanted = g_cur->idleLayer;
+	if ( g_cur->airborne && g_cur->airLayer >= 0 ) wanted = g_cur->airLayer;
+	else if ( g_cur->moving ) wanted = (g_cur->sprinting && g_cur->sprintLayer >= 0) ? g_cur->sprintLayer : g_cur->runLayer;
 	int current = FIELD( p, int, BEAST_CUR_LAYER );
 	if ( wanted < 0 || wanted == current ) return;
 
 	// The idle state may re-play its own animation; count it to spot fights.
-	if ( (current == g_idleLayer || current == g_runLayer || current == g_sprintLayer || current == g_airLayer) == false ) {
+	if ( (current == g_cur->idleLayer || current == g_cur->runLayer || current == g_cur->sprintLayer || current == g_cur->airLayer) == false ) {
 		if ( ++overridden <= 5 ) mp_log( "[MP] Puppet anim layer was %d, playing %d.\n", current, wanted );
 	}
 	PlayAnimLayer( p, wanted );
@@ -891,12 +974,12 @@ static void SetRunAnimation( EIEvilHarryP* p, const char* stateName )
 {
 	if ( !stateName ) {
 		int base = FIELD( p, int, BEAST_LOCO_BASE );
-		g_runLayer = FIELD( p, uint32_t, BEAST_ANIM_MOVE ) ? base : -1;
-		mp_log( "[MP] Run animation : quickdata move anim, layer %d.\n", g_runLayer );
+		g_cur->runLayer = FIELD( p, uint32_t, BEAST_ANIM_MOVE ) ? base : -1;
+		mp_log( "[MP] Run animation : quickdata move anim, layer %d.\n", g_cur->runLayer );
 	}
 	else {
-		g_runLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
-		mp_log( "[MP] Run animation : \"%s\" state's anim, layer %d.\n", stateName, g_runLayer );
+		g_cur->runLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+		mp_log( "[MP] Run animation : \"%s\" state's anim, layer %d.\n", stateName, g_cur->runLayer );
 	}
 }
 
@@ -906,47 +989,47 @@ static void SetIdleAnimation( EIEvilHarryP* p, const char* stateName )
 {
 	if ( !stateName ) {
 		int base = FIELD( p, int, BEAST_LOCO_BASE );
-		g_idleLayer = FIELD( p, uint32_t, BEAST_ANIM_IDLE ) ? base + 1 : -1;
-		mp_log( "[MP] Idle animation : quickdata idle anim, layer %d.\n", g_idleLayer );
+		g_cur->idleLayer = FIELD( p, uint32_t, BEAST_ANIM_IDLE ) ? base + 1 : -1;
+		mp_log( "[MP] Idle animation : quickdata idle anim, layer %d.\n", g_cur->idleLayer );
 	}
 	else {
-		g_idleLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
-		mp_log( "[MP] Idle animation : \"%s\" state's anim, layer %d.\n", stateName, g_idleLayer );
+		g_cur->idleLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+		mp_log( "[MP] Idle animation : \"%s\" state's anim, layer %d.\n", stateName, g_cur->idleLayer );
 	}
 }
 
 static void SetAirAnimation( EIEvilHarryP* p, const char* stateName )
 {
-	g_airLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
-	mp_log( "[MP] Air animation : \"%s\" state's anim, layer %d.\n", stateName, g_airLayer );
+	g_cur->airLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+	mp_log( "[MP] Air animation : \"%s\" state's anim, layer %d.\n", stateName, g_cur->airLayer );
 }
 
 static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 {
 	ResetLocomotion();
 	g_autoLocomotion = true;
-	g_mirrorClip = 0;
-	g_mirrorSlot = 0;
-	g_idleState = FindStateIndex( p, "idle left" );
-	g_idleLayer = GetStateAnimLayer( p, g_idleState );
+	g_cur->mirrorClip = 0;
+	g_cur->mirrorSlot = 0;
+	g_cur->idleState = FindStateIndex( p, "idle left" );
+	g_cur->idleLayer = GetStateAnimLayer( p, g_cur->idleState );
 
 	mp_log( "[MP] Beast anims : move CRC 0x%.8X, idle CRC 0x%.8X, locomotion base layer %d, current layer %d, idle layer %d, runner layer %d.\n",
 		FIELD( p, uint32_t, BEAST_ANIM_MOVE ), FIELD( p, uint32_t, BEAST_ANIM_IDLE ),
 		FIELD( p, int, BEAST_LOCO_BASE ), FIELD( p, int, BEAST_CUR_LAYER ),
-		g_idleLayer, GetStateAnimLayer( p, FindStateIndex( p, "runner" ) ) );
+		g_cur->idleLayer, GetStateAnimLayer( p, FindStateIndex( p, "runner" ) ) );
 
 	SetIdleAnimation( p, 0 );
-	if ( g_idleLayer < 0 ) g_idleLayer = GetStateAnimLayer( p, g_idleState );
+	if ( g_cur->idleLayer < 0 ) g_cur->idleLayer = GetStateAnimLayer( p, g_cur->idleState );
 
 	// The quickdata move animation if the beast has one (Evil Harry doesn't), else
 	// the "chase player" state's : the most natural upright run of the candidates
 	// ("runner" is hunched, "superrun" is a dive).
 	SetRunAnimation( p, 0 );
-	if ( g_runLayer < 0 ) SetRunAnimation( p, "chase player" );
+	if ( g_cur->runLayer < 0 ) SetRunAnimation( p, "chase player" );
 
 	// Above sprint speed : the "superrun to spot to ice pick" state's clip.
-	g_sprintLayer = GetStateAnimLayer( p, FindStateIndex( p, "superrun to spot to ice pick" ) );
-	mp_log( "[MP] Sprint animation : layer %d (above %.2f/tick).\n", g_sprintLayer, SPRINT_START_SPEED );
+	g_cur->sprintLayer = GetStateAnimLayer( p, FindStateIndex( p, "superrun to spot to ice pick" ) );
+	mp_log( "[MP] Sprint animation : layer %d (above %.2f/tick).\n", g_cur->sprintLayer, SPRINT_START_SPEED );
 
 	// In the air (jumping, falling) : the "falling" state's clip.
 	SetAirAnimation( p, "falling" );
@@ -954,11 +1037,11 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 	// Face where Harry faces. Walking showed his rigid body's row 1 (local +Y)
 	// points where he moves; m_transformMatrix is turned 180 degrees from that.
 	const Matrix4f& m = harry->m_rigidBodyMatrix;
-	g_heading = atan2f( m.data[1][1], m.data[1][0] );
-	mp_log( "[MP] Locomotion : idle state %d, heading %.0f deg.\n", g_idleState, g_heading * 180.0F / MP_PI );
+	g_cur->heading = atan2f( m.data[1][1], m.data[1][0] );
+	mp_log( "[MP] Locomotion : idle state %d, heading %.0f deg.\n", g_cur->idleState, g_cur->heading * 180.0F / MP_PI );
 }
 
-// Writes the beast's world transform : facing g_heading, at the target position.
+// Writes the beast's world transform : facing g_cur->heading, at the target position.
 // Rolling as a ball : Harry's display matrix (m_transformMatrix) is raised 1.2
 // above his position and spins about his side axis, while his position and
 // rigid-body matrix stay upright. Detected by that raise.
@@ -980,7 +1063,7 @@ static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSna
 		world.data[3][2] = pos.z + (t->transform.data[3][2] - t->position.z);
 		return;
 	}
-	float a = g_heading - g_forwardLocalAngle;
+	float a = g_cur->heading - g_forwardLocalAngle;
 	float c = cosf( a ), s = sinf( a );
 	world.data[0][0] =  c;   world.data[0][1] = s;     world.data[0][2] = 0.0F;  world.data[0][3] = 0.0F;
 	world.data[1][0] = -s;   world.data[1][1] = c;     world.data[1][2] = 0.0F;  world.data[1][3] = 0.0F;
@@ -1199,10 +1282,19 @@ static void DrawItemAt( int slot, const PlayerSnapshot* t, const Matrix4f& base,
 // Draws the item the puppet's snapshot says Harry drew, if it is "slot".
 static void DrawPuppetItem( int slot, void* context, void* arg )
 {
-	if ( !g_puppet ) return;
+	if ( !g_cur->beast ) return;
 	const PlayerSnapshot* t = GetPuppetTarget();
 	if ( !t || t->drawnSlot != slot ) return;
-	DrawItemAt( slot, t, g_puppet->m_transformMatrix, context, arg );
+	DrawItemAt( slot, t, g_cur->beast->m_transformMatrix, context, arg );
+}
+
+static void DrawPuppetRafts( int slot, void* context, void* arg )
+{
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		if ( !g_peers[i].beast ) continue;
+		CurrentPeer current( &g_peers[i] );
+		DrawPuppetItem( slot, context, arg );
+	}
 }
 
 // The raft's copy is drawn right after Harry's raft (drawing it from the puppet's
@@ -1213,7 +1305,7 @@ static void DrawPuppetItem( int slot, void* context, void* arg )
 	{ \
 		g_origItemDraw[n]( item, context, arg ); \
 		NoteHarryItemDraw( n, item ); \
-		if ( DRAWN_ITEMS[n].item == ITEM_RAFT ) DrawPuppetItem( n, context, arg ); \
+		if ( DRAWN_ITEMS[n].item == ITEM_RAFT ) DrawPuppetRafts( n, context, arg ); \
 	}
 ITEM_DRAW_HOOK( 0 )
 ITEM_DRAW_HOOK( 1 )
@@ -1232,12 +1324,15 @@ static_assert( sizeof(ITEM_DRAW_HOOKS) / sizeof(ITEM_DRAW_HOOKS[0]) == NUM_DRAWN
 
 static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* context, void* arg )
 {
-	const PlayerSnapshot* t = self == g_puppet ? GetPuppetTarget() : 0;
+	Peer* peer = FindPeer( self );
+	if ( !peer ) { g_origEvilHarryRender( self, context, arg ); return; }   // The game's own Evil Harry.
+	CurrentPeer current( peer );
+	const PlayerSnapshot* t = GetPuppetTarget();
 	// Online with nobody to show here (they left, or are in another level) : not drawn.
-	if ( self == g_puppet && g_networked && !t ) return;
+	if ( g_networked && !t ) return;
 	if ( t ) ApplyPuppetPose( self, t );
 	g_origEvilHarryRender( self, context, arg );
-	if ( t && g_puppet && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
+	if ( t && t->drawnSlot >= 0 && DRAWN_ITEMS[t->drawnSlot].item != ITEM_RAFT ) DrawPuppetItem( t->drawnSlot, context, arg );
 }
 
 static void InstallItemDrawHooks()
@@ -1339,34 +1434,34 @@ static void HandleHotkeys( EIHarry* harry )
 	bool f8 = InterlockedExchange( &g_reqStay, 0 ) != 0;
 
 	// The puppet went with the last level : F8's "stay here" goes too.
-	if ( !g_puppet && g_puppetStaysHere ) g_puppetPinned = g_puppetStaysHere = false;
+	if ( !g_cur->beast && g_puppetStaysHere ) g_puppetPinned = g_puppetStaysHere = false;
 
 	if ( f5 ) {
 		SpawnPuppet( harry );
 	}
 
-	if ( f6 && g_puppet ) {
+	if ( f6 && g_cur->beast ) {
 		// Only calm-looking states : forcing arbitrary ones (e.g. state 0) crashes,
 		// they expect context set up by the boss fight.
 		static const char* const CANDIDATES[] = { "idle left", "idle right", "rest left", "rest right" };
 		static const int NUM_CANDIDATES = sizeof(CANDIDATES) / sizeof(CANDIDATES[0]);
 		static int choice = -1;   // -1 = automatic (idle / run from movement).
 
-		EBeastStateMachine* sm = g_puppet->GetStateMachine();
+		EBeastStateMachine* sm = g_cur->beast->GetStateMachine();
 		choice++;
 		if ( choice >= NUM_CANDIDATES ) choice = -1;
 
 		g_autoLocomotion = (choice < 0);
-		g_forcedState = (choice >= 0) ? FindStateIndex( g_puppet, CANDIDATES[choice] ) : g_idleState;
+		g_cur->forcedState = (choice >= 0) ? FindStateIndex( g_cur->beast, CANDIDATES[choice] ) : g_cur->idleState;
 
 		if ( choice < 0 ) {
 			mp_log( "[MP] Puppet animation : automatic (idle / run).\n" );
 		}
-		else if ( g_forcedState < 0 ) {
+		else if ( g_cur->forcedState < 0 ) {
 			mp_log( "[MP] Puppet state \"%s\" not found.\n", CANDIDATES[choice] );
 		}
 		else {
-			mp_log( "[MP] Puppet forced state : %d (%s)\n", g_forcedState, sm->m_states[g_forcedState].m_name );
+			mp_log( "[MP] Puppet forced state : %d (%s)\n", g_cur->forcedState, sm->m_states[g_cur->forcedState].m_name );
 		}
 	}
 
@@ -1380,9 +1475,9 @@ static void HandleHotkeys( EIHarry* harry )
 	if ( f8 ) {
 		if ( !g_puppetStaysHere ) {
 			Vector3f here = harry->m_position;
-			if ( !g_puppet ) SpawnPuppet( harry );
-			else here = g_puppet->EIBeast::m_position;
-			if ( g_puppet ) {
+			if ( !g_cur->beast ) SpawnPuppet( harry );
+			else here = g_cur->beast->EIBeast::m_position;
+			if ( g_cur->beast ) {
 				g_puppetPin = here;
 				g_puppetPinned = g_puppetStaysHere = true;
 				mp_log( "[MP] Evil Harry stays at (%.1f, %.1f, %.1f) and copies Harry there.\n", here.x, here.y, here.z );
@@ -1756,7 +1851,7 @@ static DWORD WINAPI AutotestThread( void* )
 	while ( !(wnd = *((HWND*) HWND_GAME_WINDOW)) || (g_background && !IsWindowVisible( wnd )) ) {
 		if ( GetTickCount() - start > 60000 ) {
 			mp_log( "[AT] FAIL : game window never appeared.\n" );
-			ExitProcess( 2 );
+			QuitGame( 2 );
 		}
 		Sleep( 200 );
 	}
@@ -1773,7 +1868,7 @@ static DWORD WINAPI AutotestThread( void* )
 		if ( GetTickCount() - start > AUTOTEST_MENU_TIMEOUT_MS ) {
 			TakeSnapshot( "fail_menu_timeout" );
 			mp_log( "[AT] FAIL : never reached gameplay after %d Enter presses.\n", presses );
-			ExitProcess( 2 );
+			QuitGame( 2 );
 		}
 		if ( presses % 2 == 0 ) {
 			char name[32];
@@ -1809,7 +1904,7 @@ static DWORD WINAPI AutotestThread( void* )
 		if ( attempt >= 5 ) {
 			TakeSnapshot( "fail_not_settled" );
 			mp_log( "[AT] FAIL : game still not running freely.\n" );
-			ExitProcess( 2 );
+			QuitGame( 2 );
 		}
 		char name[32];
 		sprintf_s( name, "settle_stalled_%d", attempt );
@@ -1866,7 +1961,7 @@ static DWORD WINAPI AutotestThread( void* )
 		if ( GetTickCount() - start > AUTOTEST_TOTAL_TIMEOUT_MS ) {
 			TakeSnapshot( "fail_total_timeout" );
 			mp_log( "[AT] FAIL : test script timed out.\n" );
-			ExitProcess( 2 );
+			QuitGame( 2 );
 		}
 		if ( InterlockedExchange( &g_snapPending, 0 ) ) {
 			TakeSnapshot( g_snapName );
@@ -1879,24 +1974,24 @@ static DWORD WINAPI AutotestThread( void* )
 	LogNetStats();
 	mp_log( "[AT] %s\n", g_autotestDone == 1 ? "RESULT : PASS" : "RESULT : FAIL" );
 	Sleep( 300 );
-	ExitProcess( g_autotestDone == 1 ? 0 : 2 );
+	QuitGame( g_autotestDone == 1 ? 0 : 2 );
 	return 0;
 }
 
 static void LogTelemetry( EIHarry* harry, const char* tag )
 {
-	if ( g_puppet ) {
-		const Matrix4f& w = FIELD( g_puppet, Matrix4f, BEAST_WORLD );
+	if ( g_cur->beast ) {
+		const Matrix4f& w = FIELD( g_cur->beast, Matrix4f, BEAST_WORLD );
 		mp_log( "[AT] %s beast world (%.1f, %.1f, %.1f), anim layer %d, moving %d, speed %.3f, heading %.0f\n", tag,
-			w.data[3][0], w.data[3][1], w.data[3][2], FIELD( g_puppet, int, BEAST_CUR_LAYER ),
-			(int) g_moving, g_moveSpeed, g_heading * 180.0F / MP_PI );
-		const Vector3f& r = FIELD( g_puppet, Vector3f, BEAST_SCALE );
+			w.data[3][0], w.data[3][1], w.data[3][2], FIELD( g_cur->beast, int, BEAST_CUR_LAYER ),
+			(int) g_cur->moving, g_cur->moveSpeed, g_cur->heading * 180.0F / MP_PI );
+		const Vector3f& r = FIELD( g_cur->beast, Vector3f, BEAST_SCALE );
 		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f) puppet (%.1f, %.1f, %.1f) scale (%.2f, %.2f, %.2f) matrix (%.1f, %.1f, %.1f) state %d\n", tag,
 			harry->m_position.x, harry->m_position.y, harry->m_position.z,
-			g_puppet->EICharacter::m_position.x, g_puppet->EICharacter::m_position.y, g_puppet->EICharacter::m_position.z,
+			g_cur->beast->EICharacter::m_position.x, g_cur->beast->EICharacter::m_position.y, g_cur->beast->EICharacter::m_position.z,
 			r.x, r.y, r.z,
-			g_puppet->m_transformMatrix.data[3][0], g_puppet->m_transformMatrix.data[3][1], g_puppet->m_transformMatrix.data[3][2],
-			g_puppet->m_stateIndexCurrent );
+			g_cur->beast->m_transformMatrix.data[3][0], g_cur->beast->m_transformMatrix.data[3][1], g_cur->beast->m_transformMatrix.data[3][2],
+			g_cur->beast->m_stateIndexCurrent );
 	}
 	else {
 		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f), no puppet\n", tag, harry->m_position.x, harry->m_position.y, harry->m_position.z );
@@ -1963,7 +2058,7 @@ static void AutotestStep( EIHarry* harry )
 		}
 	}
 
-	if ( g_puppet && now - lastTelemetry >= 500 ) {
+	if ( g_cur->beast && now - lastTelemetry >= 500 ) {
 		LogTelemetry( harry, "tele" );
 		lastTelemetry = now;
 	}
@@ -2001,12 +2096,12 @@ static void AutotestStep( EIHarry* harry )
 	case 102:   // Survey : look.
 		if ( now - phaseStart < 3000 ) break;
 		{
-			bool loaded = g_puppet && g_puppet->m_beastType;
+			bool loaded = g_cur->beast && g_cur->beast->m_beastType;
 			int draws = g_puppetPoseCopies - (int) lastHarryTicks;
 			if ( loaded ) g_surveyLoaded++;
 			if ( draws > 0 ) g_surveyDrawn++;
 			mp_log( "[AT] SURVEY %s : spawned %s, model %s, drawn %d times in 3 s.\n", SURVEY_LEVELS[step].name,
-				g_puppet ? "yes" : "NO", loaded ? "loaded" : "MISSING", draws );
+				g_cur->beast ? "yes" : "NO", loaded ? "loaded" : "MISSING", draws );
 			char shot[64];
 			sprintf_s( shot, "survey_%02d_%s", step, SURVEY_LEVELS[step].name );
 			RequestSnapshot( shot );
@@ -2046,7 +2141,7 @@ static void AutotestStep( EIHarry* harry )
 		g_skipPuppetAI = false;
 		mp_log( "[AT] Hop test runs with the puppet's AI tick ENABLED (animation test).\n" );
 		SpawnPuppet( harry );
-		if ( !g_puppet ) {
+		if ( !g_cur->beast ) {
 			mp_log( "[AT] FAIL : puppet did not spawn.\n" );
 			InterlockedExchange( &g_autotestDone, 2 );
 			return;
@@ -2113,11 +2208,11 @@ static void AutotestStep( EIHarry* harry )
 
 		if ( step == 0 || now - phaseStart >= 4000 ) {
 			if ( step >= NUM_JUMPS ) {
-				SetAirAnimation( g_puppet, AIR_CANDIDATES[0] );
+				SetAirAnimation( g_cur->beast, AIR_CANDIDATES[0] );
 				phase = 8; phaseStart = now; step = 0; snapped = false;
 				break;
 			}
-			SetAirAnimation( g_puppet, AIR_CANDIDATES[JUMP_CLIP[step]] );
+			SetAirAnimation( g_cur->beast, AIR_CANDIDATES[JUMP_CLIP[step]] );
 			if ( JUMP_RUNNING[step] ) {
 				InterlockedExchange( &g_holdMs, 2000 );
 				InterlockedExchange( &g_holdKey, 'W' );
@@ -2166,12 +2261,12 @@ static void AutotestStep( EIHarry* harry )
 	case 4:   // Standing still beside Harry : show each idle candidate.
 		if ( step == 0 || now - phaseStart >= 3000 ) {
 			if ( step >= NUM_IDLE_CANDIDATES ) {
-				SetIdleAnimation( g_puppet, 0 );
+				SetIdleAnimation( g_cur->beast, 0 );
 				phase = 1; phaseStart = now; step = 0; snapped = false;
 				break;
 			}
 			mp_log( "[AT] Idle %d : %s.\n", step, IDLE_CANDIDATES[step] ? IDLE_CANDIDATES[step] : "quickdata idle anim" );
-			SetIdleAnimation( g_puppet, IDLE_CANDIDATES[step] );
+			SetIdleAnimation( g_cur->beast, IDLE_CANDIDATES[step] );
 			step++; phaseStart = now; snapped = false;
 		}
 		else if ( !snapped && now - phaseStart >= 2500 ) {
@@ -2195,8 +2290,8 @@ static void AutotestStep( EIHarry* harry )
 		}
 		else if ( step == 1 && t >= 500 ) {
 			if ( !g_puppetStaysHere ) { mp_log( "[AT] FAIL : F8 didn't pin Evil Harry.\n" ); g_itemFailures++; phase = 3; phaseStart = now; break; }
-			pinned = g_puppet->EIBeast::m_position;
-			headingAtStart = g_heading;
+			pinned = g_cur->beast->EIBeast::m_position;
+			headingAtStart = g_cur->heading;
 			sawMirror = false;
 			maxRise = 0.0F;
 			InterlockedExchange( &g_holdMs, 2000 );
@@ -2204,15 +2299,15 @@ static void AutotestStep( EIHarry* harry )
 			step = 2;
 		}
 		else if ( step == 2 ) {
-			if ( g_mirrorClip && g_mirrorClip != 0xB23CB6D0 ) sawMirror = true;   // Copying something besides standing.
-			maxRise = max( maxRise, g_puppet->EIBeast::m_position.z - pinned.z );
+			if ( g_cur->mirrorClip && g_cur->mirrorClip != 0xB23CB6D0 ) sawMirror = true;   // Copying something besides standing.
+			maxRise = max( maxRise, g_cur->beast->EIBeast::m_position.z - pinned.z );
 			if ( t >= 2700 && t < 2750 ) InterlockedExchange( &g_tapKey, VK_NUMPAD2 );   // Jump : he should too, in place.
 			if ( t >= 4500 ) {
 				RequestSnapshot( "12_stay_here" );
-				Vector3f p = g_puppet->EIBeast::m_position;
+				Vector3f p = g_cur->beast->EIBeast::m_position;
 				float dx = p.x - pinned.x, dy = p.y - pinned.y, dh = harry->m_position.x - pinned.x, dhy = harry->m_position.y - pinned.y;
 				float moved = sqrtf( dx * dx + dy * dy ), harryAway = sqrtf( dh * dh + dhy * dhy );
-				float turned = fabsf( g_heading - headingAtStart ) * 180.0F / MP_PI;
+				float turned = fabsf( g_cur->heading - headingAtStart ) * 180.0F / MP_PI;
 				bool ok = moved < 0.5F && harryAway > 3.0F && sawMirror && turned > 20.0F && maxRise > 0.5F;
 				if ( !ok ) g_itemFailures++;
 				mp_log( "[AT] Stay here : Evil Harry moved %.2f, Harry is %.1f away, puppet copied a clip %s, turned %.0f deg, jumped %.2f high : %s\n",
@@ -2303,8 +2398,8 @@ static void AutotestStep( EIHarry* harry )
 		else if ( !snapped && t >= 4000 ) {   // Past the replay delay.
 			int i = step - 1;
 			int held = GetHeldItem( harry );
-			void* m0 = g_puppet ? g_puppet->m_pickaxeModel0 : 0;
-			void* m1 = g_puppet ? g_puppet->m_pickaxeModel1 : 0;
+			void* m0 = g_cur->beast ? g_cur->beast->m_pickaxeModel0 : 0;
+			void* m1 = g_cur->beast ? g_cur->beast->m_pickaxeModel1 : 0;
 			bool shown = (m0 && (FIELD( m0, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE))
 			          || (m1 && (FIELD( m1, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE));
 			int draws = g_puppetItemDraws - drawsAtStart;   // Puppet copies drawn over the last 0.9 s.
@@ -2351,7 +2446,7 @@ static void AutotestStep( EIHarry* harry )
 				m.data[0][0], m.data[0][1], m.data[0][2], m.data[1][0], m.data[1][1], m.data[1][2], m.data[2][0], m.data[2][1], m.data[2][2],
 				m.data[3][0], m.data[3][1], m.data[3][2],
 				rb.data[0][0], rb.data[0][1], rb.data[0][2], rb.data[2][0], rb.data[2][1], rb.data[2][2], rb.data[3][0], rb.data[3][1], rb.data[3][2],
-				g_puppet ? FIELD( g_puppet, Matrix4f, BEAST_WORLD ).data[3][2] : 0.0F );
+				g_cur->beast ? FIELD( g_cur->beast, Matrix4f, BEAST_WORLD ).data[3][2] : 0.0F );
 			lastLog = now;
 		}
 		if ( (!snapped && t >= 1500) || (snapped && t >= 2300 && t < 2360) ) {
@@ -2481,32 +2576,43 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 
 	// Another level since the puppet was spawned. The load events don't cover every
 	// way of changing levels (the "Go to" menu, loading a save), this does.
-	if ( g_puppet && (self->m_world != g_puppetWorld || Gizmod::getCurrentLevelCRC() != g_puppetLevel) ) {
-		ForgetPuppet();
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		const Peer& p = g_peers[i];
+		if ( p.beast && (self->m_world != p.world || Gizmod::getCurrentLevelCRC() != p.level) ) {
+			ForgetPuppet();
+			break;
+		}
 	}
 
 	PushLocalSnapshot( self );
 	NetUpdate();
 	// Another player in this level : show them (Evil Harry appears on his own).
-	if ( g_networked && !g_autotest && !g_puppet && g_target ) {
-		static uint32_t lastTry = 0;
+	// (The autotest spawns the main peer's itself, when its steps need it.)
+	if ( g_networked ) {
 		uint32_t now = NetNowMs();
-		if ( now - lastTry >= 1000 ) {
-			lastTry = now;
-			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", g_remoteId );
+		for ( int i = 0; i < MAX_PEERS; i++ ) {
+			Peer* p = &g_peers[i];
+			if ( g_autotest && p == MainPeer() ) continue;
+			if ( p->beast || !p->target || now - p->lastSpawnTry < 1000 ) continue;
+			p->lastSpawnTry = now;
+			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", i );
+			CurrentPeer current( p );
 			SpawnPuppet( self );
 		}
 	}
+	g_cur = MainPeer();
 	if ( g_autotest ) AutotestStep( self );
 	HandleHotkeys( self );
 }
 
 static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 {
-	if ( self != g_puppet ) {
+	Peer* peer = FindPeer( self );
+	if ( !peer ) {   // The game's own Evil Harry.
 		g_origEvilHarryTick( self );
 		return;
 	}
+	CurrentPeer current( peer );
 
 	if ( g_skipPuppetAI ) {
 		// No AI, no animation : just place it.
@@ -2514,18 +2620,15 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 		return;
 	}
 
-	static int lastLoggedState = -2;
-	static int lastRequested = -2;
-
 	UpdateLocomotion( self );
 
-	if ( g_forcedState >= 0 && self->m_stateIndexCurrent != g_forcedState ) {
-		if ( lastRequested != g_forcedState ) {
-			mp_log( "[MP] Requesting state %d (current %d)...\n", g_forcedState, self->m_stateIndexCurrent );
-			lastRequested = g_forcedState;
+	if ( g_cur->forcedState >= 0 && self->m_stateIndexCurrent != g_cur->forcedState ) {
+		if ( g_cur->lastRequested != g_cur->forcedState ) {
+			mp_log( "[MP] Requesting state %d (current %d)...\n", g_cur->forcedState, self->m_stateIndexCurrent );
+			g_cur->lastRequested = g_cur->forcedState;
 		}
 		self->m_forceNextState = true;
-		self->m_nextState = g_forcedState;
+		self->m_nextState = g_cur->forcedState;
 	}
 
 	PrePositionPuppet( self );
@@ -2534,9 +2637,9 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 	self = g_evilTickSelf;         // See g_harryTickSelf.
 	if ( g_autoLocomotion ) ApplyLocomotionAnim( self );
 
-	if ( self->m_stateIndexCurrent != lastLoggedState ) {
-		mp_log( "[MP] Puppet is now in state %d.\n", self->m_stateIndexCurrent );
-		lastLoggedState = self->m_stateIndexCurrent;
+	if ( self->m_stateIndexCurrent != g_cur->lastLoggedState ) {
+		mp_log( "[MP] Player %d's puppet is now in state %d.\n", g_cur->id, self->m_stateIndexCurrent );
+		g_cur->lastLoggedState = self->m_stateIndexCurrent;
 	}
 
 	DrivePuppet( self );           // Then override where it is.
@@ -2639,6 +2742,50 @@ static bool IsKnownGameVersion()
 	return memcmp( (void*) GAME_VERSION_ADDRESS, GAME_VERSION, sizeof(GAME_VERSION) ) == 0;
 }
 
+// Leaving the room when the game closes, so the others drop our puppet at once
+// instead of after a timeout. The game ends through kernel32's ExitProcess (from
+// its own import table, patched below), and so does the autotest (QuitGame).
+typedef VOID (WINAPI *ExitProcessFunc)( UINT );
+static ExitProcessFunc g_origExitProcess = ExitProcess;
+
+static void LeaveRoom()
+{
+	if ( g_transport ) g_transport->Leave();
+}
+
+static void QuitGame( UINT code )
+{
+	LeaveRoom();
+	g_origExitProcess( code );
+}
+
+static VOID WINAPI ExitProcess_Hook( UINT code )
+{
+	LeaveRoom();
+	g_origExitProcess( code );
+}
+
+// Points the game's import of kernel32's ExitProcess at the hook.
+static bool HookGameExitProcess()
+{
+	uint8_t* image = (uint8_t*) GetModuleHandleA( 0 );
+	IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*) (image + ((IMAGE_DOS_HEADER*) image)->e_lfanew);
+	const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if ( !dir.VirtualAddress ) return false;
+	FARPROC target = GetProcAddress( GetModuleHandleA( "kernel32.dll" ), "ExitProcess" );
+	for ( IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*) (image + dir.VirtualAddress); d->Name; d++ ) {
+		if ( _stricmp( (const char*) (image + d->Name), "kernel32.dll" ) != 0 ) continue;
+		IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*) (image + d->FirstThunk);
+		for ( ; thunk->u1.Function; thunk++ ) {
+			if ( (FARPROC) thunk->u1.Function != target ) continue;
+			g_origExitProcess = (ExitProcessFunc) thunk->u1.Function;
+			injector::WriteMemory( &thunk->u1.Function, (uint32_t) &ExitProcess_Hook, true );
+			return true;
+		}
+	}
+	return false;
+}
+
 class MultiplayerPlugin : public GizmodPlugin, public ILoadLevelListener, public ILevelLoadedListener
 {
 public:
@@ -2687,6 +2834,8 @@ public:
 		g_netLog = mp_log;
 		NetConfig config;
 		ReadNetConfig( &config );
+		ResetHistory();
+		if ( !HookGameExitProcess() ) mp_log( "[NET] Couldn't hook the game's exit : the others drop us after a timeout.\n" );
 		if ( config.delayMs > 0 ) {   // The nearest choice.
 			int n = sizeof(DELAY_CHOICES) / sizeof(DELAY_CHOICES[0]);
 			for ( int i = 0; i < n; i++ ) {

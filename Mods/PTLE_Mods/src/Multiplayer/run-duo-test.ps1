@@ -1,13 +1,15 @@
-# Two-player test : runs two copies of the game in autotest mode, in the background,
-# joined to the same room of a relay server. Each one's Evil Harry shows the other
-# player. Uses whatever run-autotest.ps1 installed last (run it first after changes).
+# Two-player (or more) test : runs copies of the game in autotest mode, in the
+# background, joined to the same room of a relay server. Each one shows every other
+# player as an Evil Harry. Uses whatever run-autotest.ps1 installed last (run it
+# first after changes).
 #
-#   powershell -ExecutionPolicy Bypass -File run-duo-test.ps1 [-Server 127.0.0.1:27777] [-TimeoutSec 480]
+#   powershell -ExecutionPolicy Bypass -File run-duo-test.ps1 [-Server 127.0.0.1:27777] [-Players 2] [-TimeoutSec 480]
 #
-# Results : Documents\PTLE Multiplayer\logs\a\ and logs\b\ (log + screenshots).
+# Results : Documents\PTLE Multiplayer\logs\a\, logs\b\... (log + screenshots).
 
 param(
 	[string] $Server = '127.0.0.1:27777',
+	[ValidateRange(2, 8)] [int] $Players = 2,
 	[int] $TimeoutSec = 480
 )
 
@@ -21,9 +23,10 @@ if (Get-Process -Name 'PITFALL The Lost Expedition' -ErrorAction SilentlyContinu
 	throw 'The game is already running. Close it first.'
 }
 
+$names = @('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h')[0..($Players - 1)]
 $room = "duo-$PID"
 $procs = @{}
-foreach ($name in 'a', 'b') {
+foreach ($name in $names) {
 	$dir = Join-Path $logDir $name
 	if (Test-Path (Join-Path $dir 'shots')) { Remove-Item (Join-Path $dir 'shots\*') -Force }
 	$vars = @{
@@ -37,10 +40,10 @@ foreach ($name in 'a', 'b') {
 		foreach ($k in $vars.Keys) { Remove-Item "Env:$k" }
 	}
 	Write-Host "== Started game $name (pid $($procs[$name].Id)) in room $room on $Server"
-	Start-Sleep -Seconds 3   # Not both loading at the very same moment.
+	Start-Sleep -Seconds 3   # Not all loading at the very same moment.
 }
 
-foreach ($name in 'a', 'b') {
+foreach ($name in $names) {
 	$p = $procs[$name]
 	if (-not $p.WaitForExit($TimeoutSec * 1000)) {
 		Write-Host "== Game $name timed out, killing it"
@@ -50,7 +53,7 @@ foreach ($name in 'a', 'b') {
 }
 
 Add-Type -AssemblyName System.Drawing
-foreach ($name in 'a', 'b') {
+foreach ($name in $names) {
 	$shots = Join-Path $logDir "$name\shots"
 	if (Test-Path $shots) {
 		Get-ChildItem $shots -Filter *.bmp | ForEach-Object {
@@ -61,23 +64,39 @@ foreach ($name in 'a', 'b') {
 		}
 	}
 	Write-Host "== Game $name"
-	Get-Content (Join-Path $logDir "$name\multiplayer.log") | Select-String 'Joined|Showing|left|forgetting|Sent [0-9]+ snapshots' | Select-Object -Last 4
+	Get-Content (Join-Path $logDir "$name\multiplayer.log") | Select-String 'Joined|Showing|left|forgetting|spawned \(|Sent [0-9]+ snapshots|  Player \d+ :' | Select-Object -Last (4 + 2 * $Players)
 }
 
-# Each game must have shown the other player and kept receiving from them. (The
-# autotest's own item checks fail here : they expect Evil Harry to replay the local
-# player, and the other game runs a few seconds apart.)
+# Each game must have heard every other player, kept receiving from them and spawned
+# a puppet for each. (The autotest's own item checks fail here : they expect Evil
+# Harry to replay the local player, and the other games run a few seconds apart.)
 $ok = $true
-foreach ($name in 'a', 'b') {
-	$log = Get-Content (Join-Path $logDir "$name\multiplayer.log")
+foreach ($name in $names) {
+	$log = @(Get-Content (Join-Path $logDir "$name\multiplayer.log"))
 	$me = ($log | Select-String 'Joined room .* as player (\d+)' | Select-Object -Last 1).Matches.Groups[1].Value
-	$shown = ($log | Select-String 'Showing player (\d+)' | Select-Object -Last 1).Matches.Groups[1].Value
-	$stats = ($log | Select-String 'Player \d+ : received (\d+), lost (\d+)' | Select-Object -Last 1).Matches
-	$received = if ($stats) { [int] $stats.Groups[1].Value } else { 0 }
-	$lost = if ($stats) { [int] $stats.Groups[2].Value } else { 0 }
-	$good = $me -ne $null -and $shown -ne $null -and $me -ne $shown -and $received -gt 2500 -and $lost -lt $received / 20
-	Write-Host ("== Game {0} : player {1}, showed player {2}, received {3}, lost {4} : {5}" -f $name, $me, $shown, $received, $lost, $(if ($good) { 'ok' } else { 'WRONG' }))
+	# The stats lines (every 10 s, one per player heard) : the most received from each
+	# other player, and whether their puppet was ever shown. (The games finish at
+	# different times : the last lines may have forgotten the ones that quit.)
+	$byPlayer = @{}
+	foreach ($l in @($log | Select-String '\[NET\]   Player (\d+) : received (\d+), lost (\d+).*Puppet (.*)\.$')) {
+		$g = $l.Matches.Groups
+		if ($g[1].Value -eq $me) { continue }
+		$id = $g[1].Value
+		if (-not $byPlayer.ContainsKey($id)) { $byPlayer[$id] = @{ received = 0; lost = 0; shown = $false } }
+		$e = $byPlayer[$id]
+		if ([int] $g[2].Value -ge $e.received) { $e.received = [int] $g[2].Value; $e.lost = [int] $g[3].Value }
+		if ($g[4].Value -eq 'shown') { $e.shown = $true }
+	}
+	$others = @($byPlayer.Keys | Sort-Object)
+	$good = $me -ne $null -and $others.Count -eq ($Players - 1)
+	foreach ($id in $others) {
+		$e = $byPlayer[$id]
+		$fine = $e.received -gt 2500 -and $e.lost -lt $e.received / 20 -and $e.shown
+		Write-Host ("== Game {0} (player {1}) : player {2} received {3}, lost {4}, puppet shown {5} : {6}" -f $name, $me, $id, $e.received, $e.lost, $e.shown, $(if ($fine) { 'ok' } else { 'WRONG' }))
+		if (-not $fine) { $good = $false }
+	}
+	Write-Host ("== Game {0} : heard {1} of {2} other players : {3}" -f $name, $others.Count, ($Players - 1), $(if ($good) { 'ok' } else { 'WRONG' }))
 	if (-not $good) { $ok = $false }
 }
-Write-Host $(if ($ok) { '== DUO RESULT : PASS' } else { '== DUO RESULT : FAIL' })
+Write-Host $(if ($ok) { '== RESULT : PASS' } else { '== RESULT : FAIL' })
 if (-not $ok) { exit 1 }

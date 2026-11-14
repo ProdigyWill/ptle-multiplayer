@@ -28,7 +28,7 @@ class UdpTransport : public Transport
 public:
 	UdpTransport( const char* server, const char* room, const char* name, bool echo )
 		: m_socket( INVALID_SOCKET ), m_resolved( 0 ), m_state( WAITING_FOR_ADDRESS ), m_id( -1 ), m_echo( echo ),
-		  m_nonce( 0 ), m_lastJoin( 0 ), m_lastPing( 0 ), m_lastHeard( 0 ), m_rtt( -1 )
+		  m_nonce( 0 ), m_lastJoin( 0 ), m_lastPing( 0 ), m_lastHeard( 0 ), m_rtt( -1 ), m_left( 0 )
 	{
 		strncpy_s( m_serverText, server, _TRUNCATE );
 		strncpy_s( m_room, room, _TRUNCATE );
@@ -56,10 +56,17 @@ public:
 
 	~UdpTransport()
 	{
-		if ( m_socket != INVALID_SOCKET ) {
-			if ( m_state == JOINED ) SendControl( PACKET_LEAVE, 0, 0, 0 );
-			closesocket( m_socket );
-		}
+		Leave();
+		if ( m_socket != INVALID_SOCKET ) closesocket( m_socket );
+	}
+
+	void Leave() override
+	{
+		if ( m_socket == INVALID_SOCKET || m_state != JOINED ) return;
+		if ( InterlockedExchange( &m_left, 1 ) ) return;
+		// Twice : it's UDP, and there's no waiting for an answer.
+		SendControl( PACKET_LEAVE, 0, 0, 0 );
+		SendControl( PACKET_LEAVE, 0, 0, 0 );
 	}
 
 	void Update() override
@@ -203,6 +210,7 @@ private:
 	uint32_t m_nonce;
 	uint32_t m_lastJoin, m_lastPing, m_lastHeard;
 	int m_rtt;
+	volatile LONG m_left;
 	char m_serverText[128];
 	char m_room[64];
 	char m_name[64];
