@@ -60,7 +60,7 @@ foreach ($mod in 'Multiplayer', 'WindowedMode', 'CheatLab') {
 if (Test-Path $shotsDir) { Remove-Item (Join-Path $shotsDir '*') -Force }
 
 $vars = @{ PTLE_MP_AUTOTEST = '1'; PTLE_MP_NETSIM = $NetSim }
-if ($Survey) { $vars.PTLE_MP_SURVEY = '1' }
+if ($Survey) { $vars.PTLE_MP_SURVEY = if ($env:PTLE_MP_SURVEY) { $env:PTLE_MP_SURVEY } else { '1' } }
 if ($Server) {
 	$vars.PTLE_MP_SERVER = $Server
 	$vars.PTLE_MP_ECHO = '1'

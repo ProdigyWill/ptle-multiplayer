@@ -256,6 +256,7 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 // filmed in a few cropped frames (logs\shots\anim_<n>_f<k>.bmp).
 static bool g_animSurvey = false;
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
+static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
 static bool g_viewerTest = false;                // PTLE_MP_VIEWERTEST=1 : the autotest drives the animation viewer.
 static uint32_t g_animSurveyClip = 0;            // The clip the puppet plays (0 : normal).
 static volatile LONG g_cropPending = 0;          // A cropped grab, taken in Present.
@@ -1594,6 +1595,8 @@ static void HookCamera()
 	injector::MakeCALL( CAMERA_LOOKAT_CALL, &CameraLookAt_Hook );
 }
 
+static int g_tagPasses[2] = { 0, 0 };   // Puppet draws elsewhere than to the screen, and to the screen (diagnostics).
+
 static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
 {
 	Matrix4f view;
@@ -1603,6 +1606,17 @@ static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
 	IDirect3DDevice9* dev = *(IDirect3DDevice9**) RENDERER_DEVICE;
 	D3DVIEWPORT9 vp;
 	if ( !dev || FAILED( dev->GetViewport( &vp ) ) ) return;
+
+	// Some levels also draw him into a texture (Mama-Oullo Tower, the Great Tree :
+	// their water's reflection), with another viewport and camera : a tag noted
+	// there landed far from his head. Only the screen's own image counts.
+	IDirect3DSurface9* target = 0;
+	IDirect3DSurface9* screen = 0;
+	bool onScreen = SUCCEEDED( dev->GetRenderTarget( 0, &target ) ) && SUCCEEDED( dev->GetBackBuffer( 0, 0, D3DBACKBUFFER_TYPE_MONO, &screen ) ) && target == screen;
+	if ( target ) target->Release();
+	if ( screen ) screen->Release();
+	g_tagPasses[onScreen ? 1 : 0]++;
+	if ( !onScreen ) return;
 
 	// Above his head : his transform is at his feet. (The highest bone isn't reliable :
 	// some bones, not drawn, sit far above him in some poses.)
@@ -2077,7 +2091,8 @@ static DWORD AUTOTEST_TOTAL_TIMEOUT_MS = 360000;   // Longer for the level surve
 // Level survey (PTLE_MP_SURVEY=1) : instead of the scripted test, visit these levels
 // and spawn Evil Harry beside Harry in each, to see where his model loads and draws.
 static bool g_survey = false;
-static const struct { uint32_t crc; const char* name; } SURVEY_LEVELS[] = {
+struct SurveyLevel { uint32_t crc; const char* name; };
+static const SurveyLevel SURVEY_ALL[] = {
 	{ 0x7A9B3870, "a55_jungle_trail" },
 	{ 0xEE8F6900, "a03_crash_site" },
 	{ 0x07ECCC35, "a05_mama_oullo_tower" },
@@ -2091,7 +2106,15 @@ static const struct { uint32_t crc; const char* name; } SURVEY_LEVELS[] = {
 	{ 0x93F89D45, "a53_gates_of_el_dorado" },
 	{ 0x0081082C, "a01_chameleon_temple" },
 };
-static const int NUM_SURVEY_LEVELS = sizeof(SURVEY_LEVELS) / sizeof(SURVEY_LEVELS[0]);
+// PTLE_MP_SURVEY=2 : only these (a small level, then the big ones where name tags were off).
+static const SurveyLevel SURVEY_BIG[] = {
+	{ 0x7A9B3870, "a55_jungle_trail" },
+	{ 0x07ECCC35, "a05_mama_oullo_tower" },
+	{ 0x3292B6C9, "great_tree" },
+	{ 0x69F0CDE2, "battered_bridge" },
+};
+static const SurveyLevel* SURVEY_LEVELS = SURVEY_ALL;
+static int NUM_SURVEY_LEVELS = sizeof(SURVEY_ALL) / sizeof(SURVEY_ALL[0]);
 static int g_surveyLoaded = 0, g_surveyDrawn = 0;
 
 
@@ -2715,6 +2738,7 @@ static void AutotestStep( EIHarry* harry )
 		}
 		if ( g_animSurvey ) { phase = 200; phaseStart = now; step = 0; break; }
 		if ( g_viewerTest ) { phase = 300; phaseStart = now; step = 0; break; }
+		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
 		break;
@@ -2777,6 +2801,31 @@ static void AutotestStep( EIHarry* harry )
 			mp_log( "[AT] Death : %s (puppet 0x%.8X, %d spawned in all).\n", ok ? "survived, puppet kept" : "FAIL", b, g_puppetsSpawned );
 			InterlockedExchange( &g_autotestDone, ok ? 1 : 2 );
 		}
+		break;
+	}
+	case 500: {   // Distance : the puppet stands further and further ahead of the camera.
+		static const float DISTANCES[] = { 20.0F, 60.0F, 100.0F, 140.0F, 180.0F, 220.0F, 260.0F, 300.0F, 400.0F };
+		static const int NUM = sizeof(DISTANCES) / sizeof(DISTANCES[0]);
+		static int posesAtStart = 0, passesAtStart = 0;
+		DWORD t = now - phaseStart;
+		if ( step >= NUM ) { InterlockedExchange( &g_autotestDone, 1 ); break; }
+		if ( t < 100 ) {
+			const Matrix4f& cam = g_cameraWorld;   // It looks down its -Z.
+			float fx = -cam.data[2][0], fy = -cam.data[2][1];
+			float l = sqrtf( fx * fx + fy * fy );
+			if ( l > 0.01F ) { g_puppetOffset.x = fx / l * DISTANCES[step]; g_puppetOffset.y = fy / l * DISTANCES[step]; }
+			snapped = false;
+		}
+		else if ( t >= 2000 && t < 2100 ) { posesAtStart = g_puppetPoseCopies; passesAtStart = g_tagPasses[1]; }
+		else if ( t >= 3000 && !snapped ) {
+			char name[32];
+			sprintf_s( name, "dist_%03d", (int) DISTANCES[step] );
+			RequestSnapshot( name );
+			mp_log( "[AT] Distance %.0f ahead of Harry : render called %d times in 1 s (%d to the screen), tag depth %.1f, tag %s.\n", DISTANCES[step],
+				g_puppetPoseCopies - posesAtStart, g_tagPasses[1] - passesAtStart, g_cur->tagDepth, g_cur->tagFrame == g_presentCount ? "noted" : "not noted" );
+			snapped = true;
+		}
+		else if ( t >= 3500 ) { step++; phaseStart = now; }
 		break;
 	}
 	case 300: {   // Animation viewer : keys pressed in turn, a picture after each.
@@ -3746,6 +3795,10 @@ public:
 				g_deathTest = true;
 				mp_log( "[AT] Death test.\n" );
 			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_DISTTEST", env, sizeof(env) ) && env[0] == '1' ) {
+				g_distTest = true;
+				mp_log( "[AT] Distance test.\n" );
+			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_VIEWERTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_viewerTest = true;
 				mp_log( "[AT] Animation viewer test.\n" );
@@ -3756,8 +3809,9 @@ public:
 				AUTOTEST_TOTAL_TIMEOUT_MS = 3600000;
 				mp_log( "[AT] Animation survey mode.\n" );
 			}
-			if ( GetEnvironmentVariableA( "PTLE_MP_SURVEY", env, sizeof(env) ) && env[0] == '1' ) {
+			if ( GetEnvironmentVariableA( "PTLE_MP_SURVEY", env, sizeof(env) ) && (env[0] == '1' || env[0] == '2') ) {
 				g_survey = true;
+				if ( env[0] == '2' ) { SURVEY_LEVELS = SURVEY_BIG; NUM_SURVEY_LEVELS = sizeof(SURVEY_BIG) / sizeof(SURVEY_BIG[0]); }
 				AUTOTEST_TOTAL_TIMEOUT_MS = 1200000;
 				mp_log( "[AT] Level survey mode.\n" );
 			}
