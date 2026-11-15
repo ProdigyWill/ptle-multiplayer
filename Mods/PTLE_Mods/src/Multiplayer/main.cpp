@@ -3923,14 +3923,9 @@ static void ReadNetConfig( NetConfig* c )
 	CreateDirectoryA( dir, 0 );
 	sprintf_s( ini, "%s\\Multiplayer.ini", dir );
 
-	// A package's settings come as Multiplayer.new.ini (install.bat overwrites what it
-	// copies : the player's own settings would be lost on every update). They become
-	// Multiplayer.ini only if the player has none yet, here or in the old place.
-	char fresh[MAX_PATH];
-	sprintf_s( fresh, "%s\\Multiplayer.new.ini", dir );
+	// Settings in the old place (packages before config\Multiplayer) move here.
 	bool haveIni = GetFileAttributesA( ini ) != INVALID_FILE_ATTRIBUTES;
 	bool haveOld = GetFileAttributesA( old ) != INVALID_FILE_ATTRIBUTES;
-	bool haveFresh = GetFileAttributesA( fresh ) != INVALID_FILE_ATTRIBUTES;
 	if ( !haveIni && haveOld ) {
 		if ( CopyFileA( old, ini, TRUE ) ) {
 			DeleteFileA( old );
@@ -3941,10 +3936,6 @@ static void ReadNetConfig( NetConfig* c )
 			mp_log( "[NET] Settings : %s (the old place; they now belong in config\\Multiplayer).\n", ini );
 		}
 	}
-	else if ( !haveIni && haveFresh ) {
-		if ( MoveFileA( fresh, ini ) ) mp_log( "[NET] Settings : %s, from the package.\n", ini );
-		else strcpy_s( ini, fresh );
-	}
 	else if ( !haveIni ) {
 		FILE* f = 0;
 		if ( fopen_s( &f, ini, "wb" ) == 0 && f ) {
@@ -3953,7 +3944,6 @@ static void ReadNetConfig( NetConfig* c )
 			mp_log( "[NET] Wrote default settings to %s.\n", ini );
 		}
 	}
-	if ( haveIni && haveFresh ) DeleteFileA( fresh );   // An update : the player keeps theirs.
 	// Another copy of the game on this computer (PTLE_MP_INSTANCE, outside the
 	// autotests) : its own settings, Multiplayer-<instance>.ini, so its name, outfit
 	// and colours aren't the first copy's. Made from Multiplayer.ini the first time,
