@@ -6,6 +6,8 @@
 # Build first (run-autotest.ps1 does). The zip goes to Documents\PTLE Multiplayer\dist.
 # It has the same layout as the regular mod release : run install.bat as administrator
 # on the other PC and give it the Pitfall folder (the one with Start.exe).
+# The settings go in as config\Multiplayer\Multiplayer.new.ini : the mod uses them only
+# if the player has none yet, so an update keeps their name, outfit and colours.
 
 param(
 	[string] $Server = '15.204.239.19:27777',
@@ -42,7 +44,7 @@ Name=$Name
 ; 1 : the server sends your own moves back to you (Evil Harry replays you
 ; through the internet, to test alone).
 Echo=0
-"@ -replace "`r?`n", "`r`n" | Set-Content -Encoding ascii (Join-Path $stage 'config\Multiplayer\Multiplayer.ini')
+"@ -replace "`r?`n", "`r`n" | Set-Content -Encoding ascii (Join-Path $stage 'config\Multiplayer\Multiplayer.new.ini')
 
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip

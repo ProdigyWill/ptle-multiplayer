@@ -3923,17 +3923,56 @@ static void ReadNetConfig( NetConfig* c )
 	CreateDirectoryA( dir, 0 );
 	sprintf_s( ini, "%s\\Multiplayer.ini", dir );
 
-	if ( GetFileAttributesA( ini ) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA( old ) != INVALID_FILE_ATTRIBUTES ) {
-		strcpy_s( ini, old );
-		mp_log( "[NET] Settings : %s (the old place; they now belong in config\\Multiplayer).\n", ini );
+	// A package's settings come as Multiplayer.new.ini (install.bat overwrites what it
+	// copies : the player's own settings would be lost on every update). They become
+	// Multiplayer.ini only if the player has none yet, here or in the old place.
+	char fresh[MAX_PATH];
+	sprintf_s( fresh, "%s\\Multiplayer.new.ini", dir );
+	bool haveIni = GetFileAttributesA( ini ) != INVALID_FILE_ATTRIBUTES;
+	bool haveOld = GetFileAttributesA( old ) != INVALID_FILE_ATTRIBUTES;
+	bool haveFresh = GetFileAttributesA( fresh ) != INVALID_FILE_ATTRIBUTES;
+	if ( !haveIni && haveOld ) {
+		if ( CopyFileA( old, ini, TRUE ) ) {
+			DeleteFileA( old );
+			mp_log( "[NET] Settings moved from %s to config\\Multiplayer.\n", old );
+		}
+		else {
+			strcpy_s( ini, old );
+			mp_log( "[NET] Settings : %s (the old place; they now belong in config\\Multiplayer).\n", ini );
+		}
 	}
-	else if ( GetFileAttributesA( ini ) == INVALID_FILE_ATTRIBUTES ) {
+	else if ( !haveIni && haveFresh ) {
+		if ( MoveFileA( fresh, ini ) ) mp_log( "[NET] Settings : %s, from the package.\n", ini );
+		else strcpy_s( ini, fresh );
+	}
+	else if ( !haveIni ) {
 		FILE* f = 0;
 		if ( fopen_s( &f, ini, "wb" ) == 0 && f ) {
 			fwrite( DEFAULT_INI, 1, sizeof(DEFAULT_INI) - 1, f );
 			fclose( f );
 			mp_log( "[NET] Wrote default settings to %s.\n", ini );
 		}
+	}
+	if ( haveIni && haveFresh ) DeleteFileA( fresh );   // An update : the player keeps theirs.
+	// Another copy of the game on this computer (PTLE_MP_INSTANCE, outside the
+	// autotests) : its own settings, Multiplayer-<instance>.ini, so its name, outfit
+	// and colours aren't the first copy's. Made from Multiplayer.ini the first time,
+	// with the instance after the name.
+	char instance[32] = { 0, }, autotestEnv[8] = { 0, };
+	DWORD instanceLength = GetEnvironmentVariableA( "PTLE_MP_INSTANCE", instance, sizeof(instance) );
+	bool autotestRun = GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", autotestEnv, sizeof(autotestEnv) ) && autotestEnv[0] == '1';
+	if ( instanceLength > 0 && instanceLength < sizeof(instance) && !autotestRun ) {
+		char own[MAX_PATH];
+		sprintf_s( own, "%s\\Multiplayer-%s.ini", dir, instance );
+		if ( GetFileAttributesA( own ) == INVALID_FILE_ATTRIBUTES && CopyFileA( ini, own, TRUE ) ) {
+			char name[64] = { 0, }, renamed[96];
+			GetPrivateProfileStringA( "Network", "Name", "Harry", name, sizeof(name), own );
+			sprintf_s( renamed, "%s %s", name, instance );
+			WritePrivateProfileStringA( "Network", "Name", renamed, own );
+			mp_log( "[NET] Instance \"%s\" : its own settings, made from %s.\n", instance, ini );
+		}
+		if ( GetFileAttributesA( own ) != INVALID_FILE_ATTRIBUTES ) strcpy_s( ini, own );
+		mp_log( "[NET] Settings : %s.\n", ini );
 	}
 	strcpy_s( g_iniPath, ini );
 	g_myOutfit = GetPrivateProfileIntA( "Appearance", "Outfit", 0, ini );
