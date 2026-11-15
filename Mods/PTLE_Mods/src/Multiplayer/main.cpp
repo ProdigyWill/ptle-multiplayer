@@ -316,6 +316,9 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 // filmed in a few cropped frames (logs\shots\anim_<n>_f<k>.bmp).
 static bool g_animSurvey = false;
 static int g_crashTest = 0;                       // PTLE_MP_CRASHTEST=av|div|stack : the autotest crashes the game (the crash logger's test).
+static int g_iceTest = 0;                         // PTLE_MP_ICETEST=1 : the autotest puts the puppet in "thrown from water"; 2 : walks Harry (and the puppet) into Spinja Lair's cold water. PTLE_MP_ICEALLOW=1 : let it freeze, as before the fix.
+static bool g_allowPuppetFreeze = false;
+static volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
@@ -2213,7 +2216,7 @@ GET_METHOD( 0x5EBA90, void, ScheduleWorldLoad, void*, uint32_t, bool );
 // Level to test in, or 0 to stay wherever the game starts. 0x7567D75A is the
 // developers' "0-sound" (Sound Range Test Level) : flat and empty.
 // Turtle Monument (0x239A2165) has hostile monkeys that get in the way.
-static const uint32_t AUTOTEST_LEVEL = 0x7567D75A;
+static uint32_t AUTOTEST_LEVEL = 0x7567D75A;   // The ice test's walk : Spinja Lair (cold water just ahead).
 static volatile LONG g_settled = 0;           // 1 = cutscene/book dismissed, game runs.
 
 static bool g_background = false;            // Autotest without focus (see above).
@@ -3078,6 +3081,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_skinTest ) { phase = 700; phaseStart = now; step = 0; break; }
 		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
+		if ( g_iceTest ) { phase = 800; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
 		break;
 
@@ -3164,6 +3168,71 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
+		break;
+	}
+	case 800: {   // Ice : the puppet is put in "thrown from water" (what swimming did), then back to idle.
+		DWORD t = now - phaseStart;
+		EIEvilHarryP* b = g_cur->beast;
+		if ( !b ) { InterlockedExchange( &g_autotestDone, 2 ); break; }
+		if ( g_iceTest >= 2 ) {   // 2 : Harry walks into the cold water beside the puppet; 3 : the puppet stands out in it.
+			if ( step == 0 ) {
+				if ( t < 2000 ) break;
+				RequestSnapshot( "ice_0_before" );
+				if ( g_iceTest == 3 ) {   // The puppet out in the pool ahead (the camera looks down its -Z); Harry stays on the shore.
+					const Matrix4f& cam = g_cameraWorld;
+					float fx = -cam.data[2][0], fy = -cam.data[2][1];
+					float l = sqrtf( fx * fx + fy * fy );
+					if ( l > 0.01F ) { g_puppetOffset.x = fx / l * 14.0F; g_puppetOffset.y = fy / l * 14.0F; }
+				}
+				else { InterlockedExchange( &g_holdMs, 5000 ); InterlockedExchange( &g_holdKey, 'W' ); }   // Harry walks into the water and freezes.
+				step = 1; phaseStart = now;
+			}
+			else if ( step >= 1 && step <= 8 ) {
+				if ( t < 1200 ) break;
+				char name[32];
+				sprintf_s( name, "ice_%d_walk", step );
+				RequestSnapshot( name );
+				uint8_t* pc = (uint8_t*) b->m_playerIceCube;
+				uint8_t* hc = (uint8_t*) Gizmod::getHarry()->m_playerIceCube;
+				mp_log( "[AT] Ice %d : puppet at (%.1f, %.1f, %.1f) in state %d, freezes stopped %ld; puppet's cube 0x%.8X (world 0x%.8X, frozen %d, parent 0x%.8X), Harry's 0x%.8X (world 0x%.8X, frozen %d, parent 0x%.8X), clip 0x%.8X.\n", step,
+					b->EIBeast::m_position.x, b->EIBeast::m_position.y, b->EIBeast::m_position.z, b->m_stateIndexCurrent, g_puppetFreezesStopped,
+					(uint32_t) pc, pc ? *(uint32_t*) (pc + 0xC) : 0, pc ? pc[0x2F5] : -1, pc ? *(uint32_t*) (pc + 0x1B4) : 0,
+					(uint32_t) hc, hc ? *(uint32_t*) (hc + 0xC) : 0, hc ? hc[0x2F5] : -1, hc ? *(uint32_t*) (hc + 0x1B4) : 0,
+					g_cur->target ? g_cur->target->clipCRC : 0 );
+				step++; phaseStart = now;
+			}
+			else {   // Harry's freeze also put the puppet in "thrown from water" (the pool alone doesn't) : it must have been stopped, its cube kept out of the level.
+				uint8_t* pc = (uint8_t*) b->m_playerIceCube;
+				bool ok = g_allowPuppetFreeze || g_iceTest == 3 || (g_puppetFreezesStopped > 0 && (!pc || (!*(uint32_t*) (pc + 0xC) && !pc[0x2F5])));
+				mp_log( "[AT] Ice : the puppet kept out of the ice : %s\n", ok ? "ok" : "WRONG" );
+				InterlockedExchange( &g_autotestDone, ok ? 1 : 2 );
+			}
+			break;
+		}
+		if ( step == 0 ) {
+			if ( t < 2000 ) break;
+			RequestSnapshot( "ice_0_before" );
+			g_autoLocomotion = false;
+			g_cur->forcedState = FindStateIndex( b, "thrown from water" );
+			mp_log( "[AT] Ice : forcing state %d (\"thrown from water\").\n", g_cur->forcedState );
+			step = 1; phaseStart = now;
+		}
+		else if ( step == 1 ) {
+			if ( t < 1500 ) break;
+			bool ok = g_allowPuppetFreeze || g_puppetFreezesStopped > 0;
+			mp_log( "[AT] Ice : puppet in state %d, freezes stopped %ld : %s\n", b->m_stateIndexCurrent, g_puppetFreezesStopped, ok ? "ok" : "WRONG" );
+			RequestSnapshot( "ice_1_forced" );
+			g_autoLocomotion = true;
+			step = 2; phaseStart = now;
+			if ( !ok ) InterlockedExchange( &g_autotestDone, 2 );
+		}
+		else if ( step == 2 ) {
+			if ( t < 2500 ) break;
+			mp_log( "[AT] Ice : back in state %d.\n", b->m_stateIndexCurrent );
+			RequestSnapshot( "ice_2_after" );
+			step = 3; phaseStart = now;
+		}
+		else if ( t > 1000 ) InterlockedExchange( &g_autotestDone, 1 );
 		break;
 	}
 	case 700: {   // Outfits : the puppet wears each in turn; then ours, which a level load puts on Harry.
@@ -3885,8 +3954,59 @@ static void ApplyPuppetOutfit( EIEvilHarryP* p )
 	g_cur->shownOutfit = outfit;
 }
 
+// Evil Harry's state callbacks are a table of (function, state name) built when the
+// game starts (0x84A4B0). In his boss fight, falling in the water puts him in
+// "thrown from water", whose enter callback (0x47D490) shuts him in his ice cube
+// (0x54B480 : added to the level as an instance of its own, where he is) and counts
+// down something of the level's ([0x917034]+0xB38). A puppet runs Evil
+// Harry's state machine where its player is : when they swam, the game put the
+// puppet in that state, and the others saw them as a block of ice. Puppets skip
+// that callback; the game's own Evil Harry still freezes.
+typedef void (__thiscall *StateCallback)( EIEvilHarryP* self );
+static StateCallback g_origThrownFromWater = 0;
+
+static bool IsPuppet( const void* beast )
+{
+	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].beast == beast || g_peers[i].limbo == beast ) return true;
+	return false;
+}
+
+static void __fastcall ThrownFromWater_Hook( EIEvilHarryP* self, void* )
+{
+	if ( IsPuppet( self ) && !g_allowPuppetFreeze ) {
+		if ( InterlockedIncrement( &g_puppetFreezesStopped ) <= 3 ) mp_log( "[MP] A puppet was about to be frozen (Evil Harry's \"thrown from water\") : skipped.\n" );
+		return;
+	}
+	g_origThrownFromWater( self );
+}
+
+// Each state of the state machine keeps its own copy of its callbacks (enter,
+// update, leave), and every Evil Harry shares the one state machine : the hooks go
+// there, checked on each Evil Harry tick (a level load may build it again).
+static void HookThrownFromWater( EIEvilHarryP* b )
+{
+	static bool warned = false;
+	EBeastStateMachine* sm = b->GetStateMachine();
+	if ( !sm || !sm->m_states ) return;
+	int hooked = 0;
+	for ( int i = 0; i < (int) sm->m_numStates; i++ ) {
+		EBeastState& st = sm->m_states[i];
+		MemberFuncCallback* cbs[3] = { &st.m_onEnter, &st.m_onUpdate, &st.m_onLeave };
+		for ( int k = 0; k < 3; k++ ) {
+			uint32_t f = (uint32_t) cbs[k]->m_func;
+			if ( f == (uint32_t) &ThrownFromWater_Hook ) { hooked++; continue; }
+			if ( f != 0x47D490 ) continue;
+			g_origThrownFromWater = (StateCallback) f;
+			cbs[k]->m_func = (void (*)()) &ThrownFromWater_Hook;
+			hooked++;
+		}
+	}
+	if ( !hooked && !warned ) warned = true, mp_log( "[MP] Evil Harry's \"thrown from water\" isn't where we expect : puppets may freeze in water.\n" );
+}
+
 static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 {
+	HookThrownFromWater( self );
 	Peer* peer = FindPeer( self );
 	if ( !peer ) peer = ReclaimPuppet( self );
 	if ( !peer ) {   // The game's own Evil Harry.
@@ -4604,6 +4724,12 @@ public:
 			if ( GetEnvironmentVariableA( "PTLE_MP_CRASHTEST", env, sizeof(env) ) ) {
 				g_crashTest = strcmp( env, "div" ) == 0 ? 2 : strcmp( env, "stack" ) == 0 ? 3 : 1;
 				mp_log( "[AT] Crash test (%s).\n", env );
+			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_ICETEST", env, sizeof(env) ) && env[0] >= '1' && env[0] <= '3' ) {
+				g_iceTest = env[0] - '0';
+				if ( g_iceTest >= 2 ) AUTOTEST_LEVEL = 0x7652BAFC;   // Spinja Lair.
+				g_allowPuppetFreeze = GetEnvironmentVariableA( "PTLE_MP_ICEALLOW", env, sizeof(env) ) && env[0] == '1';
+				mp_log( "[AT] Ice test%s.\n", g_allowPuppetFreeze ? " (puppets may freeze)" : "" );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_DEATHTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_deathTest = true;
