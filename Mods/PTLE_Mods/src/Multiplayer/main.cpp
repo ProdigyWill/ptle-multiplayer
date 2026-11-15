@@ -29,6 +29,7 @@
 //        down only). F8 again : he follows.
 // --------------------------------------------------------------------------------
 
+#include <time.h>
 #include <Windows.h>
 #include <d3d9.h>
 #include <math.h>
@@ -166,21 +167,60 @@ static bool DescribeAddress( uint32_t address, char* out, int size )
 	return true;
 }
 
-// Records access violations (address + registers) before Gizmod's crash handler
-// runs. First-chance only, and capped, so handled exceptions don't flood the log.
+// Records crashes (address + registers + what's on the stack) before Gizmod's crash
+// handler runs : every exception that is an error (access violation, stack
+// overflow, division by zero, heap corruption...), first-chance, capped so handled
+// ones don't flood the log. Looking through the stack (IsBadReadPtr...) raises
+// exceptions of its own on this thread : those are ours, not logged (they used to
+// use up the cap, so a real crash after them went unlogged).
+static volatile DWORD g_crashLoggerThread = 0;
+
+static const char* ExceptionName( DWORD code )
+{
+	switch ( code ) {
+	case EXCEPTION_ACCESS_VIOLATION:      return "access violation";
+	case EXCEPTION_STACK_OVERFLOW:        return "stack overflow";
+	case EXCEPTION_ILLEGAL_INSTRUCTION:   return "illegal instruction";
+	case EXCEPTION_PRIV_INSTRUCTION:      return "privileged instruction";
+	case EXCEPTION_INT_DIVIDE_BY_ZERO:    return "integer division by zero";
+	case EXCEPTION_INT_OVERFLOW:          return "integer overflow";
+	case EXCEPTION_IN_PAGE_ERROR:         return "in-page error";
+	case EXCEPTION_DATATYPE_MISALIGNMENT: return "misaligned data";
+	case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "array bounds exceeded";
+	case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "noncontinuable exception";
+	case 0xC0000374:                      return "heap corruption";
+	case 0xC0000409:                      return "stack buffer overrun";
+	case 0xE06D7363:                      return "C++ exception";
+	}
+	if ( (code & 0xF0000000) == 0xC0000000 ) return "error";
+	return 0;
+}
+
 static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
 {
 	static volatile LONG count = 0;
 	DWORD code = e->ExceptionRecord->ExceptionCode;
-	if ( code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION ) return EXCEPTION_CONTINUE_SEARCH;
-	if ( InterlockedIncrement( &count ) > 5 ) return EXCEPTION_CONTINUE_SEARCH;
+	const char* name = ExceptionName( code );
+	if ( !name ) return EXCEPTION_CONTINUE_SEARCH;              // Not an error (debugger messages, thread names...).
+	if ( g_crashLoggerThread == GetCurrentThreadId() ) return EXCEPTION_CONTINUE_SEARCH;   // Our own stack probing.
+	static volatile LONG cppCount = 0;   // C++ exceptions are often caught (drivers...) : a few only, apart from the rest.
+	if ( code == 0xE06D7363 ? InterlockedIncrement( &cppCount ) > 3 : InterlockedIncrement( &count ) > 12 ) return EXCEPTION_CONTINUE_SEARCH;
 
 	CONTEXT* c = e->ContextRecord;
-	mp_log( "[MP] EXCEPTION 0x%.8X at EIP 0x%.8X (%s 0x%.8X) EAX=%.8X EBX=%.8X ECX=%.8X EDX=%.8X ESI=%.8X EDI=%.8X ESP=%.8X\n",
-		code, c->Eip,
-		e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-		(uint32_t) e->ExceptionRecord->ExceptionInformation[1],
-		c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Esp );
+	if ( code == EXCEPTION_STACK_OVERFLOW ) {   // Little stack left : one short line, no stack walk.
+		mp_log( "[MP] EXCEPTION 0xC00000FD (stack overflow) at EIP 0x%.8X ESP=%.8X\n", c->Eip, c->Esp );
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	g_crashLoggerThread = GetCurrentThreadId();
+	if ( code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR )
+		mp_log( "[MP] EXCEPTION 0x%.8X (%s) at EIP 0x%.8X (%s 0x%.8X) EAX=%.8X EBX=%.8X ECX=%.8X EDX=%.8X ESI=%.8X EDI=%.8X ESP=%.8X\n",
+			code, name, c->Eip,
+			e->ExceptionRecord->ExceptionInformation[0] == 8 ? "executing" : e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+			(uint32_t) e->ExceptionRecord->ExceptionInformation[1],
+			c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Esp );
+	else
+		mp_log( "[MP] EXCEPTION 0x%.8X (%s) at EIP 0x%.8X EAX=%.8X EBX=%.8X ECX=%.8X EDX=%.8X ESI=%.8X EDI=%.8X ESP=%.8X\n",
+			code, name, c->Eip, c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Esp );
 
 	char where[MAX_PATH + 16];
 	if ( DescribeAddress( c->Eip, where, sizeof(where) ) ) mp_log( "[MP]   in %s\n", where );
@@ -192,12 +232,30 @@ static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
 		uint32_t v = 0;
 		if ( !IsBadReadPtr( sp + i, 4 ) ) v = sp[i];
 		if ( v >= 0x401000 && v < 0x869000 ) { mp_log( "[MP]   stack+%02X : 0x%.8X\n", i * 4, v ); shown++; }
-		else if ( v >= 0x10000 && !IsBadCodePtr( (FARPROC) v ) && DescribeAddress( v, where, sizeof(where) ) ) {
+		else if ( v >= 0x10000 && DescribeAddress( v, where, sizeof(where) ) ) {
 			mp_log( "[MP]   stack+%02X : 0x%.8X %s\n", i * 4, v, where );
 			shown++;
 		}
 	}
+	g_crashLoggerThread = 0;
 	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Which mod loader (binkw32.dll) runs us : a crash inside it means something only
+// with its own build at hand. Its size and build time tell builds apart.
+static void LogModLoader()
+{
+	HMODULE loader = GetModuleHandleA( "binkw32.dll" );
+	char path[MAX_PATH] = { 0, };
+	if ( !loader || !GetModuleFileNameA( loader, path, MAX_PATH ) ) { mp_log( "[MP] Mod loader : binkw32.dll isn't loaded?\n" ); return; }
+	IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*) ((uint8_t*) loader + ((IMAGE_DOS_HEADER*) loader)->e_lfanew);
+	time_t built = (time_t) nt->FileHeader.TimeDateStamp;
+	tm t = { 0, };
+	gmtime_s( &t, &built );
+	WIN32_FILE_ATTRIBUTE_DATA a = { 0, };
+	GetFileAttributesExA( path, GetFileExInfoStandard, &a );
+	mp_log( "[MP] Mod loader : %s, %u bytes, built %04d-%02d-%02d %02d:%02d UTC.\n", path, a.nFileSizeLow,
+		t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min );
 }
 
 
@@ -257,6 +315,7 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 // Harry, played in turn on the puppet (which then stops copying Harry's pose), each
 // filmed in a few cropped frames (logs\shots\anim_<n>_f<k>.bmp).
 static bool g_animSurvey = false;
+static int g_crashTest = 0;                       // PTLE_MP_CRASHTEST=av|div|stack : the autotest crashes the game (the crash logger's test).
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
@@ -3743,8 +3802,25 @@ static void AutotestStep( EIHarry* harry )
 static EIHarry* volatile g_harryTickSelf = 0;
 static EIEvilHarryP* volatile g_evilTickSelf = 0;
 
+#pragma optimize( "", off )
+static int CrashTestRecurse( int depth )
+{
+	volatile char room[4096];
+	room[0] = (char) depth;
+	return CrashTestRecurse( depth + 1 ) + room[0];
+}
+static void RunCrashTest()
+{
+	mp_log( "[AT] Crash test %d : crashing now.\n", g_crashTest );
+	if ( g_crashTest == 1 ) *(volatile int*) 0x3B7FB1B1 = 1;
+	if ( g_crashTest == 2 ) { volatile int zero = 0; volatile int x = 1 / zero; (void) x; }
+	if ( g_crashTest == 3 ) CrashTestRecurse( 0 );
+}
+#pragma optimize( "", on )
+
 static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 {
+	if ( g_crashTest && g_harryTicks == 300 ) RunCrashTest();
 	g_harryTickSelf = self;
 	g_origHarryTick( self );
 	self = g_harryTickSelf;
@@ -4391,12 +4467,14 @@ static void LeaveRoom()
 
 static void QuitGame( UINT code )
 {
+	mp_log( "[MP] The game is closing (exit code %u).\n", code );
 	LeaveRoom();
 	g_origExitProcess( code );
 }
 
 static VOID WINAPI ExitProcess_Hook( UINT code )
 {
+	mp_log( "[MP] The game is closing (exit code %u).\n", code );   // A log that ends without this : the game was killed or crashed.
 	LeaveRoom();
 	g_origExitProcess( code );
 }
@@ -4440,6 +4518,7 @@ public:
 			return;
 		}
 		AddVectoredExceptionHandler( 1, CrashLogger );
+		LogModLoader();
 
 		register_types();
 
@@ -4522,6 +4601,10 @@ public:
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
+			if ( GetEnvironmentVariableA( "PTLE_MP_CRASHTEST", env, sizeof(env) ) ) {
+				g_crashTest = strcmp( env, "div" ) == 0 ? 2 : strcmp( env, "stack" ) == 0 ? 3 : 1;
+				mp_log( "[AT] Crash test (%s).\n", env );
+			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_DEATHTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_deathTest = true;
 				mp_log( "[AT] Death test.\n" );
@@ -4565,6 +4648,7 @@ public:
 
 	virtual void onLoadLevel( LoadLevelEvent& e )
 	{
+		mp_log( "[MP] Loading level 0x%.8X.\n", e.getLevelCRC() );
 		ApplyMyOutfit();   // The game clears its cheats while it starts : set again before each level loads.
 		ForgetRetroTextures();
 		SuspectPuppets();
