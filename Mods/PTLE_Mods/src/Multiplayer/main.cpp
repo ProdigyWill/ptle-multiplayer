@@ -2262,6 +2262,31 @@ static const SurveyLevel SURVEY_BIG[] = {
 	{ 0xCD944049, "butterfly_glade" },
 	{ 0x62548B77, "white_valley" },
 };
+// PTLE_MP_SURVEY=3 : every level with water, as William listed them after the
+// 2026-11-14 playtest (name tags flickered on the Great Tree and were gone in Jungle
+// Canyon). Water may draw the scene a second time for its reflection; see
+// water-levels.md.
+static const SurveyLevel SURVEY_WATER[] = {
+	{ 0x0EF63551, "m05_bittenbinders_camp" },
+	{ 0xCD944049, "b62_butterfly_glade" },
+	{ 0x8B372E42, "s57_cavern_lake" },
+	{ 0x8147EA91, "s06_copacanti_lake" },
+	{ 0x3E7EE822, "s60_ekkeko_ice_cavern" },
+	{ 0xECC9D759, "b03_flooded_courtyard" },
+	{ 0x3292B6C9, "a202_great_tree" },
+	{ 0xDEDA69BC, "a100_jungle_canyon" },
+	{ 0x619E1126, "save_a3_ladder_of_miles" },
+	{ 0x07ECCC35, "a05_mama_oullo_tower" },
+	{ 0x1B8833D3, "s58_mountain_sled_run" },   // Water at the very end only.
+	{ 0x1553BBE1, "s50_penguin_den" },
+	{ 0x7652BAFC, "s14_spinja_lair" },
+	{ 0xBA9370DF, "b63_st_claire_day" },
+	{ 0x72AD42FA, "b04_st_claire_night" },
+	{ 0xE6B9138A, "b52_twin_outposts" },
+	{ 0x9D6149E1, "c06_underground_dam" },
+	{ 0x6F498BBD, "s04_viracocha_monoliths" },
+	{ 0x62548B77, "s51_white_valley" },
+};
 static const SurveyLevel* SURVEY_LEVELS = SURVEY_ALL;
 static int NUM_SURVEY_LEVELS = sizeof(SURVEY_ALL) / sizeof(SURVEY_ALL[0]);
 static int g_surveyLoaded = 0, g_surveyDrawn = 0;
@@ -4759,9 +4784,10 @@ public:
 				AUTOTEST_TOTAL_TIMEOUT_MS = 3600000;
 				mp_log( "[AT] Animation survey mode.\n" );
 			}
-			if ( GetEnvironmentVariableA( "PTLE_MP_SURVEY", env, sizeof(env) ) && (env[0] == '1' || env[0] == '2') ) {
+			if ( GetEnvironmentVariableA( "PTLE_MP_SURVEY", env, sizeof(env) ) && (env[0] == '1' || env[0] == '2' || env[0] == '3') ) {
 				g_survey = true;
 				if ( env[0] == '2' ) { SURVEY_LEVELS = SURVEY_BIG; NUM_SURVEY_LEVELS = sizeof(SURVEY_BIG) / sizeof(SURVEY_BIG[0]); }
+				if ( env[0] == '3' ) { SURVEY_LEVELS = SURVEY_WATER; NUM_SURVEY_LEVELS = sizeof(SURVEY_WATER) / sizeof(SURVEY_WATER[0]); }
 				AUTOTEST_TOTAL_TIMEOUT_MS = 1200000;
 				mp_log( "[AT] Level survey mode.\n" );
 			}
