@@ -938,6 +938,8 @@ static void LogStateMachine( EIBeast* beast )
 static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry );
 static int g_puppetsSpawned = 0;   // For the autotest.
 
+static void RememberSpawned( EIEvilHarryP* beast, void* world, int owner );
+
 static void SpawnPuppet( EIHarry* harry )
 {
 	if ( g_cur->beast ) {
@@ -989,6 +991,7 @@ static void SpawnPuppet( EIHarry* harry )
 	g_cur->world = harry->m_world;
 	g_cur->level = Gizmod::getCurrentLevelCRC();
 	g_cur->lastLoggedState = g_cur->lastRequested = -2;
+	RememberSpawned( p, harry->m_world, g_cur->id );
 	int count = 0;
 	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].beast ) count++;
 	mp_log( "[MP] Player %d's puppet spawned (%d puppet(s) in this level).\n", g_cur->id, count );
@@ -1018,17 +1021,47 @@ static void SpawnPuppet( EIHarry* harry )
 	LogStateMachine( p );
 }
 
-// Called when a level loads : the old level's puppet was destroyed with it (already
-// gone by now : don't touch it).
-static void ForgetPuppet()
+// Called when Harry's world or the level changes. The old level's puppets usually
+// went with it, but the level's CRC changes as soon as a load is announced, while the
+// old level still runs a moment : forgetting its puppets then left one standing still
+// in the old area, ticked by the game as its own Evil Harry (a second, frozen copy of
+// its player next to a fresh puppet; 2026-11-16, going back and forth between Turtle
+// Monument and Twin Outposts). So they are only set aside, as when a load is
+// announced : one that ticks again is kept, the others are gone after a second
+// (DropLostPuppets), and only then is a new one spawned. The pointers are only
+// compared, never followed.
+static void ForgetPuppet( EIHarry* harry )
 {
 	int count = 0;
+	DWORD now = GetTickCount();
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
-		if ( g_peers[i].beast || g_peers[i].limbo ) count++;
-		g_peers[i].beast = g_peers[i].limbo = 0;
+		Peer& p = g_peers[i];
+		if ( p.beast ) p.limbo = p.beast;
+		p.beast = 0;
+		if ( p.limbo ) { p.limboSince = now; p.limboTicks = 0; count++; }
+		p.world = harry->m_world;   // So this change isn't seen again.
+		p.level = Gizmod::getCurrentLevelCRC();
 	}
-	if ( count ) mp_log( "[MP] New level, %d puppet(s) went with the old one.\n", count );
+	if ( count ) mp_log( "[MP] New level, %d puppet(s) set aside (kept if they're still here).\n", count );
 	ResetHistory();
+}
+
+// Every puppet spawned in Harry's current world, to catch one nobody drives any more
+// (an orphan) : it would stand still, a frozen copy of its player.
+struct SpawnedPuppet { EIEvilHarryP* beast; void* world; int owner; bool reported; };
+static const int MAX_SPAWNED = 32;
+static SpawnedPuppet g_spawned[MAX_SPAWNED];
+static int g_spawnedCount = 0;
+static volatile LONG g_orphansFound = 0;
+
+static void RememberSpawned( EIEvilHarryP* beast, void* world, int owner )
+{
+	int keep = 0;   // Puppets of other worlds went with them.
+	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].world == world && g_spawned[i].beast != beast ) g_spawned[keep++] = g_spawned[i];
+	g_spawnedCount = keep;
+	if ( g_spawnedCount == MAX_SPAWNED ) { memmove( g_spawned, g_spawned + 1, (MAX_SPAWNED - 1) * sizeof(SpawnedPuppet) ); g_spawnedCount--; }
+	SpawnedPuppet s = { beast, world, owner, false };
+	g_spawned[g_spawnedCount++] = s;
 }
 
 // The game announces a level load when one loads, but also when Harry dies and
@@ -1061,7 +1094,8 @@ static Peer* ReclaimPuppet( EIEvilHarryP* beast )
 		p.beast = beast;
 		p.limbo = 0;
 		p.lastLoggedState = p.lastRequested = -2;
-		mp_log( "[MP] Player %d's puppet is still there (same level) : kept.\n", i );
+		if ( EIHarry* harry = Gizmod::getHarry() ) { p.world = harry->m_world; p.level = Gizmod::getCurrentLevelCRC(); }
+		mp_log( "[MP] Player %d's puppet is still there : kept.\n", i );
 		return &p;
 	}
 	return 0;
@@ -3931,7 +3965,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const Peer& p = g_peers[i];
 		if ( (p.beast || p.limbo) && (self->m_world != p.world || Gizmod::getCurrentLevelCRC() != p.level) ) {
-			ForgetPuppet();
+			ForgetPuppet( self );
 			break;
 		}
 	}
@@ -4029,11 +4063,46 @@ static void HookThrownFromWater( EIEvilHarryP* b )
 	if ( !hooked && !warned ) warned = true, mp_log( "[MP] Evil Harry's \"thrown from water\" isn't where we expect : puppets may freeze in water.\n" );
 }
 
+// A puppet we spawned in this world that no player has any more. Given back to its
+// player if they have none (false : it ticks on as theirs); otherwise sent far below
+// the level and not ticked, out of sight (true).
+static bool HandleOrphan( EIEvilHarryP* self )
+{
+	EIHarry* harry = Gizmod::getHarry();
+	if ( !harry ) return false;
+	for ( int i = 0; i < g_spawnedCount; i++ ) {
+		SpawnedPuppet& s = g_spawned[i];
+		if ( s.beast != self || s.world != harry->m_world ) continue;
+		Peer& owner = g_peers[s.owner];
+		if ( !owner.beast && !owner.limbo ) {
+			owner.beast = self;
+			owner.world = harry->m_world;
+			owner.level = Gizmod::getCurrentLevelCRC();
+			owner.lastLoggedState = owner.lastRequested = -2;
+			owner.shownOutfit = -1;
+			InterlockedIncrement( &g_orphansFound );
+			mp_log( "[MP] Player %d's old puppet 0x%.8X ticked with nobody driving it : given back to them.\n", s.owner, self );
+			return false;
+		}
+		if ( !s.reported ) {
+			s.reported = true;
+			InterlockedIncrement( &g_orphansFound );
+			mp_log( "[MP] Player %d's old puppet 0x%.8X ticked with nobody driving it, and they have another : hidden.\n", s.owner, self );
+		}
+		Vector3f away = { self->EIBeast::m_position.x, self->EIBeast::m_position.y, -5000.0F };
+		EICharacter_SetPos( self, &away, true );
+		return true;
+	}
+	return false;
+}
+
 static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 {
 	HookThrownFromWater( self );
 	Peer* peer = FindPeer( self );
 	if ( !peer ) peer = ReclaimPuppet( self );
+	if ( !peer && HandleOrphan( self ) ) return;
+	if ( !peer ) peer = FindPeer( self );   // Given back to its player.
 	if ( !peer ) {   // The game's own Evil Harry.
 		g_origEvilHarryTick( self );
 		return;
