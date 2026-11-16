@@ -1702,11 +1702,30 @@ static const LookAtFunc CameraLookAt = (LookAtFunc) 0x6EE560;
 static Matrix4f g_cameraWorld;
 static bool g_haveCamera = false;
 
+// Diagnostics (name tags near water) : the look-ats of the frame, and where the
+// puppet was drawn. Reset by the survey; logged per level.
+struct TagDiag
+{
+	int frames, lookAts, maxLookAts;
+	int drawsOnScreen, drawsElsewhere, behind, noted;
+	UINT elseW, elseH, screenW, screenH;
+	int lookAtsThisFrame;
+	Vector3f eyes[4];                 // This frame's look-ats (eye positions).
+	int sampleLogged;
+};
+static TagDiag g_tagDiag;
+static bool g_tagDiagOn = false;
+
 static Matrix4f* __fastcall CameraLookAt_Hook( Matrix4f* self, void*, Vector3f* eye, Vector3f* target, Vector3f* up )
 {
 	Matrix4f* m = CameraLookAt( self, eye, target, up );
 	g_cameraWorld = *m;
 	g_haveCamera = true;
+	if ( g_tagDiagOn ) {
+		if ( g_tagDiag.lookAtsThisFrame < 4 ) g_tagDiag.eyes[g_tagDiag.lookAtsThisFrame] = *eye;
+		g_tagDiag.lookAtsThisFrame++;
+		g_tagDiag.lookAts++;
+	}
 	return m;
 }
 
@@ -1758,16 +1777,43 @@ static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
 	D3DVIEWPORT9 vp;
 	if ( !dev || FAILED( dev->GetViewport( &vp ) ) ) return;
 
-	// Some levels also draw him into a texture (Mama-Oullo Tower, the Great Tree :
-	// their water's reflection), with another viewport and camera : a tag noted
-	// there landed far from his head. Only the screen's own image counts.
+	// Levels with water also draw him into a 512x512 texture, their reflection. Some
+	// draw him once for the screen and once for it (the Great Tree, Butterfly Glade);
+	// others once only, while the reflection's texture is the target, and the screen
+	// shows that same draw (Jungle Canyon, Bittenbinder's Camp, Cavern Lake...). Only
+	// accepting a draw to the screen left those without a tag, and the Great Tree's
+	// flickering in the frames it skipped the screen's. The camera captured is the
+	// main view's whatever the target (one look-at a frame, water levels too), so
+	// the tag is placed with it on the screen's own image, whichever draw this is.
 	IDirect3DSurface9* target = 0;
 	IDirect3DSurface9* screen = 0;
 	bool onScreen = SUCCEEDED( dev->GetRenderTarget( 0, &target ) ) && SUCCEEDED( dev->GetBackBuffer( 0, 0, D3DBACKBUFFER_TYPE_MONO, &screen ) ) && target == screen;
+	D3DSURFACE_DESC screenDesc = { };
+	bool haveScreen = screen && SUCCEEDED( screen->GetDesc( &screenDesc ) );
 	if ( target ) target->Release();
 	if ( screen ) screen->Release();
+	if ( !onScreen ) {
+		if ( !haveScreen ) return;
+		vp.X = vp.Y = 0;
+		vp.Width = screenDesc.Width;
+		vp.Height = screenDesc.Height;
+	}
 	g_tagPasses[onScreen ? 1 : 0]++;
-	if ( !onScreen ) return;
+	if ( g_tagDiagOn ) {
+		D3DSURFACE_DESC d = { };
+		IDirect3DSurface9* rt = 0;
+		if ( SUCCEEDED( dev->GetRenderTarget( 0, &rt ) ) && rt ) { rt->GetDesc( &d ); rt->Release(); }
+		if ( onScreen ) { g_tagDiag.drawsOnScreen++; g_tagDiag.screenW = d.Width; g_tagDiag.screenH = d.Height; }
+		else { g_tagDiag.drawsElsewhere++; g_tagDiag.elseW = d.Width; g_tagDiag.elseH = d.Height; }
+		if ( g_tagDiag.frames >= 30 && g_tagDiag.sampleLogged < 2 ) {
+			g_tagDiag.sampleLogged++;
+			const float* e = &g_cameraWorld.data[3][0];
+			mp_log( "[AT] TAGS sample : draw to %s %ux%u, viewport %ux%u at (%u, %u); camera eye now (%.1f, %.1f, %.1f); %d look-at(s) this frame so far :\n",
+				onScreen ? "screen" : "other target", d.Width, d.Height, vp.Width, vp.Height, vp.X, vp.Y, e[0], e[1], e[2], g_tagDiag.lookAtsThisFrame );
+			for ( int i = 0; i < g_tagDiag.lookAtsThisFrame && i < 4; i++ )
+				mp_log( "[AT]   look-at %d : eye (%.1f, %.1f, %.1f)\n", i, g_tagDiag.eyes[i].x, g_tagDiag.eyes[i].y, g_tagDiag.eyes[i].z );
+		}
+	}
 
 	// Above his head : his transform is at his feet. (The highest bone isn't reliable :
 	// some bones, not drawn, sit far above him in some poses.)
@@ -1777,7 +1823,8 @@ static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
 	float v[4], c[4];   // Row vector times view, times projection.
 	for ( int j = 0; j < 4; j++ ) v[j] = x * view.data[0][j] + y * view.data[1][j] + z * view.data[2][j] + view.data[3][j];
 	for ( int j = 0; j < 4; j++ ) c[j] = v[0] * proj[j] + v[1] * proj[4 + j] + v[2] * proj[8 + j] + v[3] * proj[12 + j];
-	if ( c[3] < 0.1F ) return;   // Behind the camera.
+	if ( c[3] < 0.1F ) { if ( g_tagDiagOn ) g_tagDiag.behind++; return; }   // Behind the camera.
+	if ( g_tagDiagOn ) g_tagDiag.noted++;
 	peer->tagX = vp.X + (c[0] / c[3] + 1.0F) * 0.5F * vp.Width;
 	peer->tagY = vp.Y + (1.0F - c[1] / c[3]) * 0.5F * vp.Height;
 	peer->tagDepth = c[3];
@@ -2470,6 +2517,11 @@ static HRESULT __stdcall Present_Hook( IDirect3DDevice9* dev, const RECT* src, c
 	if ( NetNowMs() - g_lastNetUpdate > 250 ) NetUpdate();
 	DrawOverlay( dev );
 	g_presentCount++;
+	if ( g_tagDiagOn ) {
+		g_tagDiag.frames++;
+		if ( g_tagDiag.lookAtsThisFrame > g_tagDiag.maxLookAts ) g_tagDiag.maxLookAts = g_tagDiag.lookAtsThisFrame;
+		g_tagDiag.lookAtsThisFrame = 0;
+	}
 	if ( g_cropPending ) {
 		GrabBackBuffer( dev, g_cropName, &g_crop );
 		InterlockedExchange( &g_cropPending, 0 );
@@ -3080,6 +3132,8 @@ static void AutotestStep( EIHarry* harry )
 		SpawnPuppet( harry );
 		phase = 102; phaseStart = now;
 		lastHarryTicks = g_puppetPoseCopies;
+		memset( &g_tagDiag, 0, sizeof(g_tagDiag) );
+		g_tagDiagOn = true;
 		break;
 	case 102:   // Survey : look.
 		if ( now - phaseStart < 3000 ) break;
@@ -3090,6 +3144,11 @@ static void AutotestStep( EIHarry* harry )
 			if ( draws > 0 ) g_surveyDrawn++;
 			mp_log( "[AT] SURVEY %s : spawned %s, model %s, drawn %d times in 3 s.\n", SURVEY_LEVELS[step].name,
 				g_cur->beast ? "yes" : "NO", loaded ? "loaded" : "MISSING", draws );
+			g_tagDiagOn = false;
+			const TagDiag& d = g_tagDiag;
+			mp_log( "[AT] TAGS %s : %d frames, %.2f look-ats a frame (max %d); puppet drawn to the screen %d times (%ux%u), elsewhere %d (%ux%u); tag noted %d, behind the camera %d.\n",
+				SURVEY_LEVELS[step].name, d.frames, d.frames ? (float) d.lookAts / d.frames : 0.0F, d.maxLookAts,
+				d.drawsOnScreen, d.screenW, d.screenH, d.drawsElsewhere, d.elseW, d.elseH, d.noted, d.behind );
 			char shot[64];
 			sprintf_s( shot, "survey_%02d_%s", step, SURVEY_LEVELS[step].name );
 			RequestSnapshot( shot );
