@@ -4,13 +4,15 @@
 # first after changes).
 #
 #   powershell -ExecutionPolicy Bypass -File run-duo-test.ps1 [-Server 127.0.0.1:27777] [-Players 2] [-TimeoutSec 480]
+#       [-PlayerEnv 'PTLE_MP_PITTEST=4|PTLE_MP_PITTEST=5']   (more settings for each game, in order, between | : NAME=value;NAME=value)
 #
 # Results : %LOCALAPPDATA%\PTLE Multiplayer\logs\a\, logs\b\... (log + screenshots).
 
 param(
 	[string] $Server = '127.0.0.1:27777',
 	[ValidateRange(2, 8)] [int] $Players = 2,
-	[int] $TimeoutSec = 480
+	[int] $TimeoutSec = 480,
+	[string] $PlayerEnv = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +37,11 @@ foreach ($name in $names) {
 		# The first two as Retro Harry, each in their own colours (hair, skin, shirt, trousers); the others in another outfit each.
 		PTLE_MP_OUTFIT = "$(@(3, 3, 1, 2, 0, 1, 2, 0)[[array]::IndexOf($names, $name)])"
 		PTLE_MP_COLORS = "$(@('F5F5F5,FFA17B,DC3228,3264DC', '1E1E1E,FFA17B,F0D73C,9650C8', '', '', '', '', '', '')[[array]::IndexOf($names, $name)])"
+	}
+	$i = [array]::IndexOf($names, $name)
+	$perGame = @($PlayerEnv -split '\|')
+	if ($PlayerEnv -and $i -lt $perGame.Count) {
+		foreach ($pair in ($perGame[$i] -split ';')) { if ($pair -match '^([^=]+)=(.*)$') { $vars[$Matches[1]] = $Matches[2]; Write-Host "== Game $name : $($Matches[1])=$($Matches[2])" } }
 	}
 	foreach ($k in $vars.Keys) { Set-Item "Env:$k" $vars[$k] }
 	try {

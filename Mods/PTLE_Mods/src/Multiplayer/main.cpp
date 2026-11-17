@@ -318,6 +318,7 @@ static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the au
 // filmed in a few cropped frames (logs\shots\anim_<n>_f<k>.bmp).
 static bool g_animSurvey = false;
 static int g_crashTest = 0;                       // PTLE_MP_CRASHTEST=av|div|stack : the autotest crashes the game (the crash logger's test).
+static int g_pitTest = 0;                        // PTLE_MP_PITTEST=1 : Harry walks into Crash Site's pitfall, the puppet right behind him; 2 : the puppet (ahead of him) goes in alone, as another player's does.
 static int g_iceTest = 0;                         // PTLE_MP_ICETEST=1 : the autotest puts the puppet in "thrown from water"; 2 : walks Harry (and the puppet) into Spinja Lair's cold water. PTLE_MP_ICEALLOW=1 : let it freeze, as before the fix.
 static bool g_allowPuppetFreeze = false;
 static volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
@@ -338,7 +339,8 @@ static uint32_t ShownLevel()
 	return g_levelLeaving ? 0 : Gizmod::getCurrentLevelCRC();
 }
 
-static bool g_aimTest = false;                   // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
+static int g_aimTest = 0;   // 2 : with the raft out instead (Down looks from Harry's head, the raft isn't drawn).
+                   // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
 static bool g_menuTest = false;                  // PTLE_MP_MENUTEST=1 : the autotest drives the menu (F1).
@@ -391,6 +393,9 @@ struct Peer
 	int mirrorSlot;
 	uint32_t mirrorClip;
 	int lastLoggedState, lastRequested;
+	DWORD lastTick;                    // When the puppet last ticked (GetTickCount).
+	int ticks;
+	EIEvilHarryP* watched;             // The puppet lastTick is about (see ReplaceStalledPuppets).
 
 	// Where their name tag goes (screen pixels), noted when the puppet renders.
 	float tagX, tagY, tagDepth;
@@ -855,8 +860,11 @@ static int GetHeldItem( EIHarry* harry )
 
 static void ApplyMyOutfit();
 
+static void KeepUndrawnItem( EIHarry* harry );
+
 static void PushLocalSnapshot( EIHarry* harry )
 {
+	KeepUndrawnItem( harry );
 	SendLocalSnapshot();   // The previous one, complete now.
 
 	int worn = 0;
@@ -1151,6 +1159,35 @@ static Peer* ReclaimPuppet( EIEvilHarryP* beast )
 		return &p;
 	}
 	return 0;
+}
+
+// A puppet the game stopped ticking while its player is here : a pitfall caught it
+// as they were eaten on their screen (it stops a character it catches; ours stayed
+// in the pit, not drawn, and its player was never shown again until a reload). Far
+// away or not, a puppet ticks every frame, so two seconds without one means it's
+// gone : it's set aside (kept if it ticks again) and its player gets a new one.
+static bool g_testStallPuppet = false;   // Autotest : the puppet's ticks are skipped...
+static EIEvilHarryP* g_testStalled = 0;  // ...this one's.
+static const DWORD PUPPET_STALL_MS = 2000;
+
+static void ReplaceStalledPuppets()   // Each Harry tick.
+{
+	DWORD now = GetTickCount();
+	static DWORD lastCall = 0;
+	bool paused = now - lastCall > 500;   // Harry didn't tick either (a pause, a load) : nothing stalled.
+	lastCall = now;
+	if ( g_levelLeaving ) return;
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		Peer& p = g_peers[i];
+		if ( p.beast != p.watched || paused ) { p.watched = p.beast; p.lastTick = now; }
+		if ( !p.beast || now - p.lastTick <= PUPPET_STALL_MS ) continue;
+		mp_log( "[MP] Player %d's puppet 0x%.8X hasn't ticked for %u ms (a pitfall caught it?) : replaced.\n", i, p.beast, now - p.lastTick );
+		p.limbo = p.beast;
+		p.beast = 0;
+		p.watched = 0;
+		p.limboSince = now;
+		p.limboTicks = 0;
+	}
 }
 
 static void DropLostPuppets()   // Each Harry tick.
@@ -1603,6 +1640,8 @@ static ItemDrawFunc g_origItemDraw[NUM_DRAWN_ITEMS];
 static RenderFunc g_origEvilHarryRender = 0;
 
 static int g_puppetItemDraws = 0;     // For the autotest.
+static int g_aimItemDraws = 0;
+static bool g_testSkipHarryItemDraw = false;   // Autotest : Harry's item isn't drawn (as with the camera in his head).
 static int g_copyDrawsAlone = 0;      // For the autotest : copies drawn while Harry draws no item.
 static DWORD g_harryItemDrawTime = 0;
 
@@ -1635,6 +1674,41 @@ static void NoteHarryItemDraw( int slot, void* item )
 	s->itemState = FIELD( item, int, ITEM_STATE );
 	s->drawnSlot = slot;
 	g_harryItemDrawTime = GetTickCount();
+}
+
+// The game doesn't draw Harry's item when it doesn't need to (on the raft beside a
+// wall, the camera goes into his head : the raft isn't drawn), but it's still out :
+// the others kept seeing his raft vanish. While the item last drawn is still out,
+// a frame without its draw sends it as it was last drawn (relative to Harry).
+static struct { int slot; int itemState; int itemBones; Matrix4f itemLocal; Matrix4f itemPose[MAX_ITEM_BONES]; } g_lastItemDraw = { -1 };
+
+static void KeepUndrawnItem( EIHarry* harry )   // On the snapshot about to be sent.
+{
+	if ( !g_haveLocal ) return;
+	PlayerSnapshot& s = g_local;
+	if ( s.drawnSlot >= 0 ) {   // Drawn : noted.
+		g_lastItemDraw.slot = s.drawnSlot;
+		g_lastItemDraw.itemState = s.itemState;
+		g_lastItemDraw.itemBones = s.itemBones;
+		g_lastItemDraw.itemLocal = s.itemLocal;
+		if ( s.itemBones > 0 ) memcpy( g_lastItemDraw.itemPose, s.itemPose, s.itemBones * sizeof(Matrix4f) );
+		return;
+	}
+	int slot = g_lastItemDraw.slot;
+	if ( slot < 0 ) return;
+	int index = DRAWN_ITEMS[slot].item;
+	uint8_t* item = (uint8_t*) GetItemObject( index );
+	if ( !item || GetHeldItem( harry ) != index || FIELD( item, int, ITEM_STATE ) != 3 ) { g_lastItemDraw.slot = -1; return; }   // Put away.
+	s.drawnSlot = slot;
+	s.itemState = g_lastItemDraw.itemState;
+	s.itemBones = g_lastItemDraw.itemBones;
+	s.itemLocal = g_lastItemDraw.itemLocal;
+	if ( s.itemBones > 0 ) memcpy( s.itemPose, g_lastItemDraw.itemPose, s.itemBones * sizeof(Matrix4f) );
+	static DWORD lastLog = 0;
+	if ( GetTickCount() - lastLog > 5000 ) {
+		lastLog = GetTickCount();
+		mp_log( "[MP] Harry's item %d is out but wasn't drawn (camera in his head?) : sent as last drawn.\n", index );
+	}
 }
 
 // Swaps a Matrix4f field (maybe not 16-byte aligned) for "m * base", keeping the old one.
@@ -1717,6 +1791,7 @@ static void DrawPuppetItem( int slot, void* context, void* arg )
 #define ITEM_DRAW_HOOK( n ) \
 	static void __fastcall ItemDraw_Hook##n( void* item, void*, void* context, void* arg ) \
 	{ \
+		if ( g_testSkipHarryItemDraw && FIELD( item, EIHarry*, ITEM_OWNER ) == Gizmod::getHarry() ) return; \
 		g_origItemDraw[n]( item, context, arg ); \
 		NoteHarryItemDraw( n, item ); \
 	}
@@ -3399,6 +3474,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
 		if ( g_aimTest ) { phase = 900; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
+		if ( g_pitTest ) { phase = 1000; phaseStart = now; step = 0; break; }
 		if ( g_iceTest ) { phase = 800; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
 		break;
@@ -3463,8 +3539,103 @@ static void AutotestStep( EIHarry* harry )
 		}
 		break;
 	}
+	case 1000: {   // Pitfall : Harry walks into the pit and is eaten; he comes back, the puppet must follow him back.
+		if ( g_pitTest >= 4 ) {   // Two games : 4 walks into the pit, 5 stays at the start and watches the other's puppet.
+			static DWORD lastLog = 0;
+			static int drawsAt = 0, ticksAt = 0;
+			DWORD t = now - phaseStart;
+			if ( g_pitTest == 4 && step == 0 && t >= 15000 ) {
+				mp_log( "[AT] Pit : walking into the pit.\n" );
+				InterlockedExchange( &g_holdMs, 6000 ); InterlockedExchange( &g_holdKey, 'W' );
+				step = 1;
+			}
+			if ( now - lastLog >= 500 ) {
+				lastLog = now;
+				const Vector3f& h = harry->m_position;
+				EIEvilHarryP* b = g_cur->beast;
+				const PlayerSnapshot* tg = GetPuppetTarget();
+				mp_log( "[AT] Pit %5u ms : Harry (%.1f, %.1f, %.1f) health %d | other's puppet 0x%.8X at (%.1f, %.1f, %.1f), their place %s (%.1f, %.1f, %.1f), ticked %d (last %u ms ago), drawn %d\n",
+					t, h.x, h.y, h.z, harry->m_healthValue, b, b ? b->EIBeast::m_position.x : 0.0F, b ? b->EIBeast::m_position.y : 0.0F, b ? b->EIBeast::m_position.z : 0.0F,
+					tg ? "known" : "unknown", tg ? tg->position.x : 0.0F, tg ? tg->position.y : 0.0F, tg ? tg->position.z : 0.0F,
+					g_cur->ticks, GetTickCount() - g_cur->lastTick, g_puppetPoseCopies );
+			}
+			if ( g_pitTest == 5 && ( t == 0 || (t >= 20000 && t < 20100) || (t >= 24000 && t < 24100) || (t >= 32000 && t < 32100) ) && !snapped ) { }
+			if ( g_pitTest == 5 && step == 0 && t >= 21000 ) { RequestSnapshot( "pit_w1_eating" ); step = 1; }
+			if ( g_pitTest == 5 && step == 1 && t >= 26000 ) { RequestSnapshot( "pit_w2_eaten" ); step = 2; }
+			if ( step == 2 && t >= 40000 ) { RequestSnapshot( "pit_w3_back" ); drawsAt = g_puppetPoseCopies; ticksAt = g_cur->ticks; step = 3; }
+			if ( g_pitTest == 4 && step == 1 && t >= 40000 ) step = 3;
+			if ( step == 3 && t >= (g_pitTest == 4 ? 60000u : 45000u) ) {   // (The eater stays a while : the watcher checks while it's still here.)
+				EIEvilHarryP* b = g_cur->beast;
+				const PlayerSnapshot* tg = GetPuppetTarget();
+				float d = 999.0F;
+				if ( b && tg ) { float dx = b->EIBeast::m_position.x - tg->position.x, dy = b->EIBeast::m_position.y - tg->position.y, dz = b->EIBeast::m_position.z - tg->position.z; d = sqrtf( dx * dx + dy * dy + dz * dz ); }
+				int draws = g_puppetPoseCopies - drawsAt, ticks = g_cur->ticks - ticksAt;
+				bool ok = g_pitTest == 4 || (b && d < 6.0F && draws > 30 && ticks > 30);
+				mp_log( "[AT] Pit : %s (the other's puppet 0x%.8X %.1f from their place, drawn %d and ticked %d times in 5 s, %d spawned in all).\n",
+					ok ? "the other is shown" : "FAIL", b, d, draws, ticks, g_puppetsSpawned );
+				if ( g_pitTest == 5 ) RequestSnapshot( "pit_w4_after" );
+				InterlockedExchange( &g_autotestDone, ok ? 1 : 2 );
+			}
+			break;
+		}
+		static DWORD lastLog = 0;
+		static int drawsAt = 0;
+		DWORD t = now - phaseStart;
+		if ( step == 0 && t >= 2000 ) {
+			RequestSnapshot( "pit_0_before" );
+			mp_log( "[AT] Pit : walking forward.\n" );
+			InterlockedExchange( &g_holdMs, g_pitTest == 3 ? 1500 : g_pitTest == 2 ? 3800 : 6000 ); InterlockedExchange( &g_holdKey, 'W' );
+			step = 1;
+		}
+		if ( g_pitTest == 3 && step >= 1 && t >= 6000 && t < 12000 ) {
+			// Another player eaten by the pit, as we receive it : down into it (it opened
+			// on their screen, not here), from the ground to 60 below in 2 s, and held.
+			float depth = t < 8000 ? (t - 6000) / 2000.0F * 60.0F : 60.0F;
+			const Vector3f& h = harry->m_position;
+			g_puppetOffset.x = -0.1F - h.x; g_puppetOffset.y = 633.6F - h.y; g_puppetOffset.z = -8.9F - depth - h.z;
+		}
+		if ( g_pitTest == 3 ) {
+			g_testStallPuppet = t >= 8000 && t < 16000;   // Caught by the pit (here, as if).
+			if ( g_testStallPuppet && !g_testStalled ) g_testStalled = g_cur->beast;
+			if ( !g_cur->beast && !g_cur->limbo && t >= 8000 ) {
+				mp_log( "[AT] Pit : the caught puppet was dropped : spawning another.\n" );
+				SpawnPuppet( harry );
+			}
+		}
+		if ( g_pitTest == 3 && t >= 12000 && (g_puppetOffset.y != 0.0F || g_puppetOffset.z != 0.0F) ) {
+			mp_log( "[AT] Pit : the eaten player is back (puppet jumps to Harry).\n" );
+			g_puppetOffset.x = g_puppetOffset.y = g_puppetOffset.z = 0.0F;
+		}
+		if ( g_pitTest == 2 && step >= 1 && t >= 12000 && g_puppetOffset.y != 0.0F ) {
+			mp_log( "[AT] Pit : the puppet's player is back (puppet jumps to Harry).\n" );
+			g_puppetOffset.y = 0.0F;
+		}
+		if ( step == 1 && t >= (g_pitTest == 3 ? 9000u : 5000u) ) { RequestSnapshot( "pit_1_eaten" ); step = 2; }
+		if ( step == 2 && t >= 20000 ) { RequestSnapshot( "pit_2_back" ); drawsAt = g_puppetPoseCopies; step = 3; }
+		if ( now - lastLog >= 250 && t < 30000 ) {
+			lastLog = now;
+			EIEvilHarryP* b = g_cur->beast;
+			const Vector3f& h = harry->m_position;
+			mp_log( "[AT] Pit %5u ms : Harry (%.1f, %.1f, %.1f) health %d | puppet 0x%.8X limbo 0x%.8X at (%.1f, %.1f, %.1f) state %d, target %s, drawn %d\n",
+				t, h.x, h.y, h.z, harry->m_healthValue, b, g_cur->limbo,
+				b ? b->EIBeast::m_position.x : 0.0F, b ? b->EIBeast::m_position.y : 0.0F, b ? b->EIBeast::m_position.z : 0.0F,
+				b ? b->m_stateIndexCurrent : -1, GetPuppetTarget() ? "yes" : "no", g_puppetPoseCopies );
+		}
+		if ( step == 3 && t >= 25000 ) {
+			RequestSnapshot( "pit_3_after" );
+			EIEvilHarryP* b = g_cur->beast;
+			float dx = 0, dy = 0, dz = 0;
+			if ( b ) { dx = b->EIBeast::m_position.x - harry->m_position.x; dy = b->EIBeast::m_position.y - harry->m_position.y; dz = b->EIBeast::m_position.z - harry->m_position.z; }
+			float d = sqrtf( dx * dx + dy * dy + dz * dz );
+			int draws = g_puppetPoseCopies - drawsAt;
+			bool ok = b && d < 6.0F && draws > 30 && (g_pitTest != 3 || g_puppetsSpawned == 2);
+			mp_log( "[AT] Pit : %s (puppet 0x%.8X %.1f from Harry, drawn %d times in 5 s, %d spawned in all).\n", ok ? "puppet back with Harry" : "FAIL", b, d, draws, g_puppetsSpawned );
+			InterlockedExchange( &g_autotestDone, ok ? 1 : 2 );
+		}
+		break;
+	}
 	case 500: {   // Distance : the puppet stands further and further ahead of the camera.
-		static const float DISTANCES[] = { 20.0F, 60.0F, 100.0F, 140.0F, 180.0F, 220.0F, 260.0F, 300.0F, 400.0F };
+		static const float DISTANCES[] = { 20.0F, 60.0F, 100.0F, 140.0F, 180.0F, 220.0F, 260.0F, 300.0F, 400.0F, 800.0F, 1500.0F, 3000.0F };
 		static const int NUM = sizeof(DISTANCES) / sizeof(DISTANCES[0]);
 		static int posesAtStart = 0, passesAtStart = 0;
 		DWORD t = now - phaseStart;
@@ -3481,8 +3652,9 @@ static void AutotestStep( EIHarry* harry )
 			char name[32];
 			sprintf_s( name, "dist_%03d", (int) DISTANCES[step] );
 			RequestSnapshot( name );
-			mp_log( "[AT] Distance %.0f ahead of Harry : render called %d times in 1 s (%d to the screen), tag depth %.1f, tag %s.\n", DISTANCES[step],
-				g_puppetPoseCopies - posesAtStart, g_tagPasses[1] - passesAtStart, g_cur->tagDepth, g_cur->tagFrame == g_presentCount ? "noted" : "not noted" );
+			mp_log( "[AT] Distance %.0f ahead of Harry : render called %d times in 1 s (%d to the screen), tag depth %.1f, tag %s; ticked %d times, last %u ms ago.\n", DISTANCES[step],
+				g_puppetPoseCopies - posesAtStart, g_tagPasses[1] - passesAtStart, g_cur->tagDepth, g_cur->tagFrame == g_presentCount ? "noted" : "not noted",
+				g_cur->ticks, GetTickCount() - g_cur->lastTick );
 			snapped = true;
 		}
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
@@ -3500,12 +3672,14 @@ static void AutotestStep( EIHarry* harry )
 				float fx = -cam.data[2][0], fy = -cam.data[2][1];
 				float l = sqrtf( fx * fx + fy * fy );
 				if ( l > 0.01F ) { g_puppetOffset.x = fx / l * 25.0F; g_puppetOffset.y = fy / l * 25.0F; }
-				bool tnt = InventoryItem::setItemInHand( InventoryItem::TNT );
-				mp_log( "[AT] Aim : TNT in hand : %s.\n", tnt ? "yes" : "NO" );
+				bool tnt = InventoryItem::setItemInHand( g_aimTest == 2 ? InventoryItem::RAFT : InventoryItem::TNT );
+				mp_log( "[AT] Aim : %s in hand : %s.\n", g_aimTest == 2 ? "raft" : "TNT", tnt ? "yes" : "NO" );
 			}
 			if ( t < 3000 ) break;
 			mp_log( "[AT] Aim : before, camera 0x%.8X eye (%.1f, %.1f, %.1f), tag %s at (%.0f, %.0f).\n", g_cameraSite, eye[0], eye[1], eye[2], shown ? "shown" : "NOT shown", tx, ty );
 			RequestSnapshot( "aim_0_before" );
+			g_aimItemDraws = g_puppetItemDraws;
+			if ( g_aimTest == 2 ) g_testSkipHarryItemDraw = true;
 			InterlockedExchange( &g_holdMs, 6000 ); InterlockedExchange( &g_holdKey, VK_DOWN );
 			step = 1; phaseStart = now;
 		}
@@ -3526,6 +3700,10 @@ static void AutotestStep( EIHarry* harry )
 			mp_log( "[AT] Aim : swing into aiming : %d samples, tag turned up/down %d time(s), biggest step %.0f px.\n", samples, reversals, maxStep );
 			mp_log( "[AT] Aim : looking (Down held), camera 0x%.8X eye (%.1f, %.1f, %.1f), tag %s at (%.0f, %.0f).\n", g_cameraSite, eye[0], eye[1], eye[2], shown ? "shown" : "NOT shown", tx, ty );
 			RequestSnapshot( "aim_1_looking" );
+			mp_log( "[AT] Aim : the puppet's item drawn %d times while looking (%d before)%s.\n", g_puppetItemDraws - g_aimItemDraws, g_aimItemDraws,
+				g_testSkipHarryItemDraw ? ", Harry's not drawn" : "" );
+			if ( g_aimTest == 2 && g_puppetItemDraws - g_aimItemDraws < 60 ) { mp_log( "[AT] FAIL : the raft vanished for the others.\n" ); InterlockedExchange( &g_autotestDone, 2 ); }
+			g_testSkipHarryItemDraw = false;
 			{
 				const float* re = &g_rendCam.data[3][0];
 				mp_log( "[AT] Aim : renderer 0x%.8X view set %u time(s) (up to %u a frame), last frame %u (now %u), eye (%.1f, %.1f, %.1f)\n",
@@ -4284,6 +4462,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 		}
 	}
 	DropLostPuppets();
+	ReplaceStalledPuppets();
 	CheckLevelLeaving( self );
 
 	if ( !g_origPresent ) {   // The overlay draws as frames are presented.
@@ -4298,7 +4477,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 		uint32_t now = NetNowMs();
 		for ( int i = 0; i < MAX_PEERS; i++ ) {
 			Peer* p = &g_peers[i];
-			if ( g_autotest && p == MainPeer() ) continue;
+			if ( g_autotest && p == MainPeer() && g_pitTest < 4 ) continue;   // (The two-game pit test : as in play.)
 			if ( p->beast || p->limbo || !p->target || now - p->lastSpawnTry < 1000 ) continue;
 			p->lastSpawnTry = now;
 			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", i );
@@ -4413,6 +4592,7 @@ static bool HandleOrphan( EIEvilHarryP* self )
 
 static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 {
+	if ( g_testStallPuppet && self == g_testStalled ) return;   // Autotest : as if a pitfall caught it.
 	HookThrownFromWater( self );
 	Peer* peer = FindPeer( self );
 	if ( !peer ) peer = ReclaimPuppet( self );
@@ -4422,6 +4602,8 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 		g_origEvilHarryTick( self );
 		return;
 	}
+	peer->lastTick = GetTickCount();
+	peer->ticks++;
 	CurrentPeer current( peer );
 
 	if ( g_skipPuppetAI ) {
@@ -5141,12 +5323,19 @@ public:
 				g_allowPuppetFreeze = GetEnvironmentVariableA( "PTLE_MP_ICEALLOW", env, sizeof(env) ) && env[0] == '1';
 				mp_log( "[AT] Ice test%s.\n", g_allowPuppetFreeze ? " (puppets may freeze)" : "" );
 			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_PITTEST", env, sizeof(env) ) && env[0] >= '1' && env[0] <= '5' ) {
+				g_pitTest = env[0] - '0';
+				AUTOTEST_LEVEL = 0xEE8F6900;   // Crash Site : a pitfall just ahead of the start (Harry walks down -Y into it).
+				g_puppetOffset.x = 0.0F;       // Where Harry was (a quarter second ago), as another player's.
+				if ( g_pitTest == 2 ) g_puppetOffset.y = -45.0F;   // Ahead of him : it reaches the pit, he doesn't.
+				mp_log( "[AT] Pitfall test.\n" );
+			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_DEATHTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_deathTest = true;
 				mp_log( "[AT] Death test.\n" );
 			}
-			if ( GetEnvironmentVariableA( "PTLE_MP_AIMTEST", env, sizeof(env) ) && env[0] == '1' ) {
-				g_aimTest = true;
+			if ( GetEnvironmentVariableA( "PTLE_MP_AIMTEST", env, sizeof(env) ) && (env[0] == '1' || env[0] == '2') ) {
+				g_aimTest = env[0] - '0';
 				mp_log( "[AT] Aim test.\n" );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_DISTTEST", env, sizeof(env) ) && env[0] == '1' ) {
