@@ -322,6 +322,20 @@ static int g_iceTest = 0;                         // PTLE_MP_ICETEST=1 : the aut
 static bool g_allowPuppetFreeze = false;
 static volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
+// Leaving a level (see NoteLevelLeaving) : the old one still runs and is shown.
+static bool g_levelLeaving = false;
+static uint32_t g_tickLevel = 0;   // The level's CRC at Harry's last tick (the one shown).
+
+// The level Harry is in, as far as the others are concerned : the game's CRC is
+// the new level's as soon as a load is announced, but the old one still runs (and
+// Harry in it) a couple of seconds. Saying we were in the new one then showed us
+// to its players at our place in the old one (2026-11-16, Twin Outposts -> Turtle
+// Monument : Harry running in the middle of the level, nowhere near the loadzone).
+static uint32_t ShownLevel()
+{
+	return g_levelLeaving && g_tickLevel ? g_tickLevel : Gizmod::getCurrentLevelCRC();
+}
+
 static bool g_aimTest = false;                   // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
@@ -697,7 +711,7 @@ static void NetUpdate()
 		peer->remote.Add( incoming, h.sequence );
 		peer->lastHeard = now;
 	}
-	uint32_t level = Gizmod::getCurrentLevelCRC();
+	uint32_t level = ShownLevel();
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		PlayerInfo& info = g_players[i];
 		if ( info.present && now - info.lastInfo > INFO_TIMEOUT_MS ) {
@@ -851,7 +865,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 	PlayerSnapshot& s = g_local;
 	s.time          = NetNowMs();
-	s.level         = Gizmod::getCurrentLevelCRC();
+	s.level         = ShownLevel();
 	s.transform     = harry->m_transformMatrix;
 	s.position      = harry->m_position;
 	s.rotationEuler = harry->m_rotationEuler;
@@ -1094,11 +1108,9 @@ static void SuspectPuppets()
 // one : a puppet of a player there was drawn at their place in the new level, in
 // the old one's scenery (a Harry running into the loadzone just left; 2026-11-16,
 // Turtle Monument <-> Twin Outposts). Puppets aren't shown in that time.
-static bool g_levelLeaving = false;
 static void* g_levelLeavingWorld = 0;
 static DWORD g_levelLeavingSince = 0;
 static const DWORD LEVEL_LEAVING_MAX_MS = 8000;   // Should Harry's world not change (it does).
-static uint32_t g_tickLevel = 0;                  // The level's CRC at Harry's last tick (the one shown).
 
 static void NoteLevelLeaving( uint32_t newLevel )
 {
@@ -4649,7 +4661,7 @@ static int BuildPlayerRows( char left[][96], char right[][64], uint32_t* colors,
 {
 	int rows = 0;
 	int me = g_transport ? g_transport->PlayerId() : -1;
-	uint32_t here = Gizmod::getCurrentLevelCRC();
+	uint32_t here = ShownLevel();
 	int count = me >= 0 ? 1 : 0;
 	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_players[i].present && i != me ) count++;
 
