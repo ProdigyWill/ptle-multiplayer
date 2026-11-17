@@ -45,6 +45,7 @@
 #include "gizmod/GizmodPlugin.h"
 #include "gizmod/event/LoadLevelEvent.h"
 #include "gizmod/event/LevelLoadedEvent.h"
+#include "gizmod/item/InventoryItem.h"
 
 #include "injector/injector.hpp"
 
@@ -3362,7 +3363,7 @@ static void AutotestStep( EIHarry* harry )
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
 		break;
 	}
-	case 900: {   // Aim : the puppet ahead; Harry looks in first person (Down held), then back.
+	case 900: {   // Aim : the puppet ahead; Harry takes the TNT and aims it (Down held), then back.
 		DWORD t = now - phaseStart;
 		IDirect3DDevice9* dev = *(IDirect3DDevice9**) RENDERER_DEVICE;
 		float tx = -1.0F, ty = -1.0F, td = 0.0F;
@@ -3374,6 +3375,8 @@ static void AutotestStep( EIHarry* harry )
 				float fx = -cam.data[2][0], fy = -cam.data[2][1];
 				float l = sqrtf( fx * fx + fy * fy );
 				if ( l > 0.01F ) { g_puppetOffset.x = fx / l * 25.0F; g_puppetOffset.y = fy / l * 25.0F; }
+				bool tnt = InventoryItem::setItemInHand( InventoryItem::TNT );
+				mp_log( "[AT] Aim : TNT in hand : %s.\n", tnt ? "yes" : "NO" );
 			}
 			if ( t < 3000 ) break;
 			mp_log( "[AT] Aim : before, camera 0x%.8X eye (%.1f, %.1f, %.1f), tag %s at (%.0f, %.0f).\n", g_cameraSite, eye[0], eye[1], eye[2], shown ? "shown" : "NOT shown", tx, ty );
