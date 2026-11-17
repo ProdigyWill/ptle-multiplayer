@@ -1787,8 +1787,40 @@ static Matrix4f* __fastcall Perspective_Hook( Matrix4f* self, void*, float a, fl
 	return m;
 }
 
+// The renderer's own view (what it draws with) : set through 0x64A480 (a view
+// matrix), 0x64A4C0 (a camera matrix) or 0x64A500 (a look-at), each keeping the
+// view at +0xB0 and the camera's matrix at +0xF0.
+static Matrix4f g_rendCam;
+static uint32_t g_rendFrame = 0, g_rendSets = 0, g_rendSetsThisFrame = 0, g_rendSetsMax = 0;
+static void* g_rendSelf = 0;
+static Vector3f g_rendEyes[4];
+static int g_rendTwiceLogged = 0;
+static void NoteRendererView( void* self )
+{
+	if ( g_rendFrame != g_presentCount ) { g_rendSetsThisFrame = 0; g_rendFrame = g_presentCount; }
+	if ( g_rendSetsThisFrame < 4 ) g_rendEyes[g_rendSetsThisFrame] = *(Vector3f*) ((uint8_t*) self + 0xF0 + 0x30);
+	g_rendSetsThisFrame++;
+	if ( g_rendSetsThisFrame > g_rendSetsMax ) g_rendSetsMax = g_rendSetsThisFrame;
+	g_rendSets++;
+	g_rendSelf = self;
+	g_rendCam = *(Matrix4f*) ((uint8_t*) self + 0xF0);
+}
+typedef void (__thiscall *RendSetMatrixFunc)( void*, Matrix4f* );
+typedef void (__thiscall *RendLookAtFunc)( void*, Vector3f*, Vector3f*, Vector3f* );
+static void __fastcall RendSetView_Hook( void* self, void*, Matrix4f* m ) { ((RendSetMatrixFunc) 0x64A480)( self, m ); NoteRendererView( self ); }
+static void __fastcall RendSetCamera_Hook( void* self, void*, Matrix4f* m ) { ((RendSetMatrixFunc) 0x64A4C0)( self, m ); NoteRendererView( self ); }
+static void __fastcall RendLookAt_Hook( void* self, void*, Vector3f* e, Vector3f* t, Vector3f* u ) { ((RendLookAtFunc) 0x64A500)( self, e, t, u ); NoteRendererView( self ); }
+
 static void HookCamera()
 {
+	{
+		struct { uint32_t site, target; void* hook; } calls[] = {
+			{ 0x634C2E, 0x64A480, &RendSetView_Hook }, { 0x634BFE, 0x64A4C0, &RendSetCamera_Hook }, { 0x634BD6, 0x64A500, &RendLookAt_Hook } };
+		for ( auto& c : calls ) {
+			if ( *(uint8_t*) c.site == 0xE8 && c.site + 5 + *(int32_t*) (c.site + 1) == c.target ) injector::MakeCALL( c.site, c.hook );
+			else mp_log( "[MP] Renderer view call 0x%.8X isn't what we expect.\n", c.site );
+		}
+	}
 	static const uint8_t PERSPECTIVE_ORIGINAL[5] = { 0xE8, 0x6F, 0x9E, 0x0B, 0x00 };   // call 0x6EE990.
 	if ( memcmp( (void*) PERSPECTIVE_CALL, PERSPECTIVE_ORIGINAL, 5 ) == 0 ) injector::MakeCALL( PERSPECTIVE_CALL, &Perspective_Hook );
 	else mp_log( "[MP] The perspective call isn't what we expect.\n" );
@@ -1891,9 +1923,13 @@ static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, flo
 {
 	EIEvilHarryP* p = peer.beast;
 	if ( !p || !peer.tagFrame || g_presentCount - peer.tagFrame > TAG_GRACE_FRAMES ) return false;
-	if ( !g_haveCamera || !g_haveProj || g_presentCount - g_cameraFrame > 1 ) return false;   // A cutscene's camera : not ours.
+	// The view the renderer drew this frame with (the last it was given : any
+	// reflection comes first), whichever camera mode built it. Choosing among the
+	// cameras' own look-ats instead left the tag behind when aiming the TNT, and
+	// jumping about while the camera swung into it.
+	if ( !g_haveProj || g_presentCount - g_rendFrame > 1 ) return false;
 	Matrix4f view;
-	if ( !MatInverseAffine( g_cameraWorld, &view ) ) return false;
+	if ( !MatInverseAffine( g_rendCam, &view ) ) return false;
 	IDirect3DSurface9* screen = 0;
 	D3DSURFACE_DESC d = { };
 	bool ok = SUCCEEDED( dev->GetBackBuffer( 0, 0, D3DBACKBUFFER_TYPE_MONO, &screen ) ) && screen && SUCCEEDED( screen->GetDesc( &d ) );
@@ -2595,6 +2631,12 @@ static HRESULT __stdcall Present_Hook( IDirect3DDevice9* dev, const RECT* src, c
 		g_tagDiag.frames++;
 		if ( g_tagDiag.lookAtsThisFrame > g_tagDiag.maxLookAts ) g_tagDiag.maxLookAts = g_tagDiag.lookAtsThisFrame;
 		g_tagDiag.lookAtsThisFrame = 0;
+		if ( g_rendFrame + 1 == g_presentCount && g_rendSetsThisFrame >= 2 && g_rendTwiceLogged < 6 ) {
+			g_rendTwiceLogged++;
+			mp_log( "[AT] TAGS renderer view set %u times in a frame :", g_rendSetsThisFrame );
+			for ( uint32_t i = 0; i < g_rendSetsThisFrame && i < 4; i++ ) mp_log( " (%.1f, %.1f, %.1f)", g_rendEyes[i].x, g_rendEyes[i].y, g_rendEyes[i].z );
+			mp_log( "; look-at camera (%.1f, %.1f, %.1f).\n", g_cameraWorld.data[3][0], g_cameraWorld.data[3][1], g_cameraWorld.data[3][2] );
+		}
 	}
 	if ( g_cropPending ) {
 		GrabBackBuffer( dev, g_cropName, &g_crop );
@@ -3219,6 +3261,10 @@ static void AutotestStep( EIHarry* harry )
 			mp_log( "[AT] SURVEY %s : spawned %s, model %s, drawn %d times in 3 s.\n", SURVEY_LEVELS[step].name,
 				g_cur->beast ? "yes" : "NO", loaded ? "loaded" : "MISSING", draws );
 			g_tagDiagOn = false;
+			mp_log( "[AT] TAGS %s : renderer view set up to %u times a frame; its eye (%.1f, %.1f, %.1f), the look-at camera's (%.1f, %.1f, %.1f).\n", SURVEY_LEVELS[step].name, g_rendSetsMax,
+				g_rendCam.data[3][0], g_rendCam.data[3][1], g_rendCam.data[3][2], g_cameraWorld.data[3][0], g_cameraWorld.data[3][1], g_cameraWorld.data[3][2] );
+			g_rendSetsMax = 0;
+			g_rendTwiceLogged = 0;
 			const TagDiag& d = g_tagDiag;
 			mp_log( "[AT] TAGS %s : %d frames, %.2f look-ats a frame (max %d); puppet drawn to the screen %d times (%ux%u), elsewhere %d (%ux%u); tag noted %d, behind the camera %d.\n",
 				SURVEY_LEVELS[step].name, d.frames, d.frames ? (float) d.lookAts / d.frames : 0.0F, d.maxLookAts,
@@ -3385,9 +3431,27 @@ static void AutotestStep( EIHarry* harry )
 			step = 1; phaseStart = now;
 		}
 		else if ( step == 1 ) {
+			// The swing into aiming : the tag should glide, not jump up and down.
+			static float lastY, lastDy; static int reversals, samples; static float maxStep;
+			if ( t < 100 ) { lastY = ty; lastDy = 0; reversals = samples = 0; maxStep = 0; }
+			else if ( shown && t < 2000 ) {
+				float dy = ty - lastY;
+				if ( fabsf( dy ) > 2.0F ) {
+					if ( lastDy != 0 && ( dy > 0 ) != ( lastDy > 0 ) ) reversals++;
+					lastDy = dy;
+				}
+				if ( fabsf( dy ) > maxStep ) maxStep = fabsf( dy );
+				lastY = ty; samples++;
+			}
 			if ( t < 3000 ) break;
+			mp_log( "[AT] Aim : swing into aiming : %d samples, tag turned up/down %d time(s), biggest step %.0f px.\n", samples, reversals, maxStep );
 			mp_log( "[AT] Aim : looking (Down held), camera 0x%.8X eye (%.1f, %.1f, %.1f), tag %s at (%.0f, %.0f).\n", g_cameraSite, eye[0], eye[1], eye[2], shown ? "shown" : "NOT shown", tx, ty );
 			RequestSnapshot( "aim_1_looking" );
+			{
+				const float* re = &g_rendCam.data[3][0];
+				mp_log( "[AT] Aim : renderer 0x%.8X view set %u time(s) (up to %u a frame), last frame %u (now %u), eye (%.1f, %.1f, %.1f)\n",
+					g_rendSelf, g_rendSets, g_rendSetsMax, g_rendFrame, g_presentCount, re[0], re[1], re[2] );
+			}
 			step = 2; phaseStart = now;
 		}
 		else if ( step == 2 ) {
