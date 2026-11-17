@@ -330,10 +330,12 @@ static uint32_t g_tickLevel = 0;   // The level's CRC at Harry's last tick (the 
 // the new level's as soon as a load is announced, but the old one still runs (and
 // Harry in it) a couple of seconds. Saying we were in the new one then showed us
 // to its players at our place in the old one (2026-11-16, Twin Outposts -> Turtle
-// Monument : Harry running in the middle of the level, nowhere near the loadzone).
+// Monument : Harry running in the middle of the level, nowhere near the loadzone);
+// saying we were still in the old one showed the game pulling Harry about in the
+// loadzone (rubber-banding). So none : we're hidden until we're in the new one.
 static uint32_t ShownLevel()
 {
-	return g_levelLeaving && g_tickLevel ? g_tickLevel : Gizmod::getCurrentLevelCRC();
+	return g_levelLeaving ? 0 : Gizmod::getCurrentLevelCRC();
 }
 
 static bool g_aimTest = false;                   // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
@@ -1073,8 +1075,8 @@ static volatile LONG g_orphansFound = 0;
 
 static void RememberSpawned( EIEvilHarryP* beast, void* world, int owner )
 {
-	int keep = 0;   // Puppets of other worlds went with them.
-	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].world == world && g_spawned[i].beast != beast ) g_spawned[keep++] = g_spawned[i];
+	int keep = 0;   // Other worlds' are kept too : the old level runs on a moment after a loadzone.
+	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].beast != beast ) g_spawned[keep++] = g_spawned[i];
 	g_spawnedCount = keep;
 	if ( g_spawnedCount == MAX_SPAWNED ) { memmove( g_spawned, g_spawned + 1, (MAX_SPAWNED - 1) * sizeof(SpawnedPuppet) ); g_spawnedCount--; }
 	SpawnedPuppet s = { beast, world, owner, false };
@@ -1122,8 +1124,12 @@ static void NoteLevelLeaving( uint32_t newLevel )
 	mp_log( "[MP] Leaving the level : puppets hidden until the next one is up.\n" );
 }
 
+static void* g_prevWorld = 0;   // Harry's world before this one.
+
 static void CheckLevelLeaving( EIHarry* harry )   // Each Harry tick.
 {
+	static void* world = 0;
+	if ( harry->m_world != world ) { g_prevWorld = world; world = harry->m_world; }
 	if ( !g_levelLeaving || harry->m_world != g_levelLeavingWorld ) g_tickLevel = Gizmod::getCurrentLevelCRC();
 	if ( !g_levelLeaving ) return;
 	bool arrived = harry->m_world != g_levelLeavingWorld;
@@ -1991,10 +1997,39 @@ static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, flo
 	return true;
 }
 
+static bool IsPuppet( const void* beast );
+
 static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* context, void* arg )
 {
 	Peer* peer = FindPeer( self );
-	if ( !peer ) { g_origEvilHarryRender( self, context, arg ); return; }   // The game's own Evil Harry.
+	if ( !peer ) {
+		// One of our puppets nobody drives now (set aside, or left over) : the game
+		// drew it as its own Evil Harry, a frozen copy of its player. Not drawn.
+		// (Only this world's and the last one's : the game's own Evil Harry may reuse
+		// an old puppet's address in a level long gone.)
+		int spawned = -1;
+		EIHarry* me = Gizmod::getHarry();
+		for ( int i = 0; i < g_spawnedCount; i++ )
+			if ( g_spawned[i].beast == self && me && (g_spawned[i].world == me->m_world || g_spawned[i].world == g_prevWorld) ) spawned = i;
+		bool setAside = IsPuppet( self );
+		if ( spawned >= 0 || setAside ) {
+			static void* logged[8];
+			static int numLogged = 0;
+			bool seen = false;
+			for ( int i = 0; i < numLogged; i++ ) if ( logged[i] == self ) seen = true;
+			if ( !seen ) {
+				logged[numLogged++ % 8] = self;
+				if ( numLogged > 8 ) numLogged = 8;
+				EIHarry* harry = Gizmod::getHarry();
+				mp_log( "[MP] Puppet 0x%.8X (%s, player %d) drawn with nobody driving it, at (%.1f, %.1f, %.1f) : hidden.\n", self,
+					setAside ? "set aside" : (harry && g_spawned[spawned].world == harry->m_world ? "left over, this world" : "left over, another world"),
+					spawned >= 0 ? g_spawned[spawned].owner : -1, self->EIBeast::m_position.x, self->EIBeast::m_position.y, self->EIBeast::m_position.z );
+			}
+			return;
+		}
+		g_origEvilHarryRender( self, context, arg );   // The game's own Evil Harry.
+		return;
+	}
 	CurrentPeer current( peer );
 	const PlayerSnapshot* t = GetPuppetTarget();
 	// Online with nobody to show here (they left, or are in another level) : not drawn.
