@@ -91,6 +91,7 @@
     <ClInclude Include="net\affine.h" />
     <ClInclude Include="overlay.h" />
     <ClInclude Include="menu.h" />
+    <ClInclude Include="version.h" />
     <ClInclude Include="net\protocol.h" />
     <ClInclude Include="net\remote.h" />
     <ClInclude Include="net\snapshot.h" />

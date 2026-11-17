@@ -60,6 +60,7 @@
 
 #include "utils/func.h"
 
+#include "version.h"
 #include "net/protocol.h"
 #include "net/remote.h"
 #include "net/snapshot.h"
@@ -452,7 +453,10 @@ struct PlayerInfo
 	uint32_t lastInfo;
 	uint8_t outfit;
 	uint8_t colors[RETRO_PARTS][3];
+	char version[16];    // Their mod's (MP_VERSION); empty : a build from before versions.
 };
+static const int MAX_VERSION = 15;
+static char g_myVersion[MAX_VERSION + 1] = MP_VERSION;   // Sent to the others (tests : PTLE_MP_FAKEVERSION, another one).
 static PlayerInfo g_players[MAX_PEERS];
 static char g_myName[MAX_NAME + 1] = "Harry";
 static char g_roomName[64] = "";
@@ -696,11 +700,21 @@ static void NetUpdate()
 			info.outfit = (extra < length && packet[extra] < NUM_OUTFITS) ? packet[extra] : 0;
 			if ( extra + 1 + (int) sizeof(info.colors) <= length ) memcpy( info.colors, packet + extra + 1, sizeof(info.colors) );
 			else memcpy( info.colors, RETRO_DEFAULT, sizeof(info.colors) );
+			int at = extra + 1 + (int) sizeof(info.colors);   // Then the version : u8 length, text (not sent before versions).
+			char version[MAX_VERSION + 1] = "";
+			if ( at < length && packet[at] <= MAX_VERSION && at + 1 + packet[at] <= length ) CleanName( (const char*) packet + at + 1, packet[at], version );
+			bool versionNews = !info.present || strcmp( info.version, version ) != 0;
+			strcpy_s( info.version, version );
 			if ( !info.present || strcmp( info.name, name ) != 0 ) {
 				mp_log( "[NET] Player %d is \"%s\", in %s.\n", h.player, name, LevelName( info.level ) );
 				if ( !info.present && h.player != me ) Toast( "%s joined", name );
 				strcpy_s( info.name, name );
 				info.present = true;
+			}
+			if ( versionNews ) {
+				mp_log( "[NET] Player %d has version %s.\n", h.player, version[0] ? version : "(older, none sent)" );
+				if ( h.player != me && strcmp( version, MP_VERSION ) != 0 )
+					Toast( "%s has %s%s (you : %s)", name, version[0] ? "version " : "an older version", version, MP_VERSION );
 			}
 			continue;
 		}
@@ -734,7 +748,7 @@ static void NetUpdate()
 	}
 	if ( me >= 0 && now - g_lastInfoSent >= INFO_INTERVAL_MS ) {   // Who we are, where.
 		g_lastInfoSent = now;
-		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1 + sizeof(g_myColors)];
+		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1 + sizeof(g_myColors) + 1 + MAX_VERSION];
 		EncodeHeader( PACKET_INFO, (uint8_t) me, 0, info );
 		uint32_t where = g_haveLocal ? level : 0;
 		memcpy( info + PACKET_HEADER_SIZE, &where, 4 );
@@ -743,7 +757,12 @@ static void NetUpdate()
 		memcpy( info + PACKET_HEADER_SIZE + 5, g_myName, n );
 		info[PACKET_HEADER_SIZE + 5 + n] = (uint8_t) g_myWornOutfit;
 		memcpy( info + PACKET_HEADER_SIZE + 5 + n + 1, g_myColors, sizeof(g_myColors) );
-		g_transport->Send( info, PACKET_HEADER_SIZE + 5 + n + 1 + sizeof(g_myColors) );
+		int at = PACKET_HEADER_SIZE + 5 + n + 1 + sizeof(g_myColors);
+		static_assert( sizeof(MP_VERSION) - 1 <= MAX_VERSION, "version too long" );
+		int v = (int) strlen( g_myVersion );
+		info[at] = (uint8_t) v;
+		memcpy( info + at + 1, g_myVersion, v );
+		g_transport->Send( info, at + 1 + v );
 	}
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer* peer = &g_peers[i];
@@ -5081,6 +5100,7 @@ static void ReadNetConfig( NetConfig* c )
 		for ( int i = 0; i < NUM_OUTFITS; i++ ) if ( _stricmp( name, OUTFITS[i].name ) == 0 ) g_myOutfit = i;
 	}
 	char colors[64] = { 0, };
+	GetEnvOverride( "PTLE_MP_FAKEVERSION", g_myVersion, sizeof(g_myVersion) );
 	GetEnvOverride( "PTLE_MP_COLORS", colors, sizeof(colors) );   // Tests : "RRGGBB,RRGGBB,RRGGBB,RRGGBB" (hair, head, shirt, pants).
 	for ( int i = 0; i < RETRO_PARTS; i++ ) {
 		char key[32], value[16];
@@ -5239,10 +5259,12 @@ static int BuildPlayerRows( char left[][96], char right[][64], uint32_t* colors,
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const PlayerInfo& info = g_players[i];
 		if ( !info.present || i == me ) continue;
-		sprintf_s( left[rows], 96, "%s", info.name );
+		bool sameVersion = strcmp( info.version, MP_VERSION ) == 0;
+		if ( sameVersion ) sprintf_s( left[rows], 96, "%s", info.name );
+		else sprintf_s( left[rows], 96, "%s (version %s)", info.name, info.version[0] ? info.version : "older" );
 		if ( info.level && info.level == here ) sprintf_s( right[rows], 64, "here" );
 		else sprintf_s( right[rows], 64, "%s", LevelName( info.level ) );
-		colors[rows++] = 0xFFFFFFFF;
+		colors[rows++] = sameVersion ? 0xFFFFFFFF : 0xFFFFA040;
 	}
 	int ping = g_transport ? g_transport->RoundTripMs() : -1;
 	if ( ping >= 0 ) sprintf_s( left[rows], 96, "Ping %d ms", ping );
@@ -5301,7 +5323,7 @@ static void DrawMenu( float sw, float sh, float h )
 	static uint32_t colors[MAX_LIST_ROWS];
 	int rows = BuildPlayerRows( left, right, colors, "" );
 
-	g_menu.Begin( in, sw, sh, h, "Multiplayer", right[0][0] ? right[0] : 0 );
+	g_menu.Begin( in, sw, sh, h, "Multiplayer " MP_VERSION, right[0][0] ? right[0] : 0 );
 	if ( g_menu.Page( "Players" ) ) {
 		for ( int r = 0; r < rows; r++ ) g_menu.Info( left[r], r == 0 ? "" : right[r], colors[r] );
 	}
@@ -5581,6 +5603,7 @@ public:
 	virtual void onEnable()
 	{
 		OpenLogFile();
+		mp_log( "[MP] Multiplayer mod version %s.\n", MP_VERSION );
 		if ( !IsKnownGameVersion() ) {
 			mp_log( "[MP] This isn't the game version the mod was made for (PC 1.0.12.18-1) : the mod is off.\n" );
 			MessageBoxA( 0, "The Multiplayer mod was made for Pitfall: The Lost Expedition PC version 1.0.12.18-1, "
