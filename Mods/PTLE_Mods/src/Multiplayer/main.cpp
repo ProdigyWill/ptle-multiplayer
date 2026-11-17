@@ -413,8 +413,9 @@ static const uint32_t INFO_TIMEOUT_MS = 15000;
 // Outfits. Harry's own comes from the level : his jungle clothes, or his snowy
 // ones in the snowy levels (White Valley...), which is also the model Evil Harry
 // has. The game has three more, each a cheat (a flag, read when a level loads :
-// Harry gets that model, 0x4ADB38). "Harry" here is the level's own; "Snowy Harry"
-// makes it the snowy one everywhere (HarryModel_Hook). A character's model is its CRC at
+// Harry gets that model, 0x4ADB38). "Default" (OUTFIT_DEFAULT, not one of these :
+// the others are told what's worn) leaves it to the level; "Harry" makes it the
+// jungle one everywhere, "Snowy Harry" the snowy one (HarryModel_Hook). A character's model is its CRC at
 // +0x130 for Harry, +0x2F4 for a beast; 0x60F770( character, crc ) changes a
 // beast's on the spot (Evil Harry's Init does it to match Harry, 0x47A90D), which is
 // how each puppet wears its own player's outfit. All four share Harry's skeleton.
@@ -430,7 +431,8 @@ static const int SNOWY_OUTFIT = 4;
 static uint32_t g_forceHarryModel = 0;   // The model Harry gets instead of the level's, when a level loads (0 : the level's).
 static const int NUM_OUTFITS = sizeof(OUTFITS) / sizeof(OUTFITS[0]);
 static const uint32_t HARRY_MODEL = 0x130, BEAST_MODEL = 0x2F4, CHAR_MODEL_SET = 0x12C;
-static int g_myOutfit = 0;       // The one chosen (Multiplayer.ini, [Appearance] Outfit) : worn from the next level load.
+static const int OUTFIT_DEFAULT = -1;   // Chosen : whatever the level gives Harry.
+static int g_myOutfit = OUTFIT_DEFAULT;  // The one chosen (Multiplayer.ini, [Appearance] Outfit, by name) : worn from the next level load.
 static int g_myWornOutfit = 0;   // The one Harry wears now : what the others are told.
 static int g_testOutfit = -1;    // Autotest : every puppet wears this.
 
@@ -438,7 +440,8 @@ static int g_testOutfit = -1;    // Autotest : every puppet wears this.
 // flat squares, so each player can have their own (see the Retro palette section).
 static const int RETRO_OUTFIT = 3;
 enum { RETRO_HAIR, RETRO_SKIN, RETRO_SHIRT, RETRO_TROUSERS, RETRO_PARTS };
-static const char* const RETRO_PART_NAMES[RETRO_PARTS] = { "Hair", "Skin", "Shirt", "Trousers" };
+static const char* const RETRO_PART_NAMES[RETRO_PARTS] = { "Hair", "Skin", "Shirt", "Trousers" };   // Their ini keys (RetroHair...).
+static const char* const RETRO_PART_LABELS[RETRO_PARTS] = { "Hair", "Head", "Shirt", "Pants" };     // In the menu.
 static const uint8_t RETRO_DEFAULT[RETRO_PARTS][3] = { { 142, 118, 62 }, { 255, 161, 123 }, { 78, 200, 74 }, { 0, 87, 0 } };
 static uint8_t g_myColors[RETRO_PARTS][3];   // Multiplayer.ini, [Appearance] RetroHair... (RRGGBB).
 
@@ -871,7 +874,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 	int worn = 0;
 	for ( int i = 1; i < NUM_OUTFITS; i++ ) if ( FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[i].model ) worn = i;
-	if ( worn != g_myWornOutfit || !g_haveLocal ) mp_log( "[MP] Harry wears the %s outfit (model 0x%.8X; chosen : %s).\n", OUTFITS[worn].name, FIELD( harry, uint32_t, HARRY_MODEL ), OUTFITS[g_myOutfit].name );
+	if ( worn != g_myWornOutfit || !g_haveLocal ) mp_log( "[MP] Harry wears the %s outfit (model 0x%.8X; chosen : %s).\n", OUTFITS[worn].name, FIELD( harry, uint32_t, HARRY_MODEL ), g_myOutfit < 0 ? "Default" : OUTFITS[g_myOutfit].name );
 	g_myWornOutfit = worn;
 	ApplyMyOutfit();
 
@@ -4078,11 +4081,31 @@ static void AutotestStep( EIHarry* harry )
 			mp_log( "[AT] Outfit : Snowy Harry chosen, after the level loaded again (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_6_snowy" );
-			g_myOutfit = 0;
+			g_myOutfit = 0;   // Then Harry, in a snowy level (Spinja Lair) : still the jungle clothes.
 			ApplyMyOutfit();
+			ScheduleWorldLoad( (void*) 0x917028, 0x7652BAFC, false );
 			step = 101; phaseStart = now;
 		}
 		else if ( step == 101 ) {
+			if ( t < 12000 ) break;
+			bool ok = Gizmod::getCurrentLevelCRC() == 0x7652BAFC && g_myWornOutfit == 0 && FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[0].model;
+			mp_log( "[AT] Outfit : Harry chosen, in a snowy level (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			if ( !ok ) failures++;
+			RequestSnapshot( "outfit_7_harry_in_snow" );
+			g_myOutfit = OUTFIT_DEFAULT;   // Then Default there : the snowy clothes, as the game has it.
+			ApplyMyOutfit();
+			ScheduleWorldLoad( (void*) 0x917028, 0x7652BAFC, false );
+			step = 102; phaseStart = now;
+		}
+		else if ( step == 102 ) {
+			if ( t < 12000 ) break;
+			bool ok = g_myWornOutfit == SNOWY_OUTFIT;
+			mp_log( "[AT] Outfit : Default chosen, in a snowy level (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			if ( !ok ) failures++;
+			RequestSnapshot( "outfit_8_default_in_snow" );
+			step = 103; phaseStart = now;
+		}
+		else if ( step == 103 ) {
 			if ( t < 1000 ) break;
 			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
 		}
@@ -5052,7 +5075,13 @@ static void ReadNetConfig( NetConfig* c )
 		mp_log( "[NET] Settings : %s.\n", ini );
 	}
 	strcpy_s( g_iniPath, ini );
-	g_myOutfit = GetPrivateProfileIntA( "Appearance", "Outfit", 0, ini );
+	{
+		char name[32] = { 0, };
+		GetPrivateProfileStringA( "Appearance", "Outfit", "Default", name, sizeof(name), ini );
+		g_myOutfit = OUTFIT_DEFAULT;
+		if ( name[0] >= '0' && name[0] <= '9' ) g_myOutfit = atoi( name ) == 0 ? OUTFIT_DEFAULT : atoi( name );   // (Before Default : 0 was the level's own.)
+		else for ( int i = 0; i < NUM_OUTFITS; i++ ) if ( _stricmp( name, OUTFITS[i].name ) == 0 ) g_myOutfit = i;
+	}
 	char colors[64] = { 0, };
 	GetEnvOverride( "PTLE_MP_COLORS", colors, sizeof(colors) );   // Tests : "RRGGBB,RRGGBB,RRGGBB,RRGGBB" (hair, skin, shirt, trousers).
 	for ( int i = 0; i < RETRO_PARTS; i++ ) {
@@ -5068,8 +5097,8 @@ static void ReadNetConfig( NetConfig* c )
 	}
 	char outfit[8] = { 0, };
 	GetEnvOverride( "PTLE_MP_OUTFIT", outfit, sizeof(outfit) );   // Tests.
-	if ( outfit[0] ) g_myOutfit = atoi( outfit );
-	if ( g_myOutfit < 0 || g_myOutfit >= NUM_OUTFITS ) g_myOutfit = 0;
+	if ( outfit[0] ) g_myOutfit = atoi( outfit );   // (-1 : Default.)
+	if ( g_myOutfit < 0 || g_myOutfit >= NUM_OUTFITS ) g_myOutfit = OUTFIT_DEFAULT;
 	g_showTags = GetPrivateProfileIntA( "Display", "NameTags", 1, ini ) != 0;
 	g_tagFadeFrom = GetPrivateProfileIntA( "Display", "TagFadeFrom", 100, ini );
 	g_tagFadeTo = GetPrivateProfileIntA( "Display", "TagFadeTo", 200, ini );
@@ -5135,7 +5164,7 @@ static uint32_t WithAlpha( uint32_t color, float alpha )
 static void ApplyMyOutfit()
 {
 	for ( int i = 1; i < NUM_OUTFITS; i++ ) if ( OUTFITS[i].cheatFlag ) *(uint8_t*) OUTFITS[i].cheatFlag = (i == g_myOutfit) ? 1 : 0;
-	g_forceHarryModel = OUTFITS[g_myOutfit].cheatFlag ? 0 : (g_myOutfit == 0 ? 0 : OUTFITS[g_myOutfit].model);
+	g_forceHarryModel = g_myOutfit < 0 || OUTFITS[g_myOutfit].cheatFlag ? 0 : OUTFITS[g_myOutfit].model;   // Harry : the jungle one, even in the snow.
 }
 
 // Without a cheat, Harry's model is the level's (0x4ADC1E : mov [ecx+0x130], eax, the
@@ -5158,9 +5187,7 @@ static __declspec(naked) void HarryModel_Hook()
 static void SaveSettings()
 {
 	if ( g_autotest || !g_iniPath[0] ) return;
-	char outfit[16];
-	sprintf_s( outfit, "%d", g_myOutfit );
-	WritePrivateProfileStringA( "Appearance", "Outfit", outfit, g_iniPath );
+	WritePrivateProfileStringA( "Appearance", "Outfit", g_myOutfit < 0 ? "Default" : OUTFITS[g_myOutfit].name, g_iniPath );
 	for ( int i = 0; i < RETRO_PARTS; i++ ) {
 		char key[32], value[16];
 		sprintf_s( key, "Retro%s", RETRO_PART_NAMES[i] );
@@ -5277,13 +5304,20 @@ static void DrawMenu( float sw, float sh, float h )
 		for ( int r = 0; r < rows; r++ ) g_menu.Info( left[r], r == 0 ? "" : right[r], colors[r] );
 	}
 	if ( g_menu.Page( "Appearance" ) ) {
-		static const char* names[NUM_OUTFITS];
-		for ( int i = 0; i < NUM_OUTFITS; i++ ) names[i] = OUTFITS[i].name;
-		if ( g_menu.Choice( "Outfit", &g_myOutfit, names, NUM_OUTFITS, "What you look like, to you and to the others. Changes the next time you go to another area. Harry : jungle or snowy clothes, as the area has it." ) ) {
+		static const int ORDER[NUM_OUTFITS + 1] = { OUTFIT_DEFAULT, 0, SNOWY_OUTFIT, 1, 2, RETRO_OUTFIT };   // Default, Harry, Snowy Harry, Nicole, Native, Retro Harry.
+		static const char* names[NUM_OUTFITS + 1];
+		int choice = 0;
+		for ( int i = 0; i <= NUM_OUTFITS; i++ ) {
+			names[i] = ORDER[i] < 0 ? "Default" : OUTFITS[ORDER[i]].name;
+			if ( ORDER[i] == g_myOutfit ) choice = i;
+		}
+		if ( g_menu.Choice( "Outfit", &choice, names, NUM_OUTFITS + 1, "What you look like, to you and to the others. Changes the next time you go to another area. "
+			"Default : as in the game, jungle or snowy clothes as the area has it. Harry : always the jungle clothes." ) ) {
+			g_myOutfit = ORDER[choice];
 			ApplyMyOutfit();
 			SaveSettings();
 		}
-		if ( g_myOutfit == 0 && g_myWornOutfit == SNOWY_OUTFIT ) g_menu.Info( "", "his snowy clothes, in this area", Menu::DIM );
+		if ( g_myOutfit == OUTFIT_DEFAULT && g_myWornOutfit == SNOWY_OUTFIT ) g_menu.Info( "", "his snowy clothes, in this area", Menu::DIM );
 		if ( g_myOutfit == RETRO_OUTFIT ) {
 			// A row of ready colours per part (the first is the game's own), and sliders for any other.
 			static const uint8_t READY[][3] = { { 220, 50, 40 }, { 240, 140, 30 }, { 240, 215, 60 }, { 60, 190, 220 }, { 50, 100, 220 },
@@ -5300,13 +5334,13 @@ static void DrawMenu( float sw, float sh, float h )
 					swatches[i] = (c[0] << 16) | (c[1] << 8) | c[2];
 					if ( memcmp( c, g_myColors[part], 3 ) == 0 ) index = i;
 				}
-				if ( g_menu.Swatches( RETRO_PART_NAMES[part], &index, swatches, NUM_READY + 1, "Left / Right or click : pick a color. Shows straight away." ) && index >= 0 ) {
+				if ( g_menu.Swatches( RETRO_PART_LABELS[part], &index, swatches, NUM_READY + 1, "Left / Right or click : pick a color. Shows straight away." ) && index >= 0 ) {
 					memcpy( g_myColors[part], index == 0 ? RETRO_DEFAULT[part] : READY[index - 1], 3 );
 					editing = part;
 					changed = true;
 				}
 			}
-			g_menu.Choice( "Mix a color for", &editing, RETRO_PART_NAMES, RETRO_PARTS, "Which part the color and the three sliders below change." );
+			g_menu.Choice( "Mix a color for", &editing, RETRO_PART_LABELS, RETRO_PARTS, "Which part the color and the three sliders below change." );
 			if ( g_menu.Colour( "Color", g_myColors[editing],
 				"Enter : type a hex code (#DC3228) or red, green, blue (220, 50, 40). Ctrl + V pastes one, Ctrl + C copies this one." ) ) changed = true;
 			static const char* const CHANNELS[3] = { "Red", "Green", "Blue" };
