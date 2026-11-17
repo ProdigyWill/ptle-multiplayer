@@ -440,8 +440,7 @@ static int g_testOutfit = -1;    // Autotest : every puppet wears this.
 // flat squares, so each player can have their own (see the Retro palette section).
 static const int RETRO_OUTFIT = 3;
 enum { RETRO_HAIR, RETRO_SKIN, RETRO_SHIRT, RETRO_TROUSERS, RETRO_PARTS };
-static const char* const RETRO_PART_NAMES[RETRO_PARTS] = { "Hair", "Skin", "Shirt", "Trousers" };   // Their ini keys (RetroHair...).
-static const char* const RETRO_PART_LABELS[RETRO_PARTS] = { "Hair", "Head", "Shirt", "Pants" };     // In the menu.
+static const char* const RETRO_PART_NAMES[RETRO_PARTS] = { "Hair", "Head", "Shirt", "Pants" };   // In the menu, and the ini keys (RetroHair...).
 static const uint8_t RETRO_DEFAULT[RETRO_PARTS][3] = { { 142, 118, 62 }, { 255, 161, 123 }, { 78, 200, 74 }, { 0, 87, 0 } };
 static uint8_t g_myColors[RETRO_PARTS][3];   // Multiplayer.ini, [Appearance] RetroHair... (RRGGBB).
 
@@ -5079,11 +5078,10 @@ static void ReadNetConfig( NetConfig* c )
 		char name[32] = { 0, };
 		GetPrivateProfileStringA( "Appearance", "Outfit", "Default", name, sizeof(name), ini );
 		g_myOutfit = OUTFIT_DEFAULT;
-		if ( name[0] >= '0' && name[0] <= '9' ) g_myOutfit = atoi( name ) == 0 ? OUTFIT_DEFAULT : atoi( name );   // (Before Default : 0 was the level's own.)
-		else for ( int i = 0; i < NUM_OUTFITS; i++ ) if ( _stricmp( name, OUTFITS[i].name ) == 0 ) g_myOutfit = i;
+		for ( int i = 0; i < NUM_OUTFITS; i++ ) if ( _stricmp( name, OUTFITS[i].name ) == 0 ) g_myOutfit = i;
 	}
 	char colors[64] = { 0, };
-	GetEnvOverride( "PTLE_MP_COLORS", colors, sizeof(colors) );   // Tests : "RRGGBB,RRGGBB,RRGGBB,RRGGBB" (hair, skin, shirt, trousers).
+	GetEnvOverride( "PTLE_MP_COLORS", colors, sizeof(colors) );   // Tests : "RRGGBB,RRGGBB,RRGGBB,RRGGBB" (hair, head, shirt, pants).
 	for ( int i = 0; i < RETRO_PARTS; i++ ) {
 		char key[32], value[16];
 		sprintf_s( key, "Retro%s", RETRO_PART_NAMES[i] );
@@ -5194,6 +5192,10 @@ static void SaveSettings()
 		sprintf_s( value, "%02X%02X%02X", g_myColors[i][0], g_myColors[i][1], g_myColors[i][2] );
 		WritePrivateProfileStringA( "Appearance", key, value, g_iniPath );
 	}
+	// Gone from older versions : no longer read.
+	WritePrivateProfileStringA( "Appearance", "RetroSkin", 0, g_iniPath );
+	WritePrivateProfileStringA( "Appearance", "RetroTrousers", 0, g_iniPath );
+	WritePrivateProfileStringA( "Display", "TagFade", 0, g_iniPath );
 	char delay[16];
 	sprintf_s( delay, "%d", DELAY_CHOICES[g_delayIndex] );
 	WritePrivateProfileStringA( "Display", "NameTags", g_showTags ? "1" : "0", g_iniPath );
@@ -5334,13 +5336,13 @@ static void DrawMenu( float sw, float sh, float h )
 					swatches[i] = (c[0] << 16) | (c[1] << 8) | c[2];
 					if ( memcmp( c, g_myColors[part], 3 ) == 0 ) index = i;
 				}
-				if ( g_menu.Swatches( RETRO_PART_LABELS[part], &index, swatches, NUM_READY + 1, "Left / Right or click : pick a color. Shows straight away." ) && index >= 0 ) {
+				if ( g_menu.Swatches( RETRO_PART_NAMES[part], &index, swatches, NUM_READY + 1, "Left / Right or click : pick a color. Shows straight away." ) && index >= 0 ) {
 					memcpy( g_myColors[part], index == 0 ? RETRO_DEFAULT[part] : READY[index - 1], 3 );
 					editing = part;
 					changed = true;
 				}
 			}
-			g_menu.Choice( "Mix a color for", &editing, RETRO_PART_LABELS, RETRO_PARTS, "Which part the color and the three sliders below change." );
+			g_menu.Choice( "Mix a color for", &editing, RETRO_PART_NAMES, RETRO_PARTS, "Which part the color and the three sliders below change." );
 			if ( g_menu.Colour( "Color", g_myColors[editing],
 				"Enter : type a hex code (#DC3228) or red, green, blue (220, 50, 40). Ctrl + V pastes one, Ctrl + C copies this one." ) ) changed = true;
 			static const char* const CHANNELS[3] = { "Red", "Green", "Blue" };
