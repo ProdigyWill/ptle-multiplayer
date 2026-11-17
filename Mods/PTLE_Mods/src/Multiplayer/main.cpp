@@ -339,6 +339,7 @@ static uint32_t ShownLevel()
 	return g_levelLeaving ? 0 : Gizmod::getCurrentLevelCRC();
 }
 
+static int g_raftTest = 0;   // PTLE_MP_RAFTTEST=1 : Spinja Lair's wading water, the raft out, Harry turns paddling one side : the puppet must face as he does.
 static int g_aimTest = 0;   // 2 : with the raft out instead (Down looks from Harry's head, the raft isn't drawn).
                    // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
@@ -1295,11 +1296,12 @@ static void UpdateLocomotion( EIEvilHarryP* p )
 		g_cur->moveSpeed = sqrtf( g_cur->velX * g_cur->velX + g_cur->velY * g_cur->velY );
 		if ( g_cur->moveSpeed > 0.01F ) g_cur->heading = atan2f( g_cur->velY, g_cur->velX );
 	}
-	if ( g_puppetStaysHere ) {
-		// Not moving : face where Harry faced. His transform's row 1 points opposite
-		// to where he walks (see InitLocomotion).
-		const PlayerSnapshot* f = GetPuppetTarget();
-		if ( f ) g_cur->heading = atan2f( -f->transform.data[1][1], -f->transform.data[1][0] );
+	// Face where Harry faces, not where he travels : he turns on the spot, walks
+	// backwards a step, and in a raft paddles one side and turns freely. His
+	// transform's row 1 points opposite to where he faces (see InitLocomotion).
+	if ( const PlayerSnapshot* f = GetPuppetTarget() ) {
+		float fx = -f->transform.data[1][0], fy = -f->transform.data[1][1];
+		if ( fx * fx + fy * fy > 0.01F ) g_cur->heading = atan2f( fy, fx );
 	}
 	g_cur->lastTarget = pos;
 	g_cur->haveLastTarget = true;
@@ -3526,6 +3528,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
 		if ( g_pitTest ) { phase = 1000; phaseStart = now; step = 0; break; }
 		if ( g_iceTest ) { phase = 800; phaseStart = now; step = 0; break; }
+		if ( g_raftTest ) { phase = 1100; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
 		break;
 
@@ -3708,6 +3711,52 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
+		break;
+	}
+	case 1100: {   // Raft : Harry paddles one side and turns; the puppet faces where he faces, not where he drifts.
+		DWORD t = now - phaseStart;
+		EIEvilHarryP* b = g_cur->beast;
+		const PlayerSnapshot* tg = GetPuppetTarget();
+		if ( !b || !tg ) break;
+		static float startYaw, maxDiff, maxDrift, lastYaw, turned; static int samples;
+		float hYaw = atan2f( -harry->m_transformMatrix.data[1][1], -harry->m_transformMatrix.data[1][0] );
+		float tYaw = atan2f( -tg->transform.data[1][1], -tg->transform.data[1][0] );
+		const Matrix4f& w = FIELD( b, Matrix4f, BEAST_WORLD );
+		float pYaw = atan2f( w.data[1][1], w.data[1][0] ) + g_forwardLocalAngle - MP_PI / 2.0F;   // (SetBeastWorld : row 1 = heading - forward + 90 deg.)
+		auto wrap = []( float a ) { while ( a > MP_PI ) a -= 2.0F * MP_PI; while ( a < -MP_PI ) a += 2.0F * MP_PI; return a; };
+		if ( step == 0 ) {
+			if ( t < 6000 ) break;   // (He wades in by himself.)
+			const Matrix4f& cam = g_cameraWorld;
+			float fx = -cam.data[2][0], fy = -cam.data[2][1];
+			float l = sqrtf( fx * fx + fy * fy );
+			if ( l > 0.01F ) { g_puppetOffset.x = fx / l * 10.0F; g_puppetOffset.y = fy / l * 10.0F; }
+			bool raft = InventoryItem::setItemInHand( InventoryItem::RAFT );
+			mp_log( "[AT] Raft : in hand : %s; Harry at (%.1f, %.1f, %.1f) facing %.0f deg.\n", raft ? "yes" : "NO", harry->m_position.x, harry->m_position.y, harry->m_position.z, hYaw * 180.0F / MP_PI );
+			step = 1; phaseStart = now;
+		}
+		else if ( step == 1 ) {
+			if ( t < 4000 ) break;
+			RequestSnapshot( "raft_0_before" );
+			startYaw = lastYaw = hYaw; turned = 0; maxDiff = maxDrift = 0; samples = 0;
+			InterlockedExchange( &g_holdMs, 4500 ); InterlockedExchange( &g_holdKey, VK_UP );   // The right arm paddles (right stick up).
+			step = 2; phaseStart = now;
+		}
+		else if ( step == 2 || step == 3 ) {
+			turned += fabsf( wrap( hYaw - lastYaw ) ); lastYaw = hYaw;
+			if ( t > 500 ) {   // (The puppet's target lags a quarter second.)
+				maxDiff = max( maxDiff, fabsf( wrap( pYaw - tYaw ) ) );
+				samples++;
+			}
+			if ( g_cur->moveSpeed > 0.03F ) maxDrift = max( maxDrift, fabsf( wrap( atan2f( g_cur->velY, g_cur->velX ) - tYaw ) ) );
+			if ( step == 2 && t >= 5200 ) { RequestSnapshot( "raft_1_turned" ); InterlockedExchange( &g_holdMs, 4500 ); InterlockedExchange( &g_holdKey, 'W' ); step = 3; phaseStart = now; }
+			else if ( step == 3 && t >= 5200 ) {
+				RequestSnapshot( "raft_2_turned_back" );
+				bool ok = turned * 180.0F / MP_PI > 45.0F && samples > 100 && maxDiff * 180.0F / MP_PI < 10.0F;
+				mp_log( "[AT] Raft : Harry turned %.0f deg in all (now %.0f from the start); the puppet faced up to %.1f deg off him (%d samples); his drift was up to %.0f deg off his facing : %s\n",
+					turned * 180.0F / MP_PI, wrap( hYaw - startYaw ) * 180.0F / MP_PI, maxDiff * 180.0F / MP_PI, samples, maxDrift * 180.0F / MP_PI, ok ? "ok" : "WRONG" );
+				InterlockedExchange( &g_autotestDone, ok ? 1 : 2 );
+			}
+		}
 		break;
 	}
 	case 900: {   // Aim : the puppet ahead; Harry takes the TNT and aims it (Down held), then back.
@@ -5380,6 +5429,11 @@ public:
 				g_puppetOffset.x = 0.0F;       // Where Harry was (a quarter second ago), as another player's.
 				if ( g_pitTest == 2 ) g_puppetOffset.y = -45.0F;   // Ahead of him : it reaches the pit, he doesn't.
 				mp_log( "[AT] Pitfall test.\n" );
+			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_RAFTTEST", env, sizeof(env) ) && env[0] == '1' ) {
+				g_raftTest = 1;
+				AUTOTEST_LEVEL = 0x7652BAFC;   // Spinja Lair : Harry wades in on arrival.
+				mp_log( "[AT] Raft test.\n" );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_DEATHTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_deathTest = true;
