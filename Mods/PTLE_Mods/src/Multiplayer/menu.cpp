@@ -2,18 +2,23 @@
 
 #include "overlay.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 
 static const int MAX_ROWS = 13;            // The body's height, in rows.
+static const int HINT_LINES = 3;           // The footer's hint, at most.
+static const float LINE_GAP = 1.3F;        // Footer lines, in text heights.
 static const uint32_t PANEL = 0xD0000000, LINE = 0x30FFFFFF, SELECTED = 0x38FFFFFF, TAB_ON = 0x38FFE080;
 
 void Menu::Open()
 {
 	m_open = true;
 	m_row = 0;
+	m_editing = false;
 }
 
 void Menu::Close()
@@ -30,6 +35,9 @@ void Menu::Begin( const MenuInput& input, float screenW, float screenH, float te
 {
 	m_in = input;
 	m_h = textHeight;
+	m_keepOpen = false;
+	m_copy[0] = 0;
+	if ( m_editing ) m_in.up = m_in.down = m_in.left = m_in.right = m_in.nextPage = m_in.prevPage = 0;   // Typing : the keys are the text's.
 	m_rowH = floorf( m_h * 1.55F );
 	m_pad = floorf( m_h * 0.6F );
 
@@ -46,7 +54,8 @@ void Menu::Begin( const MenuInput& input, float screenW, float screenH, float te
 
 	float w = m_h * 40.0F;
 	if ( w > screenW - 2.0F * m_h ) w = screenW - 2.0F * m_h;
-	float h = m_rowH * (MAX_ROWS + 4) + m_h * 1.15F + m_pad;   // Title, body, two lines of hint, keys.
+	float h = m_rowH + m_pad * 0.5F + m_rowH * MAX_ROWS + m_pad * 0.5F   // Title, body,
+		+ m_pad * 0.8F + m_h * LINE_GAP * HINT_LINES + m_pad * 0.6F + m_h + m_pad;   // the hint's lines, the keys.
 	m_panel.x = floorf( (screenW - w) * 0.5F );
 	m_panel.y = floorf( (screenH - h) * 0.5F );
 	m_panel.w = floorf( w );
@@ -225,6 +234,115 @@ bool Menu::Swatches( const char* label, int* index, const uint32_t* colors, int 
 	return *index != old;
 }
 
+// "#RRGGBB", "RRGGBB", "0xRRGGBB", "#RGB", "R, G, B", "R G B", "rgb(R, G, B)".
+static bool ParseColour( const char* text, uint8_t rgb[3] )
+{
+	char s[64]; int n = 0;
+	for ( const char* c = text; *c && n < 63; c++ ) s[n++] = (char) tolower( (unsigned char) *c );
+	s[n] = 0;
+	while ( n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == '\t') ) s[--n] = 0;
+	int numbers[3] = { 0, 0, 0 }, count = 0;
+	bool decimal = false, letters = false;
+	for ( const char* c = s; *c; c++ ) {
+		if ( *c == ',' || *c == '(' ) decimal = true;
+		if ( isalpha( (unsigned char) *c ) && *c != 'x' ) letters = true;
+	}
+	for ( const char* c = s; *c; ) {   // The numbers in it.
+		if ( !isdigit( (unsigned char) *c ) ) { c++; continue; }
+		char* end;
+		long v = strtol( c, &end, 10 );
+		if ( count < 3 ) numbers[count] = (int) v;
+		count++;
+		c = end;
+	}
+	if ( strncmp( s, "rgb", 3 ) == 0 ) decimal = true;
+	if ( !decimal && !letters && count == 3 && strchr( s, ' ' ) ) decimal = true;   // "220 50 40".
+	if ( decimal ) {
+		if ( count != 3 ) return false;
+		for ( int i = 0; i < 3; i++ ) if ( numbers[i] < 0 || numbers[i] > 255 ) return false;
+		for ( int i = 0; i < 3; i++ ) rgb[i] = (uint8_t) numbers[i];
+		return true;
+	}
+	char hex[8]; int h = 0;
+	const char* c = s;
+	while ( *c == ' ' || *c == '#' ) c++;
+	if ( c[0] == '0' && c[1] == 'x' ) c += 2;
+	for ( ; *c && *c != ' '; c++ ) {
+		if ( !isxdigit( (unsigned char) *c ) || h == 6 ) return false;
+		hex[h++] = *c;
+	}
+	while ( *c == ' ' ) c++;
+	if ( *c ) return false;
+	if ( h == 3 ) { hex[4] = hex[5] = hex[2]; hex[2] = hex[3] = hex[1]; hex[1] = hex[0]; h = 6; }
+	if ( h != 6 ) return false;
+	hex[6] = 0;
+	unsigned long v = strtoul( hex, 0, 16 );
+	rgb[0] = (uint8_t) (v >> 16); rgb[1] = (uint8_t) (v >> 8); rgb[2] = (uint8_t) v;
+	return true;
+}
+
+bool Menu::Colour( const char* label, uint8_t rgb[3], const char* hint )
+{
+	Rect r; bool clicked;
+	int index = m_declSelectable;
+	bool selected = Selectable( hint, &r, &clicked );
+	bool editing = m_editing && m_editRow == index;
+	bool changed = false;
+	if ( editing && !selected ) m_editing = editing = false;   // Moved away : given up.
+	if ( selected && m_in.pasted ) {
+		uint8_t c[3];
+		if ( ParseColour( m_in.pasted, c ) ) { memcpy( rgb, c, 3 ); changed = true; }
+		m_editing = editing = false;
+	}
+	else if ( editing ) {
+		for ( const char* t = m_in.typed; t && *t; t++ ) {
+			size_t n = strlen( m_edit );
+			if ( *t == '\b' ) { if ( n ) m_edit[n - 1] = 0; }
+			else if ( n + 1 < sizeof(m_edit) ) { m_edit[n] = *t; m_edit[n + 1] = 0; }
+		}
+		if ( m_in.accept ) {
+			uint8_t c[3];
+			if ( !m_edit[0] ) m_editing = editing = false;
+			else if ( ParseColour( m_edit, c ) ) { memcpy( rgb, c, 3 ); changed = true; m_editing = editing = false; }
+		}
+		if ( m_in.back ) { m_editing = editing = false; m_keepOpen = true; }
+	}
+	else if ( selected && (m_in.accept || clicked) ) {
+		m_editing = editing = true;
+		m_editRow = index;
+		m_edit[0] = 0;
+	}
+	if ( selected && m_in.copy ) sprintf_s( m_copy, "#%02X%02X%02X", rgb[0], rgb[1], rgb[2] );
+
+	Label( r, label, selected );
+	float y = r.y + (m_rowH - m_h) * 0.5F;
+	float codeW = OverlayTextWidth( "#DDDDDD" );
+	float sw = floorf( m_h * 4.0F ), sh = floorf( m_rowH - 6.0F );
+	float sx = r.x + r.w - codeW - m_pad - sw;
+	OverlayRect( sx - 1.0F, r.y + 2.0F, sw + 2.0F, sh + 2.0F, 0x80FFFFFF );
+	OverlayRect( sx, r.y + 3.0F, sw, sh, 0xFF000000 | ((uint32_t) rgb[0] << 16) | ((uint32_t) rgb[1] << 8) | rgb[2] );
+	if ( editing ) {
+		char shown[40];
+		uint8_t c[3];
+		bool ok = !m_edit[0] || ParseColour( m_edit, c );
+		sprintf_s( shown, "%s_", m_edit );
+		float w = OverlayTextWidth( shown );
+		if ( w < codeW ) w = codeW;
+		float x = r.x + r.w - w;
+		if ( x < sx - 4.0F ) {   // Long : over the swatch.
+			OverlayRect( x - 6.0F, r.y + 2.0F, w + 6.0F, r.h - 4.0F, 0xE0202020 );
+		}
+		else OverlayRect( x - 6.0F, r.y + 2.0F, w + 6.0F, r.h - 4.0F, 0x60000000 );
+		OverlayText( x, y, shown, ok ? WHITE : 0xFFFF8080 );
+	}
+	else {
+		char code[16];
+		sprintf_s( code, "#%02X%02X%02X", rgb[0], rgb[1], rgb[2] );
+		OverlayText( r.x + r.w - OverlayTextWidth( code ), y, code, GOLD );
+	}
+	return changed;
+}
+
 bool Menu::Action( const char* label, const char* hint )
 {
 	Rect r; bool clicked;
@@ -241,24 +359,29 @@ void Menu::End()
 
 	float y = m_body.y + m_body.h + m_pad * 0.5F;
 	OverlayRect( m_panel.x, y, m_panel.w, 1.0F, LINE );
-	// The selected row's hint, on up to two lines.
-	float top = y + (m_rowH - m_h) * 0.5F;
+	// The selected row's hint, on up to three lines, then the keys : centred.
+	float top = y + m_pad * 0.8F, width = m_panel.w - 2.0F * m_pad, mid = m_panel.x + m_panel.w * 0.5F;
 	if ( m_hint ) {
-		char line[2][160] = { "", "" };
+		char line[HINT_LINES][200] = { "", };
 		int n = 0;
 		const char* word = m_hint;
-		while ( *word && n < 2 ) {
+		while ( *word && n < HINT_LINES ) {
 			const char* end = word;
 			while ( *end && *end != ' ' ) end++;
-			char trial[160];
+			char trial[200];
 			sprintf_s( trial, "%s%s%.*s", line[n], line[n][0] ? " " : "", (int) (end - word), word );
-			if ( line[n][0] && OverlayTextWidth( trial ) > m_panel.x + m_panel.w - m_pad - m_body.x ) { n++; continue; }
+			if ( line[n][0] && OverlayTextWidth( trial ) > width ) { n++; continue; }
 			strcpy_s( line[n], trial );
 			word = *end ? end + 1 : end;
 		}
-		for ( int i = 0; i < 2; i++ ) if ( line[i][0] ) OverlayText( m_body.x, top + i * m_h * 1.15F, line[i], DIM );
+		int used = 0;
+		for ( int i = 0; i < HINT_LINES; i++ ) if ( line[i][0] ) used = i + 1;
+		float first = top + (HINT_LINES - used) * m_h * LINE_GAP * 0.5F;   // Fewer lines : in the middle of their space.
+		for ( int i = 0; i < used; i++ ) OverlayText( floorf( mid - OverlayTextWidth( line[i] ) * 0.5F ), first + i * m_h * LINE_GAP, line[i], DIM );
 	}
-	OverlayText( m_panel.x + m_pad, top + m_h * 1.15F + m_rowH, "Arrows : move, change    Tab : next page    Esc : close    Mouse : click", DIM );
+	const char* keys = m_editing ? "Type a color    Enter : set it    Esc : leave it    Ctrl + V : paste"
+		: "Arrows : move, change    Tab : next page    Esc : close    Mouse : click";
+	OverlayText( floorf( mid - OverlayTextWidth( keys ) * 0.5F ), top + m_h * LINE_GAP * HINT_LINES + m_pad * 0.6F, keys, 0xFF909090 );
 
-	if ( m_in.back ) Close();
+	if ( m_in.back && !m_keepOpen ) Close();
 }

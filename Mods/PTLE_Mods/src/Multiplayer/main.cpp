@@ -2277,11 +2277,10 @@ static volatile LONG g_reqMenu = 0;
 // The menu (F1) and what it sets. Display settings are kept in the ini ([Display]).
 static Menu g_menu;
 static bool g_showTags = true;    // Names above the other players.
-// Name tags fade out with the camera distance, from the chosen start to twice it
-// (Multiplayer.ini : Display, TagFade = the start, 0 : never).
-static const int TAG_FADE_STARTS[] = { 50, 100, 150, 200, 300, 0 };
-static const int NUM_TAG_FADES = sizeof(TAG_FADE_STARTS) / sizeof(TAG_FADE_STARTS[0]);
-static int g_tagFadeIndex = 1;    // Their fade : 100 to 200 away (TAG_FADE_STARTS).
+// Name tags fade out with the camera distance, between these two (the menu's
+// sliders; Multiplayer.ini : Display, TagFadeFrom and TagFadeTo).
+static const int TAG_FADE_MAX = 1000, TAG_FADE_STEP = 10;
+static int g_tagFadeFrom = 100, g_tagFadeTo = 200;
 static bool g_showList = false;   // The player list stays on screen while playing.
 static char g_iniPath[MAX_PATH] = { 0, };
 enum { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_PREV, MK_COUNT };
@@ -2289,6 +2288,88 @@ static volatile LONG g_menuKeys[MK_COUNT];   // Presses, from the hotkey thread.
 static volatile LONG g_menuOpen = 0;         // For the hotkey thread and the keyboard poll.
 static volatile DWORD g_menuBlockUntil = 0;  // Keys stay away from the game a moment after it closes (the Esc that closed it).
 static struct { bool active; float x, y; bool down; } g_testMouse;   // Autotest : stands in for the mouse.
+
+// Typing into the menu (a colour) : characters from the hotkey thread.
+static SRWLOCK g_typedLock = SRWLOCK_INIT;
+static char g_typedChars[64];
+static volatile LONG g_menuTyping = 0, g_menuPaste = 0, g_menuCopy = 0;
+static char g_testPaste[128];      // Autotest : stands in for the clipboard.
+static DWORD g_lastCopied = 0;
+
+static void AddTyped( char c )
+{
+	AcquireSRWLockExclusive( &g_typedLock );
+	size_t n = strlen( g_typedChars );
+	if ( n + 1 < sizeof(g_typedChars) ) { g_typedChars[n] = c; g_typedChars[n + 1] = 0; }
+	ReleaseSRWLockExclusive( &g_typedLock );
+}
+
+static void TakeTyped( char* out, size_t size )
+{
+	AcquireSRWLockExclusive( &g_typedLock );
+	strcpy_s( out, size, g_typedChars );
+	g_typedChars[0] = 0;
+	ReleaseSRWLockExclusive( &g_typedLock );
+}
+
+static bool ReadClipboard( char* out, size_t size )
+{
+	out[0] = 0;
+	if ( !OpenClipboard( 0 ) ) return false;
+	HANDLE h = GetClipboardData( CF_TEXT );
+	const char* text = h ? (const char*) GlobalLock( h ) : 0;
+	if ( text ) { strncpy_s( out, size, text, _TRUNCATE ); GlobalUnlock( h ); }
+	CloseClipboard();
+	return out[0] != 0;
+}
+
+static void WriteClipboard( const char* text )
+{
+	size_t n = strlen( text ) + 1;
+	HGLOBAL h = GlobalAlloc( GMEM_MOVEABLE, n );
+	if ( !h ) return;
+	memcpy( GlobalLock( h ), text, n );
+	GlobalUnlock( h );
+	if ( OpenClipboard( 0 ) ) {
+		EmptyClipboard();
+		if ( !SetClipboardData( CF_TEXT, h ) ) GlobalFree( h );
+		CloseClipboard();
+	}
+	else GlobalFree( h );
+}
+
+// The keys that type : digits, letters, space, comma, #, ( ), backspace.
+static void PollTyping( bool active )
+{
+	static bool was[256] = { false, };
+	bool ctrl = (GetAsyncKeyState( VK_CONTROL ) & 0x8000) != 0, shift = (GetAsyncKeyState( VK_SHIFT ) & 0x8000) != 0;
+	for ( int vk = 0x08; vk < 0xE0; vk++ ) {
+		bool typing = (vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+			|| vk == VK_SPACE || vk == VK_OEM_COMMA || vk == VK_BACK;
+		if ( !typing ) continue;
+		bool down = active && (GetAsyncKeyState( vk ) & 0x8000) != 0;
+		if ( down && !was[vk] ) {
+			if ( ctrl ) {
+				if ( vk == 'V' ) InterlockedIncrement( &g_menuPaste );
+				if ( vk == 'C' ) InterlockedIncrement( &g_menuCopy );
+			}
+			else if ( g_menuTyping ) {
+				char c = 0;
+				if ( vk == VK_BACK ) c = '\b';
+				else if ( vk == VK_SPACE ) c = ' ';
+				else if ( vk == VK_OEM_COMMA ) c = ',';
+				else if ( vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9 ) c = (char) ('0' + vk - VK_NUMPAD0);
+				else if ( vk == '3' && shift ) c = '#';
+				else if ( vk == '9' && shift ) c = '(';
+				else if ( vk == '0' && shift ) c = ')';
+				else if ( vk >= 'A' && vk <= 'Z' ) c = (char) (vk - 'A' + 'a');
+				else c = (char) vk;
+				AddTyped( c );
+			}
+		}
+		was[vk] = down;
+	}
+}
 
 static bool MenuBlocksInput()
 {
@@ -2351,6 +2432,7 @@ static DWORD WINAPI HotkeyThread( void* )
 			}
 			menuDown[i] = down;
 		}
+		PollTyping( menu );
 		Sleep( 15 );
 	}
 	return 0;
@@ -4033,7 +4115,8 @@ static void AutotestStep( EIHarry* harry )
 		static Vector3f from;
 		static int failures = 0;
 		static const int START_DELAY = g_delayIndex;
-		static const int START_FADE = g_tagFadeIndex;
+		static const int START_FADE = g_tagFadeFrom;
+		static uint8_t shirtBefore[3];
 		DWORD t = now - phaseStart;
 		struct Local {
 			static float Moved( EIHarry* h, const Vector3f& from ) {
@@ -4064,11 +4147,40 @@ static void AutotestStep( EIHarry* harry )
 			step = 30; phaseStart = now; break;
 		case 30:
 			if ( t < 300 ) break;
+			memcpy( shirtBefore, g_myColors[RETRO_SHIRT], 3 );
 			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step = 31; phaseStart = now; break;
 		case 31:   // Tab again : Display. Enter : name tags off.
 			if ( t < 500 ) break;
-			Local::Check( "Right picks the next shirt colour", memcmp( g_myColors[RETRO_SHIRT], RETRO_DEFAULT[RETRO_SHIRT], 3 ) != 0 );
+			Local::Check( "Right picks the next shirt colour", memcmp( g_myColors[RETRO_SHIRT], shirtBefore, 3 ) != 0 );
 			RequestSnapshot( "menu_1b_appearance" );
+			step = 34; phaseStart = now; break;
+		case 34:   // Down three times : the shirt's colour row. A pasted hex code.
+			if ( t < 300 ) break;
+			for ( int i = 0; i < 3; i++ ) InterlockedIncrement( &g_menuKeys[MK_DOWN] );
+			step = 35; phaseStart = now; break;
+		case 35:
+			if ( t < 300 ) break;
+			strcpy_s( g_testPaste, "#123456" );
+			step = 36; phaseStart = now; break;
+		case 36:   // Enter, then typed : "10, 20, 30".
+			if ( t < 300 ) break;
+			Local::Check( "Pasting #123456 sets the shirt", g_myColors[RETRO_SHIRT][0] == 0x12 && g_myColors[RETRO_SHIRT][1] == 0x34 && g_myColors[RETRO_SHIRT][2] == 0x56 );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] );
+			step = 37; phaseStart = now; break;
+		case 37:
+			if ( t < 300 ) break;
+			Local::Check( "Enter starts typing", g_menu.IsTyping() );
+			for ( const char* c = "10, 20, 30"; *c; c++ ) AddTyped( *c );
+			step = 38; phaseStart = now; break;
+		case 38:
+			if ( t < 300 ) break;
+			RequestSnapshot( "menu_1c_typing" );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] );
+			step = 39; phaseStart = now; break;
+		case 39:
+			if ( t < 400 ) break;
+			Local::Check( "Typing 10, 20, 30 sets it", !g_menu.IsTyping() && g_myColors[RETRO_SHIRT][0] == 10 && g_myColors[RETRO_SHIRT][1] == 20 && g_myColors[RETRO_SHIRT][2] == 30 );
+			RequestSnapshot( "menu_1d_colour" );
 			step = 33; phaseStart = now; break;
 		case 33:
 			if ( t < 300 ) break;
@@ -4084,7 +4196,7 @@ static void AutotestStep( EIHarry* harry )
 		case 5:
 			if ( t < 300 ) break;
 			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step++; phaseStart = now; break;
-		case 6:   // Down, right : the next name tag fade.
+		case 6:   // Down, right : name tags start fading further away.
 			if ( t < 500 ) break;
 			Local::Check( "Right changes the playback delay", g_delayIndex == (START_DELAY + 1) % 6 );
 			InterlockedIncrement( &g_menuKeys[MK_DOWN] ); step = 61; phaseStart = now; break;
@@ -4093,7 +4205,7 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step = 62; phaseStart = now; break;
 		case 62:   // W held with the menu open : Harry stays.
 			if ( t < 500 ) break;
-			Local::Check( "Right changes the name tag fade", g_tagFadeIndex == (START_FADE + 1) % NUM_TAG_FADES );
+			Local::Check( "Right moves where name tags start fading", g_tagFadeFrom == START_FADE + TAG_FADE_STEP && g_tagFadeTo > g_tagFadeFrom );
 			RequestSnapshot( "menu_2_display" );
 			from = harry->m_position; Local::HoldW(); step = 7; phaseStart = now; break;
 		case 7:   // The mouse : click the third page's tab.
@@ -4134,7 +4246,7 @@ static void AutotestStep( EIHarry* harry )
 			Local::Check( "Harry walks again once it's closed", Local::Moved( harry, from ) > 1.0F );
 			RequestSnapshot( "menu_5_closed" );
 			g_delayIndex = START_DELAY;
-			g_tagFadeIndex = START_FADE;
+			g_tagFadeFrom = START_FADE;
 			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
 			break;
 		}
@@ -4959,8 +5071,10 @@ static void ReadNetConfig( NetConfig* c )
 	if ( outfit[0] ) g_myOutfit = atoi( outfit );
 	if ( g_myOutfit < 0 || g_myOutfit >= NUM_OUTFITS ) g_myOutfit = 0;
 	g_showTags = GetPrivateProfileIntA( "Display", "NameTags", 1, ini ) != 0;
-	int fade = GetPrivateProfileIntA( "Display", "TagFade", 100, ini );
-	for ( int i = 0; i < NUM_TAG_FADES; i++ ) if ( TAG_FADE_STARTS[i] == fade ) g_tagFadeIndex = i;
+	g_tagFadeFrom = GetPrivateProfileIntA( "Display", "TagFadeFrom", 100, ini );
+	g_tagFadeTo = GetPrivateProfileIntA( "Display", "TagFadeTo", 200, ini );
+	g_tagFadeFrom = max( 0, min( g_tagFadeFrom, TAG_FADE_MAX - TAG_FADE_STEP ) );
+	g_tagFadeTo = max( g_tagFadeFrom + TAG_FADE_STEP, min( g_tagFadeTo, TAG_FADE_MAX ) );
 	g_showList = GetPrivateProfileIntA( "Display", "PlayerList", 0, ini ) != 0;
 	GetPrivateProfileStringA( "Network", "Server", "", c->server, sizeof(c->server), ini );
 	GetPrivateProfileStringA( "Network", "Room", "default", c->room, sizeof(c->room), ini );
@@ -5057,8 +5171,10 @@ static void SaveSettings()
 	sprintf_s( delay, "%d", DELAY_CHOICES[g_delayIndex] );
 	WritePrivateProfileStringA( "Display", "NameTags", g_showTags ? "1" : "0", g_iniPath );
 	char fade[16];
-	sprintf_s( fade, "%d", TAG_FADE_STARTS[g_tagFadeIndex] );
-	WritePrivateProfileStringA( "Display", "TagFade", fade, g_iniPath );
+	sprintf_s( fade, "%d", g_tagFadeFrom );
+	WritePrivateProfileStringA( "Display", "TagFadeFrom", fade, g_iniPath );
+	sprintf_s( fade, "%d", g_tagFadeTo );
+	WritePrivateProfileStringA( "Display", "TagFadeTo", fade, g_iniPath );
 	WritePrivateProfileStringA( "Display", "PlayerList", g_showList ? "1" : "0", g_iniPath );
 	WritePrivateProfileStringA( "Network", "Delay", delay, g_iniPath );
 }
@@ -5120,6 +5236,12 @@ static void DrawMenu( float sw, float sh, float h )
 	in.back = InterlockedExchange( &g_menuKeys[MK_BACK], 0 );
 	in.nextPage = InterlockedExchange( &g_menuKeys[MK_NEXT], 0 );
 	in.prevPage = InterlockedExchange( &g_menuKeys[MK_PREV], 0 );
+	static char typed[64], pasted[128];
+	TakeTyped( typed, sizeof(typed) );
+	in.typed = typed[0] ? typed : 0;
+	in.copy = InterlockedExchange( &g_menuCopy, 0 ) != 0;
+	if ( InterlockedExchange( &g_menuPaste, 0 ) && ReadClipboard( pasted, sizeof(pasted) ) ) in.pasted = pasted;
+	if ( g_testPaste[0] ) { strcpy_s( pasted, g_testPaste ); g_testPaste[0] = 0; in.pasted = pasted; }
 
 	// The mouse, in the overlay's pixels (the window may be scaled).
 	bool cursorShown = true;
@@ -5162,11 +5284,6 @@ static void DrawMenu( float sw, float sh, float h )
 			SaveSettings();
 		}
 		if ( g_myOutfit == 0 && g_myWornOutfit == SNOWY_OUTFIT ) g_menu.Info( "", "his snowy clothes, in this area", Menu::DIM );
-		else if ( g_myOutfit != g_myWornOutfit ) {
-			char now[64];
-			sprintf_s( now, "%s until then", OUTFITS[g_myWornOutfit].name );
-			g_menu.Info( "", now, Menu::DIM );
-		}
 		if ( g_myOutfit == RETRO_OUTFIT ) {
 			// A row of ready colours per part (the first is the game's own), and sliders for any other.
 			static const uint8_t READY[][3] = { { 220, 50, 40 }, { 240, 140, 30 }, { 240, 215, 60 }, { 60, 190, 220 }, { 50, 100, 220 },
@@ -5174,7 +5291,7 @@ static void DrawMenu( float sw, float sh, float h )
 			static const int NUM_READY = sizeof(READY) / sizeof(READY[0]);
 			static int editing = RETRO_SHIRT;
 			bool changed = false;
-			g_menu.Header( "Retro Harry's colours" );
+			g_menu.Header( "Retro Harry's colors" );
 			for ( int part = 0; part < RETRO_PARTS; part++ ) {
 				uint32_t swatches[NUM_READY + 1];
 				int index = -1;
@@ -5183,13 +5300,15 @@ static void DrawMenu( float sw, float sh, float h )
 					swatches[i] = (c[0] << 16) | (c[1] << 8) | c[2];
 					if ( memcmp( c, g_myColors[part], 3 ) == 0 ) index = i;
 				}
-				if ( g_menu.Swatches( RETRO_PART_NAMES[part], &index, swatches, NUM_READY + 1, "Left / Right or click : pick a colour. Shows straight away." ) && index >= 0 ) {
+				if ( g_menu.Swatches( RETRO_PART_NAMES[part], &index, swatches, NUM_READY + 1, "Left / Right or click : pick a color. Shows straight away." ) && index >= 0 ) {
 					memcpy( g_myColors[part], index == 0 ? RETRO_DEFAULT[part] : READY[index - 1], 3 );
 					editing = part;
 					changed = true;
 				}
 			}
-			g_menu.Choice( "Mix a colour for", &editing, RETRO_PART_NAMES, RETRO_PARTS, "Which part the three sliders below change." );
+			g_menu.Choice( "Mix a color for", &editing, RETRO_PART_NAMES, RETRO_PARTS, "Which part the color and the three sliders below change." );
+			if ( g_menu.Colour( "Color", g_myColors[editing],
+				"Enter : type a hex code (#DC3228) or red, green, blue (220, 50, 40). Ctrl + V pastes one, Ctrl + C copies this one." ) ) changed = true;
 			static const char* const CHANNELS[3] = { "Red", "Green", "Blue" };
 			for ( int ch = 0; ch < 3; ch++ ) {
 				int v = g_myColors[editing][ch];
@@ -5198,7 +5317,7 @@ static void DrawMenu( float sw, float sh, float h )
 					changed = true;
 				}
 			}
-			if ( g_menu.Action( "Back to the original colours" ) ) {
+			if ( g_menu.Action( "Reset colors to default", "Retro Harry's own colors, for all four parts." ) ) {
 				memcpy( g_myColors, RETRO_DEFAULT, sizeof(g_myColors) );
 				changed = true;
 			}
@@ -5215,10 +5334,16 @@ static void DrawMenu( float sw, float sh, float h )
 		changed |= g_menu.Toggle( "Player list while playing", &g_showList, "Keeps the player list in the corner of the screen." );
 		changed |= g_menu.Choice( "Playback delay", &g_delayIndex, DELAYS, sizeof(DELAYS) / sizeof(DELAYS[0]),
 			"How far behind the others are shown. Shorter : closer to live, but jerkier on a bad connection." );
-		static const char* const FADES[] = { "50 - 100", "100 - 200", "150 - 300", "200 - 400", "300 - 600", "Never" };
-		static_assert( sizeof(FADES) / sizeof(FADES[0]) == NUM_TAG_FADES, "one name per fade" );
-		changed |= g_menu.Choice( "Name tag fade", &g_tagFadeIndex, FADES, NUM_TAG_FADES,
-			"How far away the others' names fade out (distance from the camera). The players themselves stay in view." );
+		if ( g_menu.Slider( "Name tags start fading at", &g_tagFadeFrom, 0, TAG_FADE_MAX - TAG_FADE_STEP, TAG_FADE_STEP,
+			"Distance from the camera where the others' names start to fade. The players themselves stay in view." ) ) {
+			if ( g_tagFadeTo < g_tagFadeFrom + TAG_FADE_STEP ) g_tagFadeTo = g_tagFadeFrom + TAG_FADE_STEP;
+			changed = true;
+		}
+		if ( g_menu.Slider( "Name tags gone at", &g_tagFadeTo, TAG_FADE_STEP, TAG_FADE_MAX, TAG_FADE_STEP,
+			"Distance from the camera where the others' names have faded out completely." ) ) {
+			if ( g_tagFadeFrom > g_tagFadeTo - TAG_FADE_STEP ) g_tagFadeFrom = g_tagFadeTo - TAG_FADE_STEP;
+			changed = true;
+		}
 		if ( changed ) SaveSettings();
 	}
 	if ( g_menu.Page( "Keys" ) ) {
@@ -5231,6 +5356,8 @@ static void DrawMenu( float sw, float sh, float h )
 		g_menu.Info( "F8", "Puppet stays where it is", Menu::DIM );
 	}
 	g_menu.End();
+	InterlockedExchange( &g_menuTyping, g_menu.IsTyping() ? 1 : 0 );
+	if ( const char* copy = g_menu.CopyText() ) { WriteClipboard( copy ); g_lastCopied = GetTickCount(); }
 
 	// Our own pointer where the game hides Windows'.
 	if ( in.mouseInside && !cursorShown ) {
@@ -5281,8 +5408,8 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		const Peer& p = g_peers[i];
 		float tagX, tagY, tagDepth;
 		if ( !g_showTags || g_menu.IsOpen() || !PlaceNameTag( p, dev, &tagX, &tagY, &tagDepth ) ) continue;
-		float fadeStart = (float) TAG_FADE_STARTS[g_tagFadeIndex];
-		float alpha = fadeStart <= 0.0F ? 1.0F : 1.0F - (tagDepth - fadeStart) / fadeStart;
+		float from = (float) g_tagFadeFrom, to = (float) g_tagFadeTo;
+		float alpha = to > from ? 1.0F - (tagDepth - from) / (to - from) : (tagDepth < from ? 1.0F : 0.0F);
 		if ( alpha <= 0.0F ) continue;
 		const char* name = PlayerName( p.id );
 		float w = OverlayTextWidth( name );

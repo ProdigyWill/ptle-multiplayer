@@ -30,6 +30,9 @@ struct MenuInput
 	bool mouseDown;                // Left button held.
 	bool mouseClicked;             // Left button went down this frame.
 	bool mouseMoved;
+	const char* typed;             // Characters typed since the last frame ('\b' : Backspace; may be 0).
+	const char* pasted;            // The clipboard's text, on Ctrl + V (may be 0).
+	bool copy;                     // Ctrl + C.
 };
 
 class Menu
@@ -64,6 +67,13 @@ public:
 	bool Slider( const char* label, int* value, int min, int max, int step, const char* hint = 0 );
 	bool Swatches( const char* label, int* index, const uint32_t* colors, int count, const char* hint = 0 );
 	bool Action( const char* label, const char* hint = 0 );
+	// A colour : a swatch of it and its hex code. Enter : type a hex code or R, G, B
+	// (Enter again sets it, Esc gives up); Ctrl + V pastes one; Ctrl + C copies it.
+	bool Colour( const char* label, uint8_t rgb[3], const char* hint = 0 );
+
+	// Text for the clipboard (Ctrl + C on a row that has some), this frame; 0 : none.
+	const char* CopyText() const { return m_copy[0] ? m_copy : 0; }
+	bool IsTyping() const { return m_open && m_editing; }
 
 	// Draws the footer. The menu closes itself on Esc (IsOpen then says so).
 	void End();
@@ -86,4 +96,9 @@ private:
 	int m_declPage, m_declRow, m_declSelectable;
 	bool m_onPage;
 	const char* m_hint;
+	bool m_editing = false;               // Typing into the selected row (a Colour).
+	int m_editRow = -1;
+	char m_edit[32] = { 0, };
+	bool m_keepOpen = false;              // Esc ended the typing, not the menu.
+	char m_copy[32] = { 0, };
 };
