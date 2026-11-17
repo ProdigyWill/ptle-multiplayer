@@ -1089,6 +1089,37 @@ static void SuspectPuppets()
 	ResetHistory();
 }
 
+// Between a load's announcement and the new level's arrival the old level still
+// runs and is shown a couple of seconds, while the level's CRC is already the new
+// one : a puppet of a player there was drawn at their place in the new level, in
+// the old one's scenery (a Harry running into the loadzone just left; 2026-11-16,
+// Turtle Monument <-> Twin Outposts). Puppets aren't shown in that time.
+static bool g_levelLeaving = false;
+static void* g_levelLeavingWorld = 0;
+static DWORD g_levelLeavingSince = 0;
+static const DWORD LEVEL_LEAVING_MAX_MS = 8000;   // Should Harry's world not change (it does).
+static uint32_t g_tickLevel = 0;                  // The level's CRC at Harry's last tick (the one shown).
+
+static void NoteLevelLeaving( uint32_t newLevel )
+{
+	EIHarry* harry = Gizmod::getHarry();
+	if ( !harry || !g_tickLevel || newLevel == g_tickLevel ) return;   // Coming back to life here, or already there.
+	g_levelLeaving = true;
+	g_levelLeavingWorld = harry->m_world;
+	g_levelLeavingSince = GetTickCount();
+	mp_log( "[MP] Leaving the level : puppets hidden until the next one is up.\n" );
+}
+
+static void CheckLevelLeaving( EIHarry* harry )   // Each Harry tick.
+{
+	if ( !g_levelLeaving || harry->m_world != g_levelLeavingWorld ) g_tickLevel = Gizmod::getCurrentLevelCRC();
+	if ( !g_levelLeaving ) return;
+	bool arrived = harry->m_world != g_levelLeavingWorld;
+	if ( !arrived && GetTickCount() - g_levelLeavingSince < LEVEL_LEAVING_MAX_MS ) return;
+	g_levelLeaving = false;
+	mp_log( "[MP] %s : puppets shown again.\n", arrived ? "In the new level" : "Still no new level after 8 s" );
+}
+
 static Peer* ReclaimPuppet( EIEvilHarryP* beast )
 {
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
@@ -1922,7 +1953,7 @@ static const uint32_t TAG_GRACE_FRAMES = 12;
 static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, float* y, float* depth )
 {
 	EIEvilHarryP* p = peer.beast;
-	if ( !p || !peer.tagFrame || g_presentCount - peer.tagFrame > TAG_GRACE_FRAMES ) return false;
+	if ( !p || !peer.tagFrame || g_presentCount - peer.tagFrame > TAG_GRACE_FRAMES || g_levelLeaving ) return false;
 	// The view the renderer drew this frame with (the last it was given : any
 	// reflection comes first), whichever camera mode built it. Choosing among the
 	// cameras' own look-ats instead left the tag behind when aiming the TNT, and
@@ -1956,6 +1987,7 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 	const PlayerSnapshot* t = GetPuppetTarget();
 	// Online with nobody to show here (they left, or are in another level) : not drawn.
 	if ( g_networked && !t ) return;
+	if ( g_levelLeaving ) return;   // The old level, still shown (NoteLevelLeaving).
 	bool viewer = IsViewerPeer( peer );   // No pose copy, name tag or items : just the clip.
 	if ( t && !ForcedClip() ) ApplyPuppetPose( self, t );
 	g_origEvilHarryRender( self, context, arg );
@@ -4205,6 +4237,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 		}
 	}
 	DropLostPuppets();
+	CheckLevelLeaving( self );
 
 	if ( !g_origPresent ) {   // The overlay draws as frames are presented.
 		HookPresent();
@@ -5110,6 +5143,7 @@ public:
 	virtual void onLoadLevel( LoadLevelEvent& e )
 	{
 		mp_log( "[MP] Loading level 0x%.8X.\n", e.getLevelCRC() );
+		NoteLevelLeaving( e.getLevelCRC() );
 		ApplyMyOutfit();   // The game clears its cheats while it starts : set again before each level loads.
 		ForgetRetroTextures();
 		SuspectPuppets();
