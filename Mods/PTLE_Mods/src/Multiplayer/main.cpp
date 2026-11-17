@@ -342,7 +342,8 @@ static uint32_t ShownLevel()
 static int g_raftTest = 0;   // PTLE_MP_RAFTTEST=1 : Spinja Lair's wading water, the raft out, Harry turns paddling one side : the puppet must face as he does.
 static int g_aimTest = 0;   // 2 : with the raft out instead (Down looks from Harry's head, the raft isn't drawn).
                    // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
-static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
+static int g_distTest = 0;                        // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn; two games : 2 runs away, 3 watches. PTLE_MP_FADEALLOW=1 : puppets fade as before.
+static bool g_allowPuppetFade = false;
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
 static bool g_menuTest = false;                  // PTLE_MP_MENUTEST=1 : the autotest drives the menu (F1).
 static bool g_viewerTest = false;                // PTLE_MP_VIEWERTEST=1 : the autotest drives the animation viewer.
@@ -2169,8 +2170,56 @@ static bool __fastcall PitContact5_Hook( void* self, void*, PitContact* c, int a
 	return ((PitContact5) PIT_CONTACT_FUNCS[1])( self, c, a, b, d, e );
 }
 
+// Creatures fade out with their distance to the camera (vtable +0x108, 0x41ED70,
+// shared by every kind : sets the fade at +0x24 from 1 to 0, about 150 away, and
+// the alpha at +0x1C, and returns true once gone : the render then skips it).
+// The other players, and the enemies too, now stay in full view however far (up
+// to the game's own cut-off, a few hundred away); the name tags still fade
+// (TAG_FADE_START).
+static const uint32_t VTABLE_SLOT_DISTANCE_FADE = 0x108;
+static const uint32_t DISTANCE_FADE_FUNC = 0x41ED70;
+static const uint32_t DISTANCE_FADE_VTABLES[] = {   // Every vtable with it in that slot.
+	0x869440, 0x869AD0, 0x86B3C8, 0x86C3D0, 0x86D1D8, 0x86D7A0, 0x86FD18, 0x873B68,
+	0x874688, 0x875240, 0x875B30, 0x876400, 0x876800, 0x876D28, 0x877E78, 0x878310,
+	0x878810, 0x878C00, 0x8792D0, 0x879770, 0x879B90, 0x881BE8, 0x8822D0, 0x889700,
+	0x88A2C0, 0x88A668, 0x88AFE8, 0x88B4F0, 0x88B868, 0x88BE78, 0x88E8C8, 0x88F078,
+	0x890400, 0x890A40, 0x8925A8, 0x893EA8, 0x894398, 0x896438, 0x896C10, 0x8974E0,
+	0x897ED0, 0x898660, 0x898C20, 0x899130, 0x8999C8, 0x899DE0, 0x89A6D8, 0x8A18A0,
+	0x8A1CF0, 0x8A2C70,
+};
+typedef bool (__thiscall *DistanceFadeFunc)( void* self, float distance );
+static volatile LONG g_fadesStopped = 0;
+static float g_lastPuppetFade = 1.0F;   // What the game wanted for a puppet (tests).
+static volatile LONG g_puppetFadeCalls = 0;
+
+static bool __fastcall DistanceFade_Hook( void* self, void*, float distance )
+{
+	bool gone = ((DistanceFadeFunc) DISTANCE_FADE_FUNC)( self, distance );
+	float& fade = FIELD( self, float, 0x24 );
+	bool puppet = IsAnyPuppet( self );
+	if ( puppet ) { InterlockedIncrement( &g_puppetFadeCalls ); g_lastPuppetFade = fade; }
+	if ( g_allowPuppetFade ) return gone;
+	if ( puppet && fade < 1.0F && InterlockedIncrement( &g_fadesStopped ) == 1 ) mp_log( "[MP] A puppet was fading out with distance (%.2f) : kept in full view.\n", fade );
+	fade = 1.0F;
+	FIELD( self, float, 0x1C ) = FIELD( self, float, 0x20 ) * FIELD( self, float, 0x28 );
+	return false;
+}
+
+static void InstallFadeHooks()
+{
+	int hooked = 0, n = sizeof(DISTANCE_FADE_VTABLES) / sizeof(DISTANCE_FADE_VTABLES[0]);
+	for ( int i = 0; i < n; i++ ) {
+		uint32_t slot = DISTANCE_FADE_VTABLES[i] + VTABLE_SLOT_DISTANCE_FADE;
+		if ( injector::ReadMemory<uint32_t>( slot, true ) != DISTANCE_FADE_FUNC ) continue;
+		injector::WriteMemory( slot, &DistanceFade_Hook, true );
+		hooked++;
+	}
+	if ( hooked != n ) mp_log( "[MP] Distance fade : %d of %d kinds of creature hooked; the others may still fade out.\n", hooked, n );
+}
+
 static void InstallPitHooks()
 {
+
 	void* hooks[2] = { (void*) &PitContact4_Hook, (void*) &PitContact5_Hook };
 	for ( int i = 0; i < 2; i++ ) {
 		if ( injector::ReadMemory<uint32_t>( PIT_CONTACT_SLOTS[i], true ) != PIT_CONTACT_FUNCS[i] ) {
@@ -3688,6 +3737,32 @@ static void AutotestStep( EIHarry* harry )
 		break;
 	}
 	case 500: {   // Distance : the puppet stands further and further ahead of the camera.
+		if ( g_distTest >= 2 ) {   // Two games : 2 runs away from the start, 3 stays and watches the other's puppet.
+			static DWORD lastLog = 0; static int posesAt = 0; static float maxDepthDrawn = 0.0F, minAlphaDrawn = 9.0F;
+			DWORD t = now - phaseStart;
+			if ( g_distTest == 2 && step == 0 && t >= 12000 ) { mp_log( "[AT] Distance : running away.\n" ); InterlockedExchange( &g_holdMs, 14000 ); InterlockedExchange( &g_holdKey, 'W' ); step = 1; }
+			EIEvilHarryP* b = g_cur->beast;
+			if ( g_distTest == 3 && b && now - lastLog >= 250 ) {
+				lastLog = now;
+				const Matrix4f& cam = g_cameraWorld;
+				float dx = b->EIBeast::m_position.x - cam.data[3][0], dy = b->EIBeast::m_position.y - cam.data[3][1], dz = b->EIBeast::m_position.z - cam.data[3][2];
+				float d = sqrtf( dx * dx + dy * dy + dz * dz );
+				int renders = g_puppetPoseCopies - posesAt; posesAt = g_puppetPoseCopies;
+				float a = FIELD( b, float, 0x1C );
+				if ( renders > 0 && t > 12000 ) { if ( d > maxDepthDrawn ) maxDepthDrawn = d; if ( a < minAlphaDrawn ) minAlphaDrawn = a; }
+				mp_log( "[AT] Distance %5u ms : the other's puppet %.1f from the camera, rendered %d, game fade %.2f, +1C %.2f +20 %.2f +24 %.2f +28 %.2f, +628 %.1f, tag depth %.1f\n",
+					t, d, renders, g_lastPuppetFade, a, FIELD( b, float, 0x20 ), FIELD( b, float, 0x24 ), FIELD( b, float, 0x28 ), FIELD( b, float, 0x628 ), g_cur->tagDepth );
+			}
+			if ( g_distTest == 3 && ((step == 0 && t >= 15000) || (step == 1 && t >= 20000) || (step == 2 && t >= 25000)) ) {
+				char name[32]; sprintf_s( name, "distw_%d", step ); RequestSnapshot( name ); step++;
+			}
+			if ( t >= (g_distTest == 2 ? 45000u : 35000u) ) {
+				bool ok = g_distTest == 2 || (maxDepthDrawn > 150.0F && minAlphaDrawn > 0.9F);
+				if ( g_distTest == 3 ) mp_log( "[AT] Distance : the other was rendered up to %.1f from the camera, alpha at least %.2f : %s\n", maxDepthDrawn, minAlphaDrawn, ok ? "ok" : "WRONG" );
+				InterlockedExchange( &g_autotestDone, ok ? 1 : 2 );
+			}
+			break;
+		}
 		static const float DISTANCES[] = { 20.0F, 60.0F, 100.0F, 140.0F, 180.0F, 220.0F, 260.0F, 300.0F, 400.0F, 800.0F, 1500.0F, 3000.0F };
 		static const int NUM = sizeof(DISTANCES) / sizeof(DISTANCES[0]);
 		static int posesAtStart = 0, passesAtStart = 0;
@@ -3705,9 +3780,9 @@ static void AutotestStep( EIHarry* harry )
 			char name[32];
 			sprintf_s( name, "dist_%03d", (int) DISTANCES[step] );
 			RequestSnapshot( name );
-			mp_log( "[AT] Distance %.0f ahead of Harry : render called %d times in 1 s (%d to the screen), tag depth %.1f, tag %s; ticked %d times, last %u ms ago.\n", DISTANCES[step],
+			mp_log( "[AT] Distance %.0f ahead of Harry : render called %d times in 1 s (%d to the screen), tag depth %.1f, tag %s; ticked %d times, last %u ms ago; the game's fade %.2f (%ld calls, kept 1 : %ld time(s)).\n", DISTANCES[step],
 				g_puppetPoseCopies - posesAtStart, g_tagPasses[1] - passesAtStart, g_cur->tagDepth, g_cur->tagFrame == g_presentCount ? "noted" : "not noted",
-				g_cur->ticks, GetTickCount() - g_cur->lastTick );
+				g_cur->ticks, GetTickCount() - g_cur->lastTick, g_lastPuppetFade, g_puppetFadeCalls, g_fadesStopped );
 			snapped = true;
 		}
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
@@ -4576,7 +4651,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 		uint32_t now = NetNowMs();
 		for ( int i = 0; i < MAX_PEERS; i++ ) {
 			Peer* p = &g_peers[i];
-			if ( g_autotest && p == MainPeer() && g_pitTest < 4 ) continue;   // (The two-game pit test : as in play.)
+			if ( g_autotest && p == MainPeer() && g_pitTest < 4 && g_distTest < 2 ) continue;   // (The two-game pit test : as in play.)
 			if ( p->beast || p->limbo || !p->target || now - p->lastSpawnTry < 1000 ) continue;
 			p->lastSpawnTry = now;
 			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", i );
@@ -5343,6 +5418,7 @@ public:
 		injector::WriteMemory( evilSlot,  &EvilHarryTick_Hook, true );
 		InstallItemDrawHooks();
 		InstallPitHooks();
+		InstallFadeHooks();
 		HookCamera();
 
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
@@ -5443,8 +5519,10 @@ public:
 				g_aimTest = env[0] - '0';
 				mp_log( "[AT] Aim test.\n" );
 			}
-			if ( GetEnvironmentVariableA( "PTLE_MP_DISTTEST", env, sizeof(env) ) && env[0] == '1' ) {
-				g_distTest = true;
+			if ( GetEnvironmentVariableA( "PTLE_MP_DISTTEST", env, sizeof(env) ) && env[0] >= '1' && env[0] <= '3' ) {
+				g_distTest = env[0] - '0';
+				g_allowPuppetFade = GetEnvironmentVariableA( "PTLE_MP_FADEALLOW", env, sizeof(env) ) && env[0] == '1';
+				{ char lv[16] = { 0, }; if ( GetEnvironmentVariableA( "PTLE_MP_LEVEL", lv, sizeof(lv) ) ) AUTOTEST_LEVEL = strtoul( lv, 0, 16 ); }   // Another level (its CRC, hex).
 				mp_log( "[AT] Distance test.\n" );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_SKINTEST", env, sizeof(env) ) && env[0] == '1' ) {
