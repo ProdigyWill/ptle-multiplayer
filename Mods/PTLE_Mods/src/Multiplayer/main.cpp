@@ -2129,6 +2129,56 @@ static void InstallItemDrawHooks()
 	injector::WriteMemory( render, &EvilHarryRender_Hook, true );
 }
 
+// Pitfalls (EIPitMonster) eat any beast that touches their mouth : the beast is put
+// to sleep and the pit stays shut on it, as for an enemy knocked in. A puppet
+// caught there (spat out, or crossing the mouth) kept the pit shut on the other
+// players' screens : the pit's two contact handlers now let puppets through.
+static const uint32_t PIT_CONTACT_SLOTS[2] = { 0x890444, 0x890448 };
+static const uint32_t PIT_CONTACT_FUNCS[2] = { 0x542DD0, 0x542FD0 };
+struct PitContact { uint32_t flags; uint32_t pad[2]; void* other; };
+typedef bool (__thiscall *PitContact4)( void* self, PitContact* c, int a, int b, int d );
+typedef bool (__thiscall *PitContact5)( void* self, PitContact* c, int a, int b, int d, int e );
+static volatile LONG g_pitSkips = 0;
+
+static bool IsAnyPuppet( const void* beast )
+{
+	if ( !beast ) return false;
+	if ( IsPuppet( beast ) ) return true;
+	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].beast == beast ) return true;
+	return false;
+}
+
+static bool PitSkips( PitContact* c )
+{
+	if ( !c || !IsAnyPuppet( c->other ) ) return false;
+	if ( InterlockedIncrement( &g_pitSkips ) <= 3 ) mp_log( "[MP] A pitfall touched a puppet (0x%.8X) : not eaten.\n", c->other );
+	return true;
+}
+
+static bool __fastcall PitContact4_Hook( void* self, void*, PitContact* c, int a, int b, int d )
+{
+	if ( PitSkips( c ) ) return false;
+	return ((PitContact4) PIT_CONTACT_FUNCS[0])( self, c, a, b, d );
+}
+
+static bool __fastcall PitContact5_Hook( void* self, void*, PitContact* c, int a, int b, int d, int e )
+{
+	if ( PitSkips( c ) ) return false;
+	return ((PitContact5) PIT_CONTACT_FUNCS[1])( self, c, a, b, d, e );
+}
+
+static void InstallPitHooks()
+{
+	void* hooks[2] = { (void*) &PitContact4_Hook, (void*) &PitContact5_Hook };
+	for ( int i = 0; i < 2; i++ ) {
+		if ( injector::ReadMemory<uint32_t>( PIT_CONTACT_SLOTS[i], true ) != PIT_CONTACT_FUNCS[i] ) {
+			mp_log( "[MP] The pitfall's contact handler isn't where we expect : pitfalls may still eat puppets.\n" );
+			continue;
+		}
+		injector::WriteMemory( PIT_CONTACT_SLOTS[i], hooks[i], true );
+	}
+}
+
 static void DrivePuppet( EIEvilHarryP* p )
 {
 	ApplyPuppetCollision( p );
@@ -5243,6 +5293,7 @@ public:
 		injector::WriteMemory( harrySlot, &HarryTick_Hook, true );
 		injector::WriteMemory( evilSlot,  &EvilHarryTick_Hook, true );
 		InstallItemDrawHooks();
+		InstallPitHooks();
 		HookCamera();
 
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );

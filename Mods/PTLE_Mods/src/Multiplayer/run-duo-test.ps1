@@ -81,6 +81,8 @@ foreach ($name in $names) {
 # a puppet for each. (The autotest's own item checks fail here : they expect Evil
 # Harry to replay the local player, and the other games run a few seconds apart.)
 $ok = $true
+# (The pit tests last a minute, not the usual few.)
+$minReceived = $(if ($PlayerEnv) { 1000 } else { 2500 })
 foreach ($name in $names) {
 	$log = @(Get-Content (Join-Path $logDir "$name\multiplayer.log"))
 	$me = ($log | Select-String 'Joined room .* as player (\d+)' | Select-Object -Last 1).Matches.Groups[1].Value
@@ -107,7 +109,7 @@ foreach ($name in $names) {
 	if ($missing.Count -ne 0) { $good = $false }
 	foreach ($id in $others) {
 		$e = $byPlayer[$id]
-		$fine = $e.received -gt 2500 -and $e.lost -lt $e.received / 20 -and $e.shown
+		$fine = $e.received -gt $minReceived -and $e.lost -lt $e.received / 20 -and $e.shown
 		Write-Host ("== Game {0} (player {1}) : player {2} received {3}, lost {4}, puppet shown {5} : {6}" -f $name, $me, $id, $e.received, $e.lost, $e.shown, $(if ($fine) { 'ok' } else { 'WRONG' }))
 		if (-not $fine) { $good = $false }
 	}
