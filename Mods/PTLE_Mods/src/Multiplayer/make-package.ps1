@@ -40,14 +40,14 @@ $versionH  = Join-Path $PSScriptRoot 'version.h'
 $changelog = Join-Path $PSScriptRoot 'CHANGELOG.md'
 $msbuild   = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe'
 
-function Git { & git -C $PSScriptRoot @args; if ($LASTEXITCODE -ne 0) { throw "git $args failed." } }
+function RunGit { & git.exe -C $PSScriptRoot @args; if ($LASTEXITCODE -ne 0) { throw "git $args failed." } }
 function CodeVersion { if ((Get-Content $versionH -Raw) -match '#define MP_VERSION "([^"]+)"') { $Matches[1] } else { throw 'No MP_VERSION in version.h.' } }
 function WriteText($path, $text) { [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false)) }
 
 if ($Version) {
 	if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Version : three numbers, like 0.2.0 (not '$Version')." }
 	$tag = "v$Version"
-	if (Git status --porcelain) { throw 'There are uncommitted changes : commit them first, so the zip matches a commit.' }
+	if (RunGit status --porcelain) { throw 'There are uncommitted changes : commit them first, so the zip matches a commit.' }
 	$tagged = & git -C $PSScriptRoot rev-parse -q --verify "refs/tags/$tag"
 	if (-not $tagged) {
 		# A new release.
@@ -65,18 +65,18 @@ if ($Version) {
 			if (-not $passed) { throw "The autotest didn't pass (see $logFile)." }
 		}
 		catch {
-			Git checkout -- $versionH $changelog   # Back as they were : nothing released.
+			RunGit checkout -- $versionH $changelog   # Back as they were : nothing released.
 			throw
 		}
 		Write-Host '== Autotest : PASS'
-		Git add -- $versionH $changelog
-		Git commit -q -m "Release $Version" -m 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>'
-		Git tag -a $tag -m "Multiplayer $Version"
+		RunGit add -- $versionH $changelog
+		RunGit commit -q -m "Release $Version" -m 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>'
+		RunGit tag -a $tag -m "Multiplayer $Version"
 		Write-Host "== Committed and tagged $tag (not pushed)"
 	}
 	else {
 		# More zips of a release : the same code.
-		if ((Git rev-parse HEAD) -ne (Git rev-parse "$tag^{commit}")) { throw "The code isn't $tag's any more (git checkout $tag to pack it again)." }
+		if ((RunGit rev-parse HEAD) -ne (RunGit rev-parse "$tag^{commit}")) { throw "The code isn't $tag's any more (git checkout $tag to pack it again)." }
 		if ((CodeVersion) -ne $Version) { throw "version.h doesn't say $Version." }
 		Write-Host "== $tag : building"
 		& $msbuild (Join-Path $modsDir 'PTLE_Mods.sln') '/t:ModLoader;Multiplayer;WindowedMode;CheatLab' /p:Configuration=Release /p:Platform=Win32 `
