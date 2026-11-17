@@ -30,6 +30,7 @@
 // --------------------------------------------------------------------------------
 
 #include <time.h>
+#include <intrin.h>
 #include <Windows.h>
 #include <d3d9.h>
 #include <math.h>
@@ -320,6 +321,7 @@ static int g_iceTest = 0;                         // PTLE_MP_ICETEST=1 : the aut
 static bool g_allowPuppetFreeze = false;
 static volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
+static bool g_aimTest = false;                   // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
 static bool g_distTest = false;                  // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn.
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
 static bool g_menuTest = false;                  // PTLE_MP_MENUTEST=1 : the autotest drives the menu (F1).
@@ -1696,11 +1698,32 @@ static uint32_t g_presentCount = 1;
 // down its -Z). Its projection is captured below (right-handed : w is minus the
 // view depth; 50 degrees, 4:3, whatever the window's shape). The matrix at 0x926A40
 // looks like one but isn't the main view's.
+//
+// Each camera mode builds it with its own call (about thirty : the usual one behind
+// Harry, 0x449B9A, but also looking around and aiming in first person, and others),
+// all into a camera's matrix at +0xE0. Only hooking the usual one left the camera
+// as it was when another mode took over : aiming the TNT, another player's tag
+// jumped onto Harry's head. All are hooked. Most build a camera of their own (the
+// mode's), which the usual call then follows : the main camera is the one it
+// writes, used whenever it was built this frame; otherwise the last camera built
+// this frame. A frame where none was (a cutscene, its own camera) shows no tags.
 typedef Matrix4f* (__thiscall *LookAtFunc)( Matrix4f*, Vector3f*, Vector3f*, Vector3f* );
 static const uint32_t CAMERA_LOOKAT_CALL = 0x449B9A;
+static const uint32_t CAMERA_LOOKAT_CALLS[] = {
+	0x449B9A, 0x449BC4, 0x456169, 0x457065, 0x457783, 0x457A58, 0x4582BE, 0x4584E7, 0x459A08, 0x45AC65,
+	0x45B30C, 0x45B6E7, 0x45B774, 0x45C9F2, 0x45D6B1, 0x45D956, 0x45E46D, 0x45E7E0, 0x460815, 0x4609BA,
+	0x460BDA, 0x461AF0, 0x461EE7, 0x462720, 0x4645D4, 0x465106, 0x4657AF, 0x466054, 0x46736F, 0x467C7D,
+	0x677851, 0x677B58,
+};
+static const int NUM_CAMERA_LOOKAT_CALLS = sizeof(CAMERA_LOOKAT_CALLS) / sizeof(CAMERA_LOOKAT_CALLS[0]);
 static const LookAtFunc CameraLookAt = (LookAtFunc) 0x6EE560;
 static Matrix4f g_cameraWorld;
 static bool g_haveCamera = false;
+static uint32_t g_cameraFrame = 0;          // g_presentCount when g_cameraWorld was last set.
+static uint32_t g_cameraSite = 0;           // The call that built it.
+static Matrix4f* g_mainCamera = 0;          // What the usual call (0x449B9A) writes.
+static uint32_t g_mainCameraFrame = 0;
+static int g_cameraSiteCount[NUM_CAMERA_LOOKAT_CALLS];
 
 // Diagnostics (name tags near water) : the look-ats of the frame, and where the
 // puppet was drawn. Reset by the survey; logged per level.
@@ -1719,8 +1742,20 @@ static bool g_tagDiagOn = false;
 static Matrix4f* __fastcall CameraLookAt_Hook( Matrix4f* self, void*, Vector3f* eye, Vector3f* target, Vector3f* up )
 {
 	Matrix4f* m = CameraLookAt( self, eye, target, up );
+	uint32_t site = (uint32_t) _ReturnAddress() - 5;
+	for ( int i = 0; i < NUM_CAMERA_LOOKAT_CALLS; i++ ) {
+		if ( CAMERA_LOOKAT_CALLS[i] != site ) continue;
+		if ( g_cameraSiteCount[i]++ == 0 ) mp_log( "[MP] Camera built by 0x%.8X (camera matrix 0x%.8X), eye (%.1f, %.1f, %.1f) : first time.\n", site, self, eye->x, eye->y, eye->z );
+		break;
+	}
+	if ( site == CAMERA_LOOKAT_CALL ) g_mainCamera = self;
+	bool main = self == g_mainCamera;
+	if ( main ) g_mainCameraFrame = g_presentCount;
+	else if ( g_mainCameraFrame == g_presentCount ) return m;   // The main camera is this frame's.
 	g_cameraWorld = *m;
 	g_haveCamera = true;
+	g_cameraFrame = g_presentCount;
+	g_cameraSite = site;
 	if ( g_tagDiagOn ) {
 		if ( g_tagDiag.lookAtsThisFrame < 4 ) g_tagDiag.eyes[g_tagDiag.lookAtsThisFrame] = *eye;
 		g_tagDiag.lookAtsThisFrame++;
@@ -1757,12 +1792,17 @@ static void HookCamera()
 	if ( memcmp( (void*) PERSPECTIVE_CALL, PERSPECTIVE_ORIGINAL, 5 ) == 0 ) injector::MakeCALL( PERSPECTIVE_CALL, &Perspective_Hook );
 	else mp_log( "[MP] The perspective call isn't what we expect.\n" );
 
-	static const uint8_t ORIGINAL[5] = { 0xE8, 0xC1, 0x49, 0x2A, 0x00 };   // call 0x6EE560.
-	if ( memcmp( (void*) CAMERA_LOOKAT_CALL, ORIGINAL, 5 ) != 0 ) {
-		mp_log( "[MP] The camera call isn't what we expect (free camera on?) : no name tags.\n" );
-		return;
+	int hooked = 0;
+	for ( int i = 0; i < NUM_CAMERA_LOOKAT_CALLS; i++ ) {
+		uint32_t site = CAMERA_LOOKAT_CALLS[i];
+		if ( *(uint8_t*) site != 0xE8 || site + 5 + *(int32_t*) (site + 1) != (uint32_t) CameraLookAt ) {
+			mp_log( "[MP] Camera call 0x%.8X isn't what we expect%s.\n", site, site == CAMERA_LOOKAT_CALL ? " (free camera on?)" : "" );
+			continue;
+		}
+		injector::MakeCALL( site, &CameraLookAt_Hook );
+		hooked++;
 	}
-	injector::MakeCALL( CAMERA_LOOKAT_CALL, &CameraLookAt_Hook );
+	if ( !hooked ) mp_log( "[MP] No camera call hooked : no name tags.\n" );
 }
 
 static int g_tagPasses[2] = { 0, 0 };   // Puppet draws elsewhere than to the screen, and to the screen (diagnostics).
@@ -1816,7 +1856,8 @@ static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
 	}
 
 	// Above his head : his transform is at his feet. (The highest bone isn't reliable :
-	// some bones, not drawn, sit far above him in some poses.)
+	// some bones, not drawn, sit far above him in some poses.) Placed again each
+	// frame it's shown (PlaceNameTag); this one is for the logs and tests.
 	const Matrix4f& m = p->m_transformMatrix;
 	float x = m.data[3][0], y = m.data[3][1], z = m.data[3][2] + TAG_ABOVE_FEET;
 
@@ -1836,6 +1877,38 @@ static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
 		mp_log( "[MP] Name tag : head (%.1f, %.1f, %.1f) at screen (%.0f, %.0f), depth %.1f, viewport %ux%u.\n",
 			x, y, z, peer->tagX, peer->tagY, peer->tagDepth, vp.Width, vp.Height );
 	}
+}
+
+// Where a puppet's tag goes on the screen now : the camera of this frame, the
+// puppet where it is. The game doesn't draw a puppet in every frame where it's seen
+// through a wall (St. Claire's camp at night : one frame in two or three) : a tag
+// only shown on frames it was drawn flickered there. It stays up for a few frames
+// after the last draw, placed again each frame. False : not shown.
+static const uint32_t TAG_GRACE_FRAMES = 12;
+
+static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, float* y, float* depth )
+{
+	EIEvilHarryP* p = peer.beast;
+	if ( !p || !peer.tagFrame || g_presentCount - peer.tagFrame > TAG_GRACE_FRAMES ) return false;
+	if ( !g_haveCamera || !g_haveProj || g_presentCount - g_cameraFrame > 1 ) return false;   // A cutscene's camera : not ours.
+	Matrix4f view;
+	if ( !MatInverseAffine( g_cameraWorld, &view ) ) return false;
+	IDirect3DSurface9* screen = 0;
+	D3DSURFACE_DESC d = { };
+	bool ok = SUCCEEDED( dev->GetBackBuffer( 0, 0, D3DBACKBUFFER_TYPE_MONO, &screen ) ) && screen && SUCCEEDED( screen->GetDesc( &d ) );
+	if ( screen ) screen->Release();
+	if ( !ok ) return false;
+	const float* proj = &g_cameraProj.data[0][0];
+	const Matrix4f& m = p->m_transformMatrix;
+	float px = m.data[3][0], py = m.data[3][1], pz = m.data[3][2] + TAG_ABOVE_FEET;
+	float v[4], c[4];
+	for ( int j = 0; j < 4; j++ ) v[j] = px * view.data[0][j] + py * view.data[1][j] + pz * view.data[2][j] + view.data[3][j];
+	for ( int j = 0; j < 4; j++ ) c[j] = v[0] * proj[j] + v[1] * proj[4 + j] + v[2] * proj[8 + j] + v[3] * proj[12 + j];
+	if ( c[3] < 0.1F ) return false;   // Behind the camera.
+	*x = (c[0] / c[3] + 1.0F) * 0.5F * d.Width;
+	*y = (1.0F - c[1] / c[3]) * 0.5F * d.Height;
+	*depth = c[3];
+	return true;
 }
 
 static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* context, void* arg )
@@ -3198,6 +3271,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_menuTest ) { phase = 600; phaseStart = now; step = 0; break; }
 		if ( g_skinTest ) { phase = 700; phaseStart = now; step = 0; break; }
 		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
+		if ( g_aimTest ) { phase = 900; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
 		if ( g_iceTest ) { phase = 800; phaseStart = now; step = 0; break; }
 		phase = 7; phaseStart = now; step = 0; snapped = false; circleAngle = 0.0F;   // Roll, collision (open space), circle, walk, jumps, items.
@@ -3286,6 +3360,41 @@ static void AutotestStep( EIHarry* harry )
 			snapped = true;
 		}
 		else if ( t >= 3500 ) { step++; phaseStart = now; }
+		break;
+	}
+	case 900: {   // Aim : the puppet ahead; Harry looks in first person (Down held), then back.
+		DWORD t = now - phaseStart;
+		IDirect3DDevice9* dev = *(IDirect3DDevice9**) RENDERER_DEVICE;
+		float tx = -1.0F, ty = -1.0F, td = 0.0F;
+		bool shown = dev && PlaceNameTag( *g_cur, dev, &tx, &ty, &td );
+		const float* eye = &g_cameraWorld.data[3][0];
+		if ( step == 0 ) {
+			if ( t < 100 ) {
+				const Matrix4f& cam = g_cameraWorld;
+				float fx = -cam.data[2][0], fy = -cam.data[2][1];
+				float l = sqrtf( fx * fx + fy * fy );
+				if ( l > 0.01F ) { g_puppetOffset.x = fx / l * 25.0F; g_puppetOffset.y = fy / l * 25.0F; }
+			}
+			if ( t < 3000 ) break;
+			mp_log( "[AT] Aim : before, camera 0x%.8X eye (%.1f, %.1f, %.1f), tag %s at (%.0f, %.0f).\n", g_cameraSite, eye[0], eye[1], eye[2], shown ? "shown" : "NOT shown", tx, ty );
+			RequestSnapshot( "aim_0_before" );
+			InterlockedExchange( &g_holdMs, 6000 ); InterlockedExchange( &g_holdKey, VK_DOWN );
+			step = 1; phaseStart = now;
+		}
+		else if ( step == 1 ) {
+			if ( t < 3000 ) break;
+			mp_log( "[AT] Aim : looking (Down held), camera 0x%.8X eye (%.1f, %.1f, %.1f), tag %s at (%.0f, %.0f).\n", g_cameraSite, eye[0], eye[1], eye[2], shown ? "shown" : "NOT shown", tx, ty );
+			RequestSnapshot( "aim_1_looking" );
+			step = 2; phaseStart = now;
+		}
+		else if ( step == 2 ) {
+			if ( t < 5000 ) break;
+			mp_log( "[AT] Aim : after, camera 0x%.8X eye (%.1f, %.1f, %.1f), tag %s at (%.0f, %.0f).\n", g_cameraSite, eye[0], eye[1], eye[2], shown ? "shown" : "NOT shown", tx, ty );
+			RequestSnapshot( "aim_2_after" );
+			for ( int i = 0; i < NUM_CAMERA_LOOKAT_CALLS; i++ )
+				if ( g_cameraSiteCount[i] ) mp_log( "[AT] Aim : camera call 0x%.8X built %d camera(s).\n", CAMERA_LOOKAT_CALLS[i], g_cameraSiteCount[i] );
+			InterlockedExchange( &g_autotestDone, 1 );
+		}
 		break;
 	}
 	case 800: {   // Ice : the puppet is put in "thrown from water" (what swimming did), then back to idle.
@@ -4630,7 +4739,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 	uint32_t now = NetNowMs();
 	if ( InterlockedExchange( &g_reqMenu, 0 ) ) SetMenuOpen( !g_menu.IsOpen() );
 	bool any = g_showList || g_animViewer || g_menu.IsOpen();
-	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame == g_presentCount;
+	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame && g_presentCount - g_peers[i].tagFrame <= TAG_GRACE_FRAMES;
 	for ( int i = 0; i < MAX_TOASTS && !any; i++ ) any = g_toasts[i].text[0] && now - g_toasts[i].time < TOAST_MS;
 	if ( !any ) return;
 
@@ -4646,12 +4755,13 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 	// Name tags.
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const Peer& p = g_peers[i];
-		if ( !g_showTags || g_menu.IsOpen() || !p.beast || p.tagFrame != g_presentCount ) continue;
-		float alpha = 1.0F - (p.tagDepth - TAG_FADE_START) / (TAG_FADE_END - TAG_FADE_START);
+		float tagX, tagY, tagDepth;
+		if ( !g_showTags || g_menu.IsOpen() || !PlaceNameTag( p, dev, &tagX, &tagY, &tagDepth ) ) continue;
+		float alpha = 1.0F - (tagDepth - TAG_FADE_START) / (TAG_FADE_END - TAG_FADE_START);
 		if ( alpha <= 0.0F ) continue;
 		const char* name = PlayerName( p.id );
 		float w = OverlayTextWidth( name );
-		float x = floorf( p.tagX - w * 0.5F ), y = floorf( p.tagY - h * 1.2F );
+		float x = floorf( tagX - w * 0.5F ), y = floorf( tagY - h * 1.2F );
 		OverlayRect( x - pad, y - pad * 0.5F, w + 2.0F * pad, h + pad, WithAlpha( 0x80000000, alpha ) );
 		OverlayText( x, y, name, WithAlpha( 0xFFFFFFFF, alpha ) );
 	}
@@ -4887,6 +4997,10 @@ public:
 			if ( GetEnvironmentVariableA( "PTLE_MP_DEATHTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_deathTest = true;
 				mp_log( "[AT] Death test.\n" );
+			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_AIMTEST", env, sizeof(env) ) && env[0] == '1' ) {
+				g_aimTest = true;
+				mp_log( "[AT] Aim test.\n" );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_DISTTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_distTest = true;
