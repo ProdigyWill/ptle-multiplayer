@@ -2175,7 +2175,7 @@ static bool __fastcall PitContact5_Hook( void* self, void*, PitContact* c, int a
 // the alpha at +0x1C, and returns true once gone : the render then skips it).
 // The other players, and the enemies too, now stay in full view however far (up
 // to the game's own cut-off, a few hundred away); the name tags still fade
-// (TAG_FADE_START).
+// (TAG_FADE_STARTS).
 static const uint32_t VTABLE_SLOT_DISTANCE_FADE = 0x108;
 static const uint32_t DISTANCE_FADE_FUNC = 0x41ED70;
 static const uint32_t DISTANCE_FADE_VTABLES[] = {   // Every vtable with it in that slot.
@@ -2277,6 +2277,11 @@ static volatile LONG g_reqMenu = 0;
 // The menu (F1) and what it sets. Display settings are kept in the ini ([Display]).
 static Menu g_menu;
 static bool g_showTags = true;    // Names above the other players.
+// Name tags fade out with the camera distance, from the chosen start to twice it
+// (Multiplayer.ini : Display, TagFade = the start, 0 : never).
+static const int TAG_FADE_STARTS[] = { 50, 100, 150, 200, 300, 0 };
+static const int NUM_TAG_FADES = sizeof(TAG_FADE_STARTS) / sizeof(TAG_FADE_STARTS[0]);
+static int g_tagFadeIndex = 1;    // Their fade : 100 to 200 away (TAG_FADE_STARTS).
 static bool g_showList = false;   // The player list stays on screen while playing.
 static char g_iniPath[MAX_PATH] = { 0, };
 enum { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_PREV, MK_COUNT };
@@ -4028,6 +4033,7 @@ static void AutotestStep( EIHarry* harry )
 		static Vector3f from;
 		static int failures = 0;
 		static const int START_DELAY = g_delayIndex;
+		static const int START_FADE = g_tagFadeIndex;
 		DWORD t = now - phaseStart;
 		struct Local {
 			static float Moved( EIHarry* h, const Vector3f& from ) {
@@ -4078,11 +4084,18 @@ static void AutotestStep( EIHarry* harry )
 		case 5:
 			if ( t < 300 ) break;
 			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step++; phaseStart = now; break;
-		case 6:   // W held with the menu open : Harry stays.
+		case 6:   // Down, right : the next name tag fade.
 			if ( t < 500 ) break;
 			Local::Check( "Right changes the playback delay", g_delayIndex == (START_DELAY + 1) % 6 );
+			InterlockedIncrement( &g_menuKeys[MK_DOWN] ); step = 61; phaseStart = now; break;
+		case 61:
+			if ( t < 300 ) break;
+			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step = 62; phaseStart = now; break;
+		case 62:   // W held with the menu open : Harry stays.
+			if ( t < 500 ) break;
+			Local::Check( "Right changes the name tag fade", g_tagFadeIndex == (START_FADE + 1) % NUM_TAG_FADES );
 			RequestSnapshot( "menu_2_display" );
-			from = harry->m_position; Local::HoldW(); step++; phaseStart = now; break;
+			from = harry->m_position; Local::HoldW(); step = 7; phaseStart = now; break;
 		case 7:   // The mouse : click the third page's tab.
 			if ( t < 1800 ) break;
 			Local::Check( "Harry stays put while it's open", Local::Moved( harry, from ) < 0.5F );
@@ -4121,6 +4134,7 @@ static void AutotestStep( EIHarry* harry )
 			Local::Check( "Harry walks again once it's closed", Local::Moved( harry, from ) > 1.0F );
 			RequestSnapshot( "menu_5_closed" );
 			g_delayIndex = START_DELAY;
+			g_tagFadeIndex = START_FADE;
 			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
 			break;
 		}
@@ -4945,6 +4959,8 @@ static void ReadNetConfig( NetConfig* c )
 	if ( outfit[0] ) g_myOutfit = atoi( outfit );
 	if ( g_myOutfit < 0 || g_myOutfit >= NUM_OUTFITS ) g_myOutfit = 0;
 	g_showTags = GetPrivateProfileIntA( "Display", "NameTags", 1, ini ) != 0;
+	int fade = GetPrivateProfileIntA( "Display", "TagFade", 100, ini );
+	for ( int i = 0; i < NUM_TAG_FADES; i++ ) if ( TAG_FADE_STARTS[i] == fade ) g_tagFadeIndex = i;
 	g_showList = GetPrivateProfileIntA( "Display", "PlayerList", 0, ini ) != 0;
 	GetPrivateProfileStringA( "Network", "Server", "", c->server, sizeof(c->server), ini );
 	GetPrivateProfileStringA( "Network", "Room", "default", c->room, sizeof(c->room), ini );
@@ -4992,8 +5008,6 @@ static bool IsKnownGameVersion()
 // The overlay : name tags over the other players, the player list (F9), and
 // "joined" / "left" messages.
 // --------------------------------------------------------------------------------
-static const float TAG_FADE_START = 150.0F;   // Camera distance : tags fade out from here...
-static const float TAG_FADE_END = 300.0F;    // ...to here.
 
 static uint32_t WithAlpha( uint32_t color, float alpha )
 {
@@ -5042,6 +5056,9 @@ static void SaveSettings()
 	char delay[16];
 	sprintf_s( delay, "%d", DELAY_CHOICES[g_delayIndex] );
 	WritePrivateProfileStringA( "Display", "NameTags", g_showTags ? "1" : "0", g_iniPath );
+	char fade[16];
+	sprintf_s( fade, "%d", TAG_FADE_STARTS[g_tagFadeIndex] );
+	WritePrivateProfileStringA( "Display", "TagFade", fade, g_iniPath );
 	WritePrivateProfileStringA( "Display", "PlayerList", g_showList ? "1" : "0", g_iniPath );
 	WritePrivateProfileStringA( "Network", "Delay", delay, g_iniPath );
 }
@@ -5198,6 +5215,10 @@ static void DrawMenu( float sw, float sh, float h )
 		changed |= g_menu.Toggle( "Player list while playing", &g_showList, "Keeps the player list in the corner of the screen." );
 		changed |= g_menu.Choice( "Playback delay", &g_delayIndex, DELAYS, sizeof(DELAYS) / sizeof(DELAYS[0]),
 			"How far behind the others are shown. Shorter : closer to live, but jerkier on a bad connection." );
+		static const char* const FADES[] = { "50 - 100", "100 - 200", "150 - 300", "200 - 400", "300 - 600", "Never" };
+		static_assert( sizeof(FADES) / sizeof(FADES[0]) == NUM_TAG_FADES, "one name per fade" );
+		changed |= g_menu.Choice( "Name tag fade", &g_tagFadeIndex, FADES, NUM_TAG_FADES,
+			"How far away the others' names fade out (distance from the camera). The players themselves stay in view." );
 		if ( changed ) SaveSettings();
 	}
 	if ( g_menu.Page( "Keys" ) ) {
@@ -5260,7 +5281,8 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		const Peer& p = g_peers[i];
 		float tagX, tagY, tagDepth;
 		if ( !g_showTags || g_menu.IsOpen() || !PlaceNameTag( p, dev, &tagX, &tagY, &tagDepth ) ) continue;
-		float alpha = 1.0F - (tagDepth - TAG_FADE_START) / (TAG_FADE_END - TAG_FADE_START);
+		float fadeStart = (float) TAG_FADE_STARTS[g_tagFadeIndex];
+		float alpha = fadeStart <= 0.0F ? 1.0F : 1.0F - (tagDepth - fadeStart) / fadeStart;
 		if ( alpha <= 0.0F ) continue;
 		const char* name = PlayerName( p.id );
 		float w = OverlayTextWidth( name );
