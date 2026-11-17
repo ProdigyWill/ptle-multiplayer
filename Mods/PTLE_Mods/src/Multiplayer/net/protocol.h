@@ -30,6 +30,8 @@ enum PacketType : uint8_t
 	PACKET_PING     = 6,   // Payload sent back as is in a PONG.
 	PACKET_PONG     = 7,
 	PACKET_INFO     = 8,   // u32 level CRC (0 : none), u8 name length, name. About once a second.
+	PACKET_CAUGHT   = 9,   // Hide and seek : the sender (a hider) was caught by u8 seeker. Sequence : the catch's
+	                       // number (sent a few times; the same number again is the same catch).
 };
 
 static const int MAX_NAME = 31;   // Display names, in bytes.

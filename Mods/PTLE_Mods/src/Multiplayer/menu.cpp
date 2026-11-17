@@ -43,8 +43,9 @@ void Menu::Begin( const MenuInput& input, float screenW, float screenH, float te
 
 	// Keys : pages, then rows (wrapping), from what was declared last frame.
 	if ( m_pageCount > 0 ) {
-		int page = (m_page + m_in.nextPage - m_in.prevPage) % m_pageCount;
-		if ( page < 0 ) page += m_pageCount;
+		int from = m_page >= 0 ? m_page : (m_in.nextPage ? -1 : 0);   // (No page showing : Tab, the first; Shift + Tab, the last.)
+		int page = m_page < 0 && !m_in.nextPage && !m_in.prevPage ? -1 : (from + m_in.nextPage - m_in.prevPage) % m_pageCount;
+		if ( page < 0 && (m_in.nextPage || m_in.prevPage) ) page += m_pageCount;
 		if ( page != m_page ) { m_page = page; m_row = 0; m_rowCount = 0; }
 	}
 	if ( m_rowCount > 0 ) {
@@ -76,41 +77,135 @@ void Menu::Begin( const MenuInput& input, float screenW, float screenH, float te
 	OverlayRect( m_tabs.x + m_tabs.w, m_panel.y + m_rowH, 1.0F, m_tabs.h + m_pad, LINE );
 
 	m_declPage = 0;
-	m_declRow = 0;
+	m_declY = 0.0F;
 	m_declSelectable = 0;
+	m_declTab = 0;
+	m_declGroup = 0;
+	m_group = -1;
 	m_onPage = false;
 	m_hint = 0;
+	for ( int i = 0; i < MAX_PAGES; i++ ) m_nextTabY[i] = 0.0F;
+	for ( int i = 0; i < MAX_GROUPS; i++ ) m_nextGroupY[i] = 0.0F;
+}
+
+Menu::Rect Menu::NextTab()
+{
+	Rect tab = { m_tabs.x, m_tabs.y + m_declTab * m_rowH, m_tabs.w, m_rowH };
+	m_declTab++;
+	return tab;
+}
+
+void Menu::Group( const char* name )
+{
+	if ( m_group >= 0 ) EndGroup();
+	if ( m_declGroup >= MAX_GROUPS ) return;
+	int g = m_group = m_declGroup++;
+	int first = m_groupFirst[g] = m_declPage;
+	int count = m_groupCount[g];   // (Last frame's.)
+	bool holdsCurrent = m_page >= first && m_page < first + count;
+	Rect tab = NextTab();
+	bool shown = m_groupOpened[g] || holdsCurrent;
+	if ( m_in.mouseClicked && Hit( tab ) ) {
+		if ( !shown ) {   // Open : its first page.
+			m_groupOpened[g] = shown = true;
+			m_page = first;
+			m_row = 0;
+			m_rowCount = 0;
+		}
+		else {   // Closed, and none of its pages showing.
+			m_groupOpened[g] = shown = false;
+			if ( holdsCurrent ) { m_page = -1; m_row = 0; m_rowCount = 0; holdsCurrent = false; }
+		}
+	}
+	m_groupShown[g] = shown;
+	m_nextGroupY[g] = tab.y + tab.h * 0.5F;
+	if ( Hit( tab ) ) OverlayRect( tab.x, tab.y, tab.w, tab.h, LINE );
+	float y = tab.y + (m_rowH - m_h) * 0.5F;
+	OverlayText( tab.x + m_pad, y, name, holdsCurrent ? GOLD : 0xFFD8D8D8 );
+	// A small triangle : pointing down when open, right when closed.
+	// Its middle at the middle of the capitals (a bit below the text's box's).
+	float size = floorf( m_h * 0.45F ), cx = tab.x + tab.w - m_pad - size, cy = floorf( y + m_h * 0.62F - size * 0.5F );
+	for ( int i = 0; i < (int) size; i++ ) {
+		float f = (float) i / size, len = floorf( size * (1.0F - f) );
+		if ( shown ) OverlayRect( cx + floorf( (size - len) * 0.5F ), cy + i, len, 1.0F, DIM );   // Rows, narrowing downwards.
+		else OverlayRect( cx + i, cy + floorf( (size - len) * 0.5F ), 1.0F, len, DIM );           // Columns, narrowing rightwards.
+	}
+}
+
+void Menu::EndGroup()
+{
+	if ( m_group < 0 ) return;
+	m_groupCount[m_group] = m_declPage - m_groupFirst[m_group];
+	if ( !m_groupShown[m_group] ) m_groupOpened[m_group] = false;
+	m_group = -1;
 }
 
 bool Menu::Page( const char* name )
 {
 	int index = m_declPage++;
-	Rect tab = { m_tabs.x, m_tabs.y + index * m_rowH, m_tabs.w, m_rowH };
-	if ( m_in.mouseClicked && Hit( tab ) && index != m_page ) {
-		m_page = index;
-		m_row = 0;
-		m_rowCount = 0;
+	bool inGroup = m_group >= 0;
+	if ( !inGroup || m_groupShown[m_group] ) {   // (In a closed group : no tab.)
+		Rect tab = NextTab();
+		if ( m_in.mouseClicked && Hit( tab ) && index != m_page ) {
+			m_page = index;
+			m_row = 0;
+			m_rowCount = 0;
+		}
+		bool current = index == m_page;
+		if ( current ) OverlayRect( tab.x, tab.y, tab.w, tab.h, TAB_ON );
+		else if ( Hit( tab ) ) OverlayRect( tab.x, tab.y, tab.w, tab.h, LINE );
+		float indent = inGroup ? m_pad * 2.0F : m_pad;
+		OverlayText( tab.x + indent, tab.y + (m_rowH - m_h) * 0.5F, name, current ? GOLD : 0xFFD8D8D8 );
+		if ( index < MAX_PAGES ) m_nextTabY[index] = tab.y + tab.h * 0.5F;
 	}
 	bool current = index == m_page;
-	if ( current ) OverlayRect( tab.x, tab.y, tab.w, tab.h, TAB_ON );
-	else if ( Hit( tab ) ) OverlayRect( tab.x, tab.y, tab.w, tab.h, LINE );
-	OverlayText( tab.x + m_pad, tab.y + (m_rowH - m_h) * 0.5F, name, current ? GOLD : 0xFFD8D8D8 );
 	m_onPage = current;
-	if ( current ) { m_declRow = 0; m_declSelectable = 0; }
+	if ( current ) { m_declY = 0.0F; m_declSelectable = 0; m_columnCount = 0; }
 	return current;
 }
 
-Menu::Rect Menu::NextRow()
+Menu::Rect Menu::NextRow( float height )
 {
-	Rect r = { m_body.x, m_body.y + m_declRow * m_rowH, m_body.w, m_rowH };
-	m_declRow++;
+	if ( height <= 0.0F ) height = m_rowH;
+	Rect r = { m_body.x, floorf( m_body.y + m_declY ), m_body.w, height };
+	m_declY += height;
 	return r;
 }
 
-void Menu::Header( const char* text )
+void Menu::Section( const char* title, const char* const* columns, int count )
 {
+	if ( m_declY > 0.0F ) m_declY += floorf( m_rowH * 0.5F );   // Room above, after other rows.
 	Rect r = NextRow();
-	OverlayText( r.x, r.y + (m_rowH - m_h) * 0.5F, text, GOLD );
+	float y = r.y + (m_rowH - m_h) * 0.5F;
+	char caps[64];
+	int n = 0;
+	for ( const char* c = title; *c && n < 63; c++ ) caps[n++] = (char) toupper( (unsigned char) *c );
+	caps[n] = 0;
+	OverlayText( r.x, y, caps, GOLD );
+	if ( columns && count > 0 && m_columnCount > 0 ) {   // The columns' titles.
+		for ( int i = 1; i < count && i < m_columnCount; i++ ) {
+			float x = i == m_columnCount - 1 ? r.x + r.w - OverlayTextWidth( columns[i] ) : r.x + r.w * m_columns[i];
+			OverlayText( x, y, columns[i], DIM );
+		}
+	}
+	OverlayRect( r.x, r.y + r.h - 2.0F, r.w, 1.0F, LINE );
+}
+
+void Menu::Columns( const float* at, int count )
+{
+	m_columnCount = count < MAX_COLUMNS ? count : MAX_COLUMNS;
+	for ( int i = 0; i < m_columnCount; i++ ) m_columns[i] = at[i];
+}
+
+void Menu::TableRow( const char* const* cells, int count, uint32_t color )
+{
+	Rect r = NextRow( floorf( m_h * 1.25F ) );
+	float y = r.y + (r.h - m_h) * 0.5F;
+	for ( int i = 0; i < count && i < m_columnCount; i++ ) {
+		if ( !cells[i] || !cells[i][0] ) continue;
+		float x = i == m_columnCount - 1 && i > 0 ? r.x + r.w - OverlayTextWidth( cells[i] ) : r.x + r.w * m_columns[i];
+		OverlayText( x, y, cells[i], color );
+	}
 }
 
 void Menu::Info( const char* left, const char* right, uint32_t color )
@@ -343,6 +438,15 @@ bool Menu::Colour( const char* label, uint8_t rgb[3], const char* hint )
 	return changed;
 }
 
+bool Menu::Button( const char* label, const char* value, const char* hint )
+{
+	Rect r; bool clicked;
+	bool selected = Selectable( hint, &r, &clicked );
+	Label( r, label, selected );
+	if ( value ) OverlayText( r.x + r.w - OverlayTextWidth( value ), r.y + (m_rowH - m_h) * 0.5F, value, GOLD );
+	return clicked || (selected && m_in.accept);
+}
+
 bool Menu::Action( const char* label, const char* hint )
 {
 	Rect r; bool clicked;
@@ -353,9 +457,12 @@ bool Menu::Action( const char* label, const char* hint )
 
 void Menu::End()
 {
+	if ( m_group >= 0 ) EndGroup();
 	m_pageCount = m_declPage;
 	m_rowCount = m_declSelectable;
 	if ( m_row >= m_rowCount ) m_row = m_rowCount > 0 ? m_rowCount - 1 : 0;
+	for ( int i = 0; i < MAX_PAGES; i++ ) m_tabY[i] = m_nextTabY[i];
+	for ( int i = 0; i < MAX_GROUPS; i++ ) m_groupY[i] = m_nextGroupY[i];
 
 	float y = m_body.y + m_body.h + m_pad * 0.5F;
 	OverlayRect( m_panel.x, y, m_panel.w, 1.0F, LINE );

@@ -345,6 +345,7 @@ static int g_aimTest = 0;   // 2 : with the raft out instead (Down looks from Ha
                    // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
 static int g_distTest = 0;                        // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn; two games : 2 runs away, 3 watches. PTLE_MP_FADEALLOW=1 : puppets fade as before.
 static bool g_allowPuppetFade = false;
+static int g_hsTest = 0;                         // PTLE_MP_HSTEST=1 : hide and seek, one game (role, hide time).
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
 static bool g_menuTest = false;                  // PTLE_MP_MENUTEST=1 : the autotest drives the menu (F1).
 static bool g_viewerTest = false;                // PTLE_MP_VIEWERTEST=1 : the autotest drives the animation viewer.
@@ -454,7 +455,48 @@ struct PlayerInfo
 	uint8_t outfit;
 	uint8_t colors[RETRO_PARTS][3];
 	char version[16];    // Their mod's (MP_VERSION); empty : a build from before versions.
+	uint8_t role;        // Hide and seek : ROLE_SEEKER, ROLE_HIDER.
+	uint32_t hideMs;     // Their total hide time.
+	bool playsHs;        // Their build has hide and seek (sends a role).
 };
+
+// Hide and seek (the "PTLE Multiplayer: Hide-and-Seek Plan" doc). No rounds and no
+// host : each player chooses their own role. A hider's hide time adds up while
+// they're one and Harry is in a level (not loading, not paused); only they can
+// reset it, and it's kept in a file so restarts and crashes don't lose it.
+enum { ROLE_SEEKER, ROLE_HIDER, ROLE_NONE };   // ROLE_NONE (sent) : not playing, the game mode is off.
+static int g_myRole = ROLE_SEEKER;      // Everyone starts as a seeker.
+
+// Game modes (F1 -> Gamemodes; Multiplayer.ini, [Gamemodes] Mode). Off : just
+// see each other.
+enum { MODE_OFF, MODE_HIDE_AND_SEEK, NUM_MODES };
+static const char* const MODE_NAMES[NUM_MODES] = { "Off", "Hide and seek" };
+static int g_gameMode = MODE_OFF;
+static bool PlayingHs() { return g_gameMode == MODE_HIDE_AND_SEEK; }
+
+// Swapping roles without the menu : hold the controller button or the key, then
+// either direction of the d-pad or either arrow key (Multiplayer.ini, [Keys]
+// RoleSwapButton, RoleSwapKey). While it's held, the d-pad and the arrows don't
+// reach the game : no item comes out.
+static int g_swapButton = 4;     // DirectInput button : the fifth, L1 / LB.
+static int g_swapKey = 0x2A;     // DirectInput key code : Left Shift.
+static uint32_t g_myHideMs = 0;         // Total hide time (hide-time.txt).
+static bool g_testHideReport = false;   // Autotest : log the hide time each second.
+
+// Caught : a seeker as close as this to a hider, as the hider's game shows him
+// (Harry is about 7 units tall). The hider's game decides, so a catch is never a
+// surprise to the one caught.
+static const float CATCH_DISTANCE = 3.5F;
+static const int CAUGHT_SENDS = 5;             // The CAUGHT packet, this many times...
+static const uint32_t CAUGHT_RESEND_MS = 200;  // ...this far apart.
+static struct { int seeker; uint32_t number; int left; uint32_t lastSent; } g_caughtOut = { -1, 0, 0, 0 };
+static uint32_t g_catchNumber = 0;             // Ours (a random start : another session's don't look the same).
+static uint32_t g_lastCatchHeard[MAX_PEERS];   // Each hider's last catch number heard.
+static int g_testCaughtBy = -1, g_testCaughtHider = -1;   // Autotest : the last catch heard.
+static float g_testNearestSeeker = -1.0F;   // Autotest : this tick's nearest seeker (-1 : none shown).
+static bool HiddenFromMe( int id );   // (Below : a hider, to a seeker.)
+static int VkToDik( int vk );            // (Below : the role swap's key binding.)
+static const char* KeyName( int dik );
 static const int MAX_VERSION = 15;
 static char g_myVersion[MAX_VERSION + 1] = MP_VERSION;   // Sent to the others (tests : PTLE_MP_FAKEVERSION, another one).
 static PlayerInfo g_players[MAX_PEERS];
@@ -479,6 +521,79 @@ static void Toast( const char* fmt, ... )
 }
 
 // Names : printable ASCII only (the font has nothing else), never empty.
+// The hide time's file : %LOCALAPPDATA%\PTLE Multiplayer\hide-time.txt, the total in
+// milliseconds (the autotests keep theirs in hide-time-autotest.txt).
+static void HideTimePath( char* path )   // MAX_PATH.
+{
+	path[0] = 0;
+	if ( GetDataDir( path ) ) strcat_s( path, MAX_PATH, g_autotest ? "\\hide-time-autotest.txt" : "\\hide-time.txt" );
+}
+
+static bool g_hideTimeLoaded = false;
+static uint32_t g_hideSavedMs = 0;
+
+static void LoadHideTime()
+{
+	if ( g_hideTimeLoaded ) return;
+	g_hideTimeLoaded = true;
+	char path[MAX_PATH];
+	HideTimePath( path );
+	FILE* f = 0;
+	if ( path[0] && fopen_s( &f, path, "r" ) == 0 && f ) {
+		unsigned long ms = 0;
+		if ( fscanf_s( f, "%lu", &ms ) == 1 ) g_myHideMs = (uint32_t) ms;
+		fclose( f );
+	}
+	g_hideSavedMs = g_myHideMs;
+	mp_log( "[HS] Hide time : %u ms (%s).\n", g_myHideMs, path );
+}
+
+// Written to a new file, then moved over the old one : a crash mid-write keeps the old.
+static void SaveHideTime()
+{
+	if ( !g_hideTimeLoaded ) return;
+	char path[MAX_PATH], temp[MAX_PATH];
+	HideTimePath( path );
+	if ( !path[0] ) return;
+	sprintf_s( temp, "%s.new", path );
+	FILE* f = 0;
+	if ( fopen_s( &f, temp, "w" ) != 0 || !f ) return;
+	fprintf( f, "%u\n", g_myHideMs );
+	fclose( f );
+	if ( MoveFileExA( temp, path, MOVEFILE_REPLACE_EXISTING ) ) g_hideSavedMs = g_myHideMs;
+}
+
+static void SetMyRole( int role )
+{
+	if ( role == g_myRole ) return;
+	g_myRole = role;
+	mp_log( "[HS] Now a %s (hide time %u ms).\n", role == ROLE_HIDER ? "hider" : "seeker", g_myHideMs );
+	SaveHideTime();
+}
+
+// Each of Harry's ticks : a hider's time goes on. A gap (loading, the pause menu :
+// Harry doesn't tick then) doesn't count.
+static void HideTick()
+{
+	LoadHideTime();
+	static uint32_t last = 0;
+	uint32_t now = GetTickCount();
+	uint32_t dt = now - last;
+	last = now;
+	if ( PlayingHs() && g_myRole == ROLE_HIDER && dt < 250 ) g_myHideMs += dt;
+	if ( g_myHideMs - g_hideSavedMs >= 5000 ) SaveHideTime();   // Every 5 s while hiding.
+	static uint32_t lastReport = 0;
+	if ( g_testHideReport && now - lastReport >= 1000 ) { lastReport = now; mp_log( "[AT] HS : %s, hide time %u ms.\n", g_myRole == ROLE_HIDER ? "hider" : "seeker", g_myHideMs ); }
+}
+
+// 754000 ms : "12:34"; an hour or more : "1:02:03".
+static void FormatHideTime( uint32_t ms, char* out, size_t size )
+{
+	uint32_t s = ms / 1000;
+	if ( s >= 3600 ) sprintf_s( out, size, "%u:%02u:%02u", s / 3600, s / 60 % 60, s % 60 );
+	else sprintf_s( out, size, "%u:%02u", s / 60, s % 60 );
+}
+
 static void CleanName( const char* in, int length, char* out )
 {
 	int n = 0;
@@ -684,6 +799,24 @@ static void NetUpdate()
 			g_players[h.player].name[0] = 0;
 			continue;
 		}
+		if ( h.type == PACKET_CAUGHT ) {
+			if ( h.player == me && !echo ) continue;
+			if ( length < PACKET_HEADER_SIZE + 1 || packet[PACKET_HEADER_SIZE] >= MAX_PEERS ) { g_netStats.badPackets++; continue; }
+			if ( g_lastCatchHeard[h.player] == h.sequence ) continue;   // A resend.
+			g_lastCatchHeard[h.player] = h.sequence;
+			int seeker = packet[PACKET_HEADER_SIZE];
+			g_players[h.player].role = ROLE_SEEKER;   // (Their next info says so too.)
+			g_testCaughtBy = seeker; g_testCaughtHider = h.player;
+			mp_log( "[HS] Player %d (\"%s\") was caught by player %d (\"%s\").\n", h.player, PlayerName( h.player ), seeker, PlayerName( seeker ) );
+			if ( h.player == me ) {}   // (Our own, echoed : we said so when it happened.)
+			else if ( seeker == me ) Toast( "You caught %s!", PlayerName( h.player ) );
+			else {
+				char hider[MAX_NAME + 1];
+				strcpy_s( hider, PlayerName( h.player ) );
+				Toast( "%s caught %s", PlayerName( seeker ), hider );
+			}
+			continue;
+		}
 		if ( h.type == PACKET_INFO ) {
 			if ( h.player == me && !echo ) continue;
 			if ( length < PACKET_HEADER_SIZE + 5 ) { g_netStats.badPackets++; continue; }
@@ -705,6 +838,11 @@ static void NetUpdate()
 			if ( at < length && packet[at] <= MAX_VERSION && at + 1 + packet[at] <= length ) CleanName( (const char*) packet + at + 1, packet[at], version );
 			bool versionNews = !info.present || strcmp( info.version, version ) != 0;
 			strcpy_s( info.version, version );
+			at += at < length ? 1 + packet[at] : 0;   // Then hide and seek : u8 role, u32 hide time (ms).
+			info.playsHs = at + 5 <= length;
+			info.role = info.playsHs && packet[at] <= ROLE_NONE ? packet[at] : ROLE_NONE;
+			info.hideMs = 0;
+			if ( info.playsHs ) memcpy( &info.hideMs, packet + at + 1, 4 );
 			if ( !info.present || strcmp( info.name, name ) != 0 ) {
 				mp_log( "[NET] Player %d is \"%s\", in %s.\n", h.player, name, LevelName( info.level ) );
 				if ( !info.present && h.player != me ) Toast( "%s joined", name );
@@ -746,9 +884,17 @@ static void NetUpdate()
 			info.name[0] = 0;
 		}
 	}
+	if ( me >= 0 && g_caughtOut.left > 0 && now - g_caughtOut.lastSent >= CAUGHT_RESEND_MS ) {   // We were caught.
+		g_caughtOut.left--;
+		g_caughtOut.lastSent = now;
+		uint8_t caught[PACKET_HEADER_SIZE + 1];
+		EncodeHeader( PACKET_CAUGHT, (uint8_t) me, g_caughtOut.number, caught );
+		caught[PACKET_HEADER_SIZE] = (uint8_t) g_caughtOut.seeker;
+		g_transport->Send( caught, sizeof(caught) );
+	}
 	if ( me >= 0 && now - g_lastInfoSent >= INFO_INTERVAL_MS ) {   // Who we are, where.
 		g_lastInfoSent = now;
-		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1 + sizeof(g_myColors) + 1 + MAX_VERSION];
+		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1 + sizeof(g_myColors) + 1 + MAX_VERSION + 5];
 		EncodeHeader( PACKET_INFO, (uint8_t) me, 0, info );
 		uint32_t where = g_haveLocal ? level : 0;
 		memcpy( info + PACKET_HEADER_SIZE, &where, 4 );
@@ -762,7 +908,11 @@ static void NetUpdate()
 		int v = (int) strlen( g_myVersion );
 		info[at] = (uint8_t) v;
 		memcpy( info + at + 1, g_myVersion, v );
-		g_transport->Send( info, at + 1 + v );
+		at += 1 + v;
+		LoadHideTime();
+		info[at] = (uint8_t) (PlayingHs() ? g_myRole : ROLE_NONE);
+		memcpy( info + at + 1, &g_myHideMs, 4 );
+		g_transport->Send( info, at + 5 );
 	}
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer* peer = &g_peers[i];
@@ -3251,10 +3401,78 @@ static const uint32_t POLL_KEYBOARD = 0x6E8A80, POLL_KEYBOARD_CALL = 0x663BBE;
 // there's none, so Harry doesn't walk off under it.
 static const uint32_t POLL_GAMEPAD = 0x6E8660, POLL_GAMEPAD_CALL = 0x663BAD;
 
+// The state is a DIJOYSTATE2 (0x110 bytes, 0x940B78 + index * 0x110; the game
+// keeps the one before at 0x940DA8 + ...) : the d-pad is the hat at +0x20 (hundredths
+// of a degree, 0xFFFF... : centred), the buttons at +0x30.
+static const int PAD_HAT = 0x20, PAD_BUTTONS = 0x30, PAD_STATE_SIZE = 0x110;
+static uint8_t g_padSeen[PAD_STATE_SIZE];   // The last state polled (the Keys page reads its buttons).
+static bool g_padSeenAny = false;
+static uint8_t g_testPad[PAD_STATE_SIZE];   // Autotest : a controller of its own (g_testPadOn).
+static bool g_testPadOn = false;
+static volatile LONG g_testArrowFrames = 0, g_testHatFrames = 0;   // Autotest : polls in which the game got the right arrow / the d-pad.
+
+static void ToggleRole( const char* how )
+{
+	SetMyRole( g_myRole == ROLE_HIDER ? ROLE_SEEKER : ROLE_HIDER );
+	mp_log( "[HS] Role swapped (%s).\n", how );
+	Toast( g_myRole == ROLE_HIDER ? "You're a hider" : "You're a seeker" );
+}
+
+static void RoleSwapPad( uint8_t* state )
+{
+	DWORD& hat = *(DWORD*) (state + PAD_HAT);
+	bool centred = LOWORD( hat ) == 0xFFFF;
+	int dir = 0;   // -1 : left, 1 : right.
+	if ( !centred && hat > 4500 && hat < 13500 ) dir = 1;
+	if ( !centred && hat > 22500 && hat < 31500 ) dir = -1;
+	bool held = g_swapButton >= 0 && g_swapButton < 128 && (state[PAD_BUTTONS + g_swapButton] & 0x80);
+	static int lastDir = 0;
+	static bool masking = false;
+	if ( !PlayingHs() ) { lastDir = dir; masking = false; return; }
+	if ( held && dir && dir != lastDir ) ToggleRole( "controller" );
+	lastDir = dir;
+	if ( held ) masking = true;
+	if ( masking ) {   // Until the d-pad is let go too : no item when the button goes first.
+		if ( !held && centred ) masking = false;
+		else hat = 0xFFFFFFFF;
+	}
+}
+
 static void* __cdecl PollGamepad_Hook( int index )
 {
 	void* state = ((void* (__cdecl *)( int )) POLL_GAMEPAD)( index );
+	if ( g_testPadOn && index == 0 ) {   // As the game does : the last state kept, then the new one.
+		memcpy( (void*) (0x940DA8 + index * PAD_STATE_SIZE), (void*) (0x940B78 + index * PAD_STATE_SIZE), PAD_STATE_SIZE );
+		memcpy( (void*) (0x940B78 + index * PAD_STATE_SIZE), g_testPad, PAD_STATE_SIZE );
+		state = (void*) (0x940B78 + index * PAD_STATE_SIZE);
+	}
+	if ( state ) {
+		memcpy( g_padSeen, state, PAD_STATE_SIZE );
+		g_padSeenAny = true;
+		if ( !MenuBlocksInput() ) RoleSwapPad( (uint8_t*) state );
+		if ( LOWORD( *(DWORD*) ((uint8_t*) state + PAD_HAT) ) != 0xFFFF ) InterlockedIncrement( &g_testHatFrames );
+	}
 	return MenuBlocksInput() ? 0 : state;
+}
+
+// DirectInput key codes : the arrows.
+static const int DIK_ARROWS[4] = { 0xC8, 0xD0, 0xCB, 0xCD };   // Up, down, left, right.
+
+static void RoleSwapKeys( uint8_t* keys )
+{
+	bool held = g_swapKey > 0 && g_swapKey < 256 && (keys[g_swapKey] & 0x80);
+	bool left = (keys[0xCB] & 0x80) != 0, right = (keys[0xCD] & 0x80) != 0;
+	bool any = false;
+	for ( int i = 0; i < 4; i++ ) any |= (keys[DIK_ARROWS[i]] & 0x80) != 0;
+	static bool wasLeft = false, wasRight = false, masking = false;
+	if ( !PlayingHs() ) { wasLeft = left; wasRight = right; masking = false; return; }
+	if ( held && ((left && !wasLeft) || (right && !wasRight)) ) ToggleRole( "keyboard" );
+	wasLeft = left; wasRight = right;
+	if ( held ) masking = true;
+	if ( masking ) {
+		if ( !held && !any ) masking = false;
+		else for ( int i = 0; i < 4; i++ ) keys[DIK_ARROWS[i]] = 0;
+	}
 }
 
 static void PollKeyboard_Hook()
@@ -3268,6 +3486,8 @@ static void PollKeyboard_Hook()
 	}
 	else ((void (*)()) POLL_KEYBOARD)();
 	if ( MenuBlocksInput() ) memset( (void*) KEYS_NOW, 0, 256 );   // The menu has the keyboard.
+	else RoleSwapKeys( (uint8_t*) KEYS_NOW );
+	if ( ((uint8_t*) KEYS_NOW)[0xCD] & 0x80 ) InterlockedIncrement( &g_testArrowFrames );
 }
 
 // The game window shows up without being activated or brought forward : its
@@ -3680,6 +3900,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_viewerTest ) { phase = 300; phaseStart = now; step = 0; break; }
 		if ( g_menuTest ) { phase = 600; phaseStart = now; step = 0; break; }
 		if ( g_skinTest ) { phase = 700; phaseStart = now; step = 0; break; }
+		if ( g_hsTest ) { phase = g_hsTest >= 2 ? 1210 : 1200; phaseStart = now; step = 0; break; }
 		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
 		if ( g_aimTest ) { phase = 900; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
@@ -4068,6 +4289,175 @@ static void AutotestStep( EIHarry* harry )
 		else if ( t > 1000 ) InterlockedExchange( &g_autotestDone, 1 );
 		break;
 	}
+	case 1200: {   // Hide and seek, one game : a hider's time goes on, a seeker's stops; the room hears it; the file keeps it.
+		static int failures = 0;
+		static uint32_t startMs = 0, stopMs = 0;
+		DWORD t = now - phaseStart;
+		struct Local { static void Check( const char* what, bool ok ) { mp_log( "[AT] HS : %s : %s\n", what, ok ? "ok" : "WRONG" ); if ( !ok ) failures++; } };
+		int me = g_transport ? g_transport->PlayerId() : -1;
+		if ( step == 0 && t >= 2000 ) {
+			g_testHideReport = true;
+			g_gameMode = MODE_HIDE_AND_SEEK;
+			Local::Check( "everyone starts as a seeker", g_myRole == ROLE_SEEKER );
+			startMs = g_myHideMs;
+			SetMyRole( ROLE_HIDER );
+			step = 1;
+		}
+		else if ( step == 1 && t >= 7000 ) {
+			uint32_t gained = g_myHideMs - startMs;
+			mp_log( "[AT] HS : 5 s as a hider : %u ms more.\n", gained );
+			Local::Check( "a hider's time goes on", gained >= 4000 && gained <= 6000 );
+			bool heard = me >= 0 && g_players[me].present && g_players[me].playsHs && g_players[me].role == ROLE_HIDER && g_myHideMs - g_players[me].hideMs < 2500;
+			mp_log( "[AT] HS : the room hears : role %d, %u ms (me %d).\n", me >= 0 ? g_players[me].role : -1, me >= 0 ? g_players[me].hideMs : 0, me );
+			Local::Check( "the room hears our role and time", heard );
+			RequestSnapshot( "hs_1_hider" );
+			SetMyRole( ROLE_SEEKER );
+			stopMs = g_myHideMs;
+			step = 2;
+		}
+		else if ( step == 2 && t >= 10000 ) {
+			Local::Check( "a seeker's time stops (and stays)", g_myHideMs == stopMs && stopMs > startMs );
+			char path[MAX_PATH];
+			HideTimePath( path );
+			FILE* f = 0;
+			unsigned long saved = 0;
+			if ( fopen_s( &f, path, "r" ) == 0 && f ) { fscanf_s( f, "%lu", &saved ); fclose( f ); }
+			Local::Check( "the file keeps it", saved == g_myHideMs );
+			RequestSnapshot( "hs_2_seeker" );
+			step = 3;
+		}
+		// The shortcuts (we're a seeker now). Items on the hotbar first, so the arrows have
+		// something to bring out : Right alone does, Shift + Right swaps and doesn't.
+		static int itemBefore = -1;
+		if ( step == 3 && t >= 11000 ) {
+			for ( int slot = 0; slot < 4; slot++ ) InventoryItem::setItemInHotbar( slot, slot == 3 ? InventoryItem::TORCH : InventoryItem::PICKAXES );
+			itemBefore = GetHeldItem( harry );
+			InterlockedExchange( &g_testArrowFrames, 0 );
+			SendKey( VK_RIGHT, true ); step = 4;
+		}
+		else if ( step == 4 && t >= 11300 ) { SendKey( VK_RIGHT, false ); step = 5; }
+		else if ( step == 5 && t >= 13000 ) {
+			int item = GetHeldItem( harry );
+			mp_log( "[AT] HS : Right arrow alone : held item %d -> %d, the game got it in %d polls.\n", itemBefore, item, g_testArrowFrames );
+			Local::Check( "the Right arrow alone reaches the game", g_testArrowFrames > 0 );
+			itemBefore = item;
+			InterlockedExchange( &g_testArrowFrames, 0 );
+			SendKey( VK_LSHIFT, true ); step = 6;
+		}
+		else if ( step == 6 && t >= 13300 ) { SendKey( VK_RIGHT, true ); step = 7; }
+		else if ( step == 7 && t >= 13600 ) { SendKey( VK_RIGHT, false ); step = 8; }
+		else if ( step == 8 && t >= 13900 ) { SendKey( VK_LSHIFT, false ); step = 9; }
+		else if ( step == 9 && t >= 15500 ) {
+			int item = GetHeldItem( harry );
+			Local::Check( "Left Shift + Right : a hider", g_myRole == ROLE_HIDER );
+			mp_log( "[AT] HS : with Shift, the game got the Right arrow in %d polls.\n", g_testArrowFrames );
+			Local::Check( "and the arrow didn't reach the game (no item)", g_testArrowFrames == 0 && item == itemBefore );
+			RequestSnapshot( "hs_7_shortcut_hud" );
+			// The controller : L1 held, the d-pad's left.
+			memset( g_testPad, 0, sizeof(g_testPad) );
+			for ( int i = 0; i < 4; i++ ) *(DWORD*) (g_testPad + PAD_HAT + 4 * i) = 0xFFFFFFFF;
+			g_testPadOn = true;
+			InterlockedExchange( &g_testHatFrames, 0 );
+			step = 10;
+		}
+		else if ( step == 10 && t >= 16000 ) { g_testPad[PAD_BUTTONS + 4] = 0x80; step = 11; }
+		else if ( step == 11 && t >= 16300 ) { *(DWORD*) (g_testPad + PAD_HAT) = 27000; step = 12; }
+		else if ( step == 12 && t >= 16600 ) { *(DWORD*) (g_testPad + PAD_HAT) = 0xFFFFFFFF; step = 13; }
+		else if ( step == 13 && t >= 16900 ) { g_testPad[PAD_BUTTONS + 4] = 0; step = 14; }
+		else if ( step == 14 && t >= 18500 ) {
+			int item = GetHeldItem( harry );
+			Local::Check( "L1 + d-pad left : a seeker again", g_myRole == ROLE_SEEKER );
+			mp_log( "[AT] HS : with L1, the game got the d-pad in %d polls.\n", g_testHatFrames );
+			Local::Check( "and the d-pad didn't reach the game (no item)", g_testHatFrames == 0 && item == itemBefore );
+			InterlockedExchange( &g_testHatFrames, 0 );
+			*(DWORD*) (g_testPad + PAD_HAT) = 9000;   // The d-pad alone : it does reach the game.
+			step = 15;
+		}
+		else if ( step == 15 && t >= 18800 ) { *(DWORD*) (g_testPad + PAD_HAT) = 0xFFFFFFFF; step = 16; }
+		else if ( step == 16 && t >= 20500 ) {
+			mp_log( "[AT] HS : d-pad right alone : the game got it in %d polls (held item %d -> %d).\n", g_testHatFrames, itemBefore, GetHeldItem( harry ) );
+			Local::Check( "the d-pad alone reaches the game", g_testHatFrames > 0 );
+			g_testPadOn = false;
+			g_gameMode = MODE_OFF;
+			step = 17;
+		}
+		else if ( step == 17 && t >= 21500 ) {
+			Local::Check( "game mode off : the timer and the HUD stop", !PlayingHs() );
+			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+		}
+		break;
+	}
+	case 1210: {   // Hide and seek, two games : 2 runs off and hides; 3 (a seeker) makes the same run later, into 2 : caught.
+		static int failures = 0;
+		static uint32_t hiddenAt = 0, caughtMs = 0;
+		static DWORD lastLog = 0, caughtAt = 0;
+		static int startHealth = 0;
+		DWORD t = now - phaseStart;
+		g_puppetOffset.x = 0.0F;   // Puppets where the players are, as in play (not beside them).
+		g_gameMode = g_hsTest == 4 ? MODE_OFF : MODE_HIDE_AND_SEEK;   // 4 : the "seeker" isn't playing.
+		bool expectCatch = g_hsTest == 2;
+		struct Local { static void Check( const char* what, bool ok ) { mp_log( "[AT] HS : %s : %s\n", what, ok ? "ok" : "WRONG" ); if ( !ok ) failures++; } };
+		int me = g_transport ? g_transport->PlayerId() : -1;
+		if ( now - lastLog >= 500 ) {
+			lastLog = now;
+			mp_log( "[AT] HS %5u ms : %s, %u ms hidden, health %d, nearest seeker %.1f\n", t, g_myRole == ROLE_HIDER ? "hider" : "seeker", g_myHideMs, harry->m_healthValue, g_testNearestSeeker );
+		}
+		if ( g_hsTest == 2 || g_hsTest == 5 ) {
+			if ( step == 0 && t >= 12000 ) { mp_log( "[AT] HS : running off.\n" ); InterlockedExchange( &g_holdMs, 2500 ); InterlockedExchange( &g_holdKey, 'W' ); step = 1; }
+			else if ( step == 1 && t >= 17000 ) {
+				startHealth = harry->m_healthValue;
+				SetMyRole( ROLE_HIDER );
+				hiddenAt = g_myHideMs;
+				step = 2;
+			}
+			else if ( step == 2 && t >= 22000 ) {
+				if ( expectCatch ) Local::Check( "a seeker far off doesn't catch", g_myRole == ROLE_HIDER && g_testNearestSeeker > CATCH_DISTANCE );
+				else Local::Check( "someone not playing isn't a seeker", g_myRole == ROLE_HIDER && g_testNearestSeeker < 0.0F );
+				int other = -1;
+				for ( int i = 0; i < MAX_PEERS; i++ ) if ( i != me && g_players[i].present ) other = i;
+				if ( expectCatch ) Local::Check( "we see the seeker's name tag", other >= 0 && !HiddenFromMe( other ) );
+				Local::Check( "the hide time goes on", g_myHideMs - hiddenAt >= 4000 );
+				RequestSnapshot( "hs_3_hiding" );
+				step = 3;   // Waiting for the seeker.
+			}
+			else if ( step == 3 && !expectCatch && t >= 45000 ) { Local::Check( "not caught by someone not playing", g_myRole == ROLE_HIDER ); step = 5; }
+			else if ( step == 3 && g_myRole == ROLE_SEEKER && !caughtAt ) {
+				if ( !expectCatch ) { Local::Check( "not caught by someone not playing", false ); step = 5; break; }
+				caughtAt = now; caughtMs = g_myHideMs;
+				Local::Check( "touching the seeker catches us, Harry dies", harry->m_healthValue <= 0 );
+				RequestSnapshot( "hs_4_caught" );
+				step = 4;
+			}
+			else if ( step == 3 && t >= 45000 ) { Local::Check( "caught once the seeker came", false ); step = 5; }
+			else if ( step == 4 && now - caughtAt >= 15000 ) {
+				Local::Check( "back after dying, health full again", harry->m_healthValue > 0 && harry->m_healthValue >= startHealth );
+				Local::Check( "a caught hider's time stops", g_myHideMs == caughtMs );
+				RequestSnapshot( "hs_5_back" );
+				step = 5;
+			}
+			else if ( step == 5 && t >= 65000 ) InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+		}
+		else {   // 3 : the seeker. Both games start on the same spot, facing the same way : the same run ends where 2 is.
+			if ( step == 0 && t >= 30000 ) {
+				int other = -1;
+				for ( int i = 0; i < MAX_PEERS; i++ ) if ( i != me && g_players[i].present ) other = i;
+				Local::Check( "the hider's name and whereabouts are hidden from us", other >= 0 && HiddenFromMe( other ) );
+				RequestSnapshot( "hs_6_seeker_view" );
+				mp_log( "[AT] HS : seeking (the hider's run).\n" ); InterlockedExchange( &g_holdMs, 2500 ); InterlockedExchange( &g_holdKey, 'W' ); step = 1;
+			}
+			else if ( step == 1 && t >= 60000 ) {
+				if ( g_hsTest == 4 ) Local::Check( "not playing : no catch", g_testCaughtBy < 0 );
+				else {
+					Local::Check( "we hear that we caught them", g_testCaughtBy == me && g_testCaughtHider >= 0 && g_testCaughtHider != me );
+					Local::Check( "the caught one is a seeker now", g_testCaughtHider >= 0 && g_players[g_testCaughtHider].role == ROLE_SEEKER );
+					Local::Check( "their name shows again", g_testCaughtHider >= 0 && !HiddenFromMe( g_testCaughtHider ) );
+				}
+				step = 2;
+			}
+			else if ( step == 2 && t >= 65000 ) InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+		}
+		break;
+	}
 	case 700: {   // Outfits : the puppet wears each in turn; then ours, which a level load puts on Harry.
 		static int failures = 0;
 		DWORD t = now - phaseStart;
@@ -4179,11 +4569,33 @@ static void AutotestStep( EIHarry* harry )
 			if ( t < 1000 ) break;
 			Local::Check( "F1 opens it", g_menu.IsOpen() && g_menu.CurrentPage() == 0 );
 			RequestSnapshot( "menu_1_players" );
-			InterlockedIncrement( &g_menuKeys[MK_NEXT] ); step++; phaseStart = now; break;
+			InterlockedIncrement( &g_menuKeys[MK_NEXT] ); step = 20; phaseStart = now; break;
+		case 20:   // Tab : Gamemodes opens, on Hide and seek. Enter : enabled.
+			if ( t < 700 ) break;
+			g_gameMode = MODE_OFF;
+			Local::Check( "Tab goes to the next page (Hide and seek, under Gamemodes)", g_menu.CurrentPage() == 1 && g_menu.GroupOpen( 0 ) );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] ); step = 24; phaseStart = now; break;
+		case 24:   // Down to the role, right : a hider.
+			if ( t < 400 ) break;
+			Local::Check( "Enter on Enabled : Hide and seek on", g_gameMode == MODE_HIDE_AND_SEEK && g_menu.IsOpen() );
+			InterlockedIncrement( &g_menuKeys[MK_DOWN] ); InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step = 25; phaseStart = now; break;
+		case 25:
+			if ( t < 400 ) break;
+			Local::Check( "Right on the role : a hider", g_myRole == ROLE_HIDER );
+			InterlockedIncrement( &g_menuKeys[MK_RIGHT] ); step = 26; phaseStart = now; break;
+		case 26:
+			if ( t < 400 ) break;
+			Local::Check( "Right again : a seeker", g_myRole == ROLE_SEEKER );
+			Local::Check( "Left Shift's key code and name", VkToDik( VK_LSHIFT ) == 0x2A && strcmp( KeyName( 0x2A ), "Left Shift" ) == 0 && VkToDik( VK_RCONTROL ) == 0x9D );
+			g_gameMode = MODE_OFF;
+			InterlockedIncrement( &g_menuKeys[MK_NEXT] ); step = 3; phaseStart = now; break;
 		case 3:   // Tab : Appearance, with Retro Harry's colours showing. Down three times, right : another shirt.
 			if ( t < 100 ) { g_myOutfit = RETRO_OUTFIT; break; }
 			if ( t < 700 ) break;
-			Local::Check( "Tab goes to the next page", g_menu.CurrentPage() == 1 );
+			{
+				float x, y;
+				Local::Check( "Tab goes to Appearance; Gamemodes closes", g_menu.CurrentPage() == 2 && !g_menu.GroupOpen( 0 ) && !g_menu.TabCenter( 1, &x, &y ) );
+			}
 			for ( int i = 0; i < 3; i++ ) InterlockedIncrement( &g_menuKeys[MK_DOWN] );
 			step = 30; phaseStart = now; break;
 		case 30:
@@ -4228,7 +4640,7 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedIncrement( &g_menuKeys[MK_NEXT] ); step = 32; phaseStart = now; break;
 		case 32:
 			if ( t < 700 ) break;
-			Local::Check( "Tab again goes to Display", g_menu.CurrentPage() == 2 );
+			Local::Check( "Tab again goes to Display", g_menu.CurrentPage() == 3 );
 			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] ); step = 4; phaseStart = now; break;
 		case 4:   // Down twice, right : the next playback delay.
 			if ( t < 600 ) break;
@@ -4249,20 +4661,45 @@ static void AutotestStep( EIHarry* harry )
 			Local::Check( "Right moves where name tags start fading", g_tagFadeFrom == START_FADE + TAG_FADE_STEP && g_tagFadeTo > g_tagFadeFrom );
 			RequestSnapshot( "menu_2_display" );
 			from = harry->m_position; Local::HoldW(); step = 7; phaseStart = now; break;
-		case 7:   // The mouse : click the third page's tab.
+		case 7:   // The mouse : click the last page's tab (Keys).
 			if ( t < 1800 ) break;
 			Local::Check( "Harry stays put while it's open", Local::Moved( harry, from ) < 0.5F );
-			g_menu.TabCenter( 3, &g_testMouse.x, &g_testMouse.y );
+			g_menu.TabCenter( 4, &g_testMouse.x, &g_testMouse.y );
 			g_testMouse.active = true; g_testMouse.down = true; step++; phaseStart = now; break;
 		case 8:   // Then the first row of the second page (name tags back on).
 			if ( t < 500 ) break;
 			g_testMouse.down = false;
-			Local::Check( "Clicking a tab opens its page", g_menu.CurrentPage() == 3 );
+			Local::Check( "Clicking a tab opens its page", g_menu.CurrentPage() == 4 );
 			RequestSnapshot( "menu_3_keys" );
-			step++; phaseStart = now; break;
+			step = 80; phaseStart = now; break;
+		case 80:   // Click Gamemodes : it opens, on Hide and seek.
+			if ( t < 500 ) break;
+			g_menu.GroupCenter( 0, &g_testMouse.x, &g_testMouse.y ); g_testMouse.down = true; step = 81; phaseStart = now; break;
+		case 81:
+			if ( t < 300 ) break;
+			g_testMouse.down = false;
+			if ( t < 600 ) break;
+			Local::Check( "Clicking Gamemodes opens it, on Hide and seek", g_menu.GroupOpen( 0 ) && g_menu.CurrentPage() == 1 );
+			g_gameMode = MODE_HIDE_AND_SEEK;   // For the picture : the whole page.
+			step = 82; phaseStart = now; break;
+		case 82:
+			if ( t < 400 ) break;
+			RequestSnapshot( "menu_1i_gamemodes" );
+			step = 83; phaseStart = now; break;
+		case 83:   // Click it again : closed, no page showing.
+			if ( t < 400 ) break;
+			g_gameMode = MODE_OFF;
+			g_menu.GroupCenter( 0, &g_testMouse.x, &g_testMouse.y ); g_testMouse.down = true; step = 84; phaseStart = now; break;
+		case 84:
+			if ( t < 300 ) break;
+			g_testMouse.down = false;
+			if ( t < 600 ) break;
+			Local::Check( "Clicking Gamemodes again closes it, no page showing", !g_menu.GroupOpen( 0 ) && g_menu.CurrentPage() < 0 );
+			RequestSnapshot( "menu_1j_no_page" );
+			step = 9; phaseStart = now; break;
 		case 9:
 			if ( t < 500 ) break;
-			g_menu.TabCenter( 2, &g_testMouse.x, &g_testMouse.y ); g_testMouse.down = true; step++; phaseStart = now; break;
+			g_menu.TabCenter( 3, &g_testMouse.x, &g_testMouse.y ); g_testMouse.down = true; step++; phaseStart = now; break;   // Display.
 		case 10:
 			if ( t < 300 ) break;
 			g_testMouse.down = false;
@@ -4779,6 +5216,47 @@ static void RunCrashTest()
 }
 #pragma optimize( "", on )
 
+// A hider touched by a seeker (their puppet, as we show it) : Harry dies the game's
+// way (he comes back at the last loadzone), and we're a seeker from now on.
+
+static void CheckCaught( EIHarry* harry )
+{
+	g_testNearestSeeker = -1.0F;
+	int me = g_transport ? g_transport->PlayerId() : -1;
+	if ( g_testHideReport ) {   // Autotest : how far the others' puppets are, each second.
+		static uint32_t lastReport = 0;
+		uint32_t now = GetTickCount();
+		for ( int i = 0; i < MAX_PEERS && now - lastReport >= 1000; i++ ) {
+			const Peer& p = g_peers[i];
+			if ( i == me || !p.beast ) continue;
+			const Vector3f& s = p.beast->EIBeast::m_position;
+			mp_log( "[AT] HS : player %d's puppet is (%.2f, %.2f, %.2f) from Harry.\n", i, s.x - harry->m_position.x, s.y - harry->m_position.y, s.z - harry->m_position.z );
+			lastReport = now;
+		}
+	}
+	if ( !PlayingHs() || g_myRole != ROLE_HIDER || me < 0 || harry->m_healthValue <= 0 ) return;
+	for ( int i = 0; i < MAX_PEERS; i++ ) {
+		const PlayerInfo& info = g_players[i];
+		const Peer& p = g_peers[i];
+		if ( i == me || !info.present || !info.playsHs || info.role != ROLE_SEEKER || !p.beast || !p.target ) continue;
+		const Vector3f& s = p.beast->EIBeast::m_position;
+		float dx = s.x - harry->m_position.x, dy = s.y - harry->m_position.y, dz = s.z - harry->m_position.z;
+		float d = sqrtf( dx * dx + dy * dy + dz * dz );
+		if ( g_testNearestSeeker < 0.0F || d < g_testNearestSeeker ) g_testNearestSeeker = d;
+		if ( d >= CATCH_DISTANCE ) continue;
+		mp_log( "[HS] Caught by player %d (\"%s\"), %.2f away : Harry dies.\n", i, info.name, d );
+		Toast( "%s caught you!", info.name );
+		if ( !g_catchNumber ) g_catchNumber = GetTickCount() | 1;
+		g_caughtOut.seeker = i;
+		g_caughtOut.number = ++g_catchNumber;
+		g_caughtOut.left = CAUGHT_SENDS;
+		g_caughtOut.lastSent = 0;
+		SetMyRole( ROLE_SEEKER );
+		harry->m_healthValue = 0;
+		return;
+	}
+}
+
 static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 {
 	if ( g_crashTest && g_harryTicks == 300 ) RunCrashTest();
@@ -4810,15 +5288,17 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 		HookPresent();
 		InterlockedExchange( &g_reqMenu, 0 );   // An F1 pressed before there was anything to draw (the main menu) doesn't count.
 	}
+	HideTick();
 	PushLocalSnapshot( self );
 	NetUpdate();
+	CheckCaught( self );
 	// Another player in this level : show them (Evil Harry appears on his own).
 	// (The autotest spawns the main peer's itself, when its steps need it.)
 	if ( g_networked ) {
 		uint32_t now = NetNowMs();
 		for ( int i = 0; i < MAX_PEERS; i++ ) {
 			Peer* p = &g_peers[i];
-			if ( g_autotest && p == MainPeer() && g_pitTest < 4 && g_distTest < 2 ) continue;   // (The two-game pit test : as in play.)
+			if ( g_autotest && p == MainPeer() && g_pitTest < 4 && g_distTest < 2 && g_hsTest < 2 ) continue;   // (The two-game pit test : as in play.)
 			if ( p->beast || p->limbo || !p->target || now - p->lastSpawnTry < 1000 ) continue;
 			p->lastSpawnTry = now;
 			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", i );
@@ -5095,6 +5575,10 @@ static void ReadNetConfig( NetConfig* c )
 	strcpy_s( g_iniPath, ini );
 	{
 		char name[32] = { 0, };
+		GetPrivateProfileStringA( "Gamemodes", "Mode", "Off", name, sizeof(name), ini );
+		for ( int i = 0; i < NUM_MODES; i++ ) if ( _stricmp( name, MODE_NAMES[i] ) == 0 ) g_gameMode = i;
+		g_swapButton = GetPrivateProfileIntA( "Keys", "RoleSwapButton", 4, ini );
+		g_swapKey = GetPrivateProfileIntA( "Keys", "RoleSwapKey", 0x2A, ini );
 		GetPrivateProfileStringA( "Appearance", "Outfit", "Default", name, sizeof(name), ini );
 		g_myOutfit = OUTFIT_DEFAULT;
 		for ( int i = 0; i < NUM_OUTFITS; i++ ) if ( _stricmp( name, OUTFITS[i].name ) == 0 ) g_myOutfit = i;
@@ -5206,6 +5690,12 @@ static void SaveSettings()
 {
 	if ( g_autotest || !g_iniPath[0] ) return;
 	WritePrivateProfileStringA( "Appearance", "Outfit", g_myOutfit < 0 ? "Default" : OUTFITS[g_myOutfit].name, g_iniPath );
+	WritePrivateProfileStringA( "Gamemodes", "Mode", MODE_NAMES[g_gameMode], g_iniPath );
+	{
+		char n[16];
+		sprintf_s( n, "%d", g_swapButton ); WritePrivateProfileStringA( "Keys", "RoleSwapButton", n, g_iniPath );
+		sprintf_s( n, "%d", g_swapKey );    WritePrivateProfileStringA( "Keys", "RoleSwapKey", n, g_iniPath );
+	}
 	for ( int i = 0; i < RETRO_PARTS; i++ ) {
 		char key[32], value[16];
 		sprintf_s( key, "Retro%s", RETRO_PART_NAMES[i] );
@@ -5230,6 +5720,14 @@ static void SaveSettings()
 
 // The player list's rows : the room, us, the others, the ping.
 static const int MAX_LIST_ROWS = MAX_PEERS + 3;
+// Hide and seek : a hider's name tag and whereabouts are hidden from everyone else
+// (other hiders too : they'd know where to look once they're seekers).
+static bool HiddenFromMe( int id )
+{
+	int me = g_transport ? g_transport->PlayerId() : -1;
+	return id != me && g_players[id].playsHs && g_players[id].role == ROLE_HIDER;
+}
+
 static int BuildPlayerRows( char left[][96], char right[][64], uint32_t* colors, const char* lastRight )
 {
 	int rows = 0;
@@ -5262,7 +5760,8 @@ static int BuildPlayerRows( char left[][96], char right[][64], uint32_t* colors,
 		bool sameVersion = strcmp( info.version, MP_VERSION ) == 0;
 		if ( sameVersion ) sprintf_s( left[rows], 96, "%s", info.name );
 		else sprintf_s( left[rows], 96, "%s (version %s)", info.name, info.version[0] ? info.version : "older" );
-		if ( info.level && info.level == here ) sprintf_s( right[rows], 64, "here" );
+		if ( HiddenFromMe( i ) ) sprintf_s( right[rows], 64, "hiding" );
+		else if ( info.level && info.level == here ) sprintf_s( right[rows], 64, "here" );
 		else sprintf_s( right[rows], 64, "%s", LevelName( info.level ) );
 		colors[rows++] = sameVersion ? 0xFFFFFFFF : 0xFFFFA040;
 	}
@@ -5272,6 +5771,90 @@ static int BuildPlayerRows( char left[][96], char right[][64], uint32_t* colors,
 	sprintf_s( right[rows], 64, "%s", lastRight );
 	colors[rows++] = 0xFFB0B0B0;
 	return rows;
+}
+
+// The role swap's bindings : the Keys page waits for the next key or button.
+enum { BIND_NONE, BIND_BUTTON, BIND_KEY };
+static int g_binding = BIND_NONE;
+static bool g_bindArmed = false;   // Everything was let go since (the Enter that started it doesn't count).
+
+static void StartBinding( int what ) { g_binding = what; g_bindArmed = false; }
+
+static void SetGameMode( int mode )
+{
+	if ( mode == g_gameMode ) return;
+	g_gameMode = mode;
+	if ( mode != MODE_HIDE_AND_SEEK ) SetMyRole( ROLE_SEEKER );   // Back as a seeker, next time.
+	mp_log( "[HS] Game mode : %s.\n", MODE_NAMES[mode] );
+	SaveSettings();
+}
+
+// A Windows key's DirectInput code (its scan code, + 0x80 for the extended ones).
+static int VkToDik( int vk )
+{
+	switch ( vk ) {
+	case VK_UP: return 0xC8; case VK_DOWN: return 0xD0; case VK_LEFT: return 0xCB; case VK_RIGHT: return 0xCD;
+	case VK_RCONTROL: return 0x9D; case VK_RMENU: return 0xB8; case VK_INSERT: return 0xD2; case VK_DELETE: return 0xD3;
+	case VK_HOME: return 0xC7; case VK_END: return 0xCF; case VK_PRIOR: return 0xC9; case VK_NEXT: return 0xD1;
+	case VK_DIVIDE: return 0xB5; case VK_RSHIFT: return 0x36;
+	}
+	return (int) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC ) & 0x7F;
+}
+
+static const char* KeyName( int dik )
+{
+	static char name[4][40];
+	static int next = 0;
+	char* out = name[next++ & 3];
+	LONG lp = ((dik & 0x7F) << 16) | ((dik & 0x80) ? (1 << 24) : 0);
+	if ( dik == 0x2A ) strcpy_s( out, 40, "Left Shift" );
+	else if ( dik == 0x36 ) strcpy_s( out, 40, "Right Shift" );
+	else if ( dik == 0x1D ) strcpy_s( out, 40, "Left Ctrl" );
+	else if ( dik == 0x9D ) strcpy_s( out, 40, "Right Ctrl" );
+	else if ( dik == 0x38 ) strcpy_s( out, 40, "Left Alt" );
+	else if ( dik == 0xB8 ) strcpy_s( out, 40, "Right Alt" );
+	else if ( !GetKeyNameTextA( lp, out, 40 ) ) sprintf_s( out, 40, "key %d", dik );
+	return out;
+}
+
+static const char* PadButtonName( int button )
+{
+	static char name[4][40];
+	static int next = 0;
+	char* out = name[next++ & 3];
+	if ( button == 4 ) strcpy_s( out, 40, "L1 / LB (button 5)" );
+	else sprintf_s( out, 40, "button %d", button + 1 );
+	return out;
+}
+
+static void PollBinding()
+{
+	if ( g_binding == BIND_NONE ) return;
+	bool escape = (GetAsyncKeyState( VK_ESCAPE ) & 0x8000) != 0;
+	if ( g_binding == BIND_KEY ) {
+		int down = -1;
+		for ( int vk = 0x08; vk < 0xFF; vk++ ) {
+			if ( vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || (vk >= VK_LBUTTON && vk <= VK_XBUTTON2 && vk != VK_CANCEL) ) continue;   // (Their left / right ones count.)
+			if ( GetAsyncKeyState( vk ) & 0x8000 ) { down = vk; break; }
+		}
+		if ( !g_bindArmed ) { g_bindArmed = down < 0; return; }
+		if ( down < 0 ) return;
+		if ( down == VK_ESCAPE ) { g_binding = BIND_NONE; return; }
+		if ( down == VK_LEFT || down == VK_RIGHT || down == VK_UP || down == VK_DOWN ) return;   // They're the directions.
+		g_swapKey = VkToDik( down );
+		mp_log( "[HS] Role swap key : %s (%d).\n", KeyName( g_swapKey ), g_swapKey );
+	}
+	else {
+		int down = -1;
+		for ( int b = 0; g_padSeenAny && b < 32; b++ ) if ( g_padSeen[PAD_BUTTONS + b] & 0x80 ) { down = b; break; }
+		if ( !g_bindArmed ) { g_bindArmed = down < 0 && !escape; return; }
+		if ( escape ) { g_binding = BIND_NONE; return; }
+		if ( down < 0 ) return;
+		g_swapButton = down;
+		mp_log( "[HS] Role swap button : %d.\n", g_swapButton + 1 );
+	}
+	g_binding = BIND_NONE;
+	SaveSettings();
 }
 
 // The menu's pages. Each setting is one row here.
@@ -5323,10 +5906,79 @@ static void DrawMenu( float sw, float sh, float h )
 	static uint32_t colors[MAX_LIST_ROWS];
 	int rows = BuildPlayerRows( left, right, colors, "" );
 
+	if ( !g_menu.IsOpen() ) g_binding = BIND_NONE;
+	if ( g_binding != BIND_NONE ) {   // Waiting for a key or a button : the menu doesn't get them.
+		PollBinding();
+		in.up = in.down = in.left = in.right = in.accept = in.back = in.nextPage = in.prevPage = 0;
+		in.mouseClicked = false;
+	}
 	g_menu.Begin( in, sw, sh, h, "Multiplayer " MP_VERSION, right[0][0] ? right[0] : 0 );
 	if ( g_menu.Page( "Players" ) ) {
 		for ( int r = 0; r < rows; r++ ) g_menu.Info( left[r], r == 0 ? "" : right[r], colors[r] );
 	}
+	// Game modes : one page each, under a heading. One on at a time (g_gameMode); each
+	// page's Enabled turns its own on, or all off.
+	g_menu.Group( "Gamemodes" );
+	if ( g_menu.Page( "Hide and seek" ) ) {
+		g_menu.Section( "Settings" );
+		bool on = g_gameMode == MODE_HIDE_AND_SEEK;
+		if ( g_menu.Toggle( "Enabled", &on,
+			"On : you're playing. You get a role, your hide time adds up while you're a hider, and seekers can catch you. "
+			"Everyone who plays turns it on. Off : just see each other." ) ) SetGameMode( on ? MODE_HIDE_AND_SEEK : MODE_OFF );
+		char hidden[16];
+		if ( on ) {
+			int role = g_myRole;
+			static const char* const ROLES[] = { "Seeker", "Hider" };
+			char swapHint[200];
+			sprintf_s( swapHint, "Also without the menu : hold %s (controller) or %s (keyboard) and press left or right. "
+				"Caught : you're a seeker. Only seekers have name tags.", PadButtonName( g_swapButton ), KeyName( g_swapKey ) );
+			if ( g_menu.Choice( "Your role", &role, ROLES, 2, swapHint ) ) SetMyRole( role );
+			FormatHideTime( g_myHideMs, hidden, sizeof(hidden) );
+			g_menu.Info( "Your hide time", hidden );
+			static uint32_t resetAsked = 0;
+			bool asking = resetAsked && GetTickCount() - resetAsked < 4000;
+			if ( g_menu.Action( asking ? "Reset my timer : press again to be sure" : "Reset my timer",
+				"Your hide time back to 0:00. Only you can reset it : leaving, restarting and being caught keep it." ) ) {
+				if ( asking ) {
+					mp_log( "[HS] Hide time reset (was %u ms).\n", g_myHideMs );
+					g_myHideMs = 0;
+					SaveHideTime();
+					resetAsked = 0;
+				}
+				else resetAsked = GetTickCount();
+			}
+		}
+
+		// Who's playing : a table of the players who have it on.
+		static const float COLUMNS[] = { 0.0F, 0.47F, 0.64F, 1.0F };
+		static const char* const TITLES[] = { "Name", "Role", "Time", "Where" };
+		g_menu.Columns( COLUMNS, 4 );
+		g_menu.Section( "Who's playing", TITLES, 4 );
+		int me = g_transport ? g_transport->PlayerId() : -1;
+		uint32_t here = ShownLevel();
+		int listed = 0;
+		for ( int i = 0; i < MAX_PEERS; i++ ) {
+			bool mine = i == me;
+			const PlayerInfo& info = g_players[i];
+			if ( mine ? !on : (!info.present || !info.playsHs || info.role == ROLE_NONE) ) continue;
+			int r = mine ? g_myRole : info.role;
+			char name[48], where[64];
+			FormatHideTime( mine ? g_myHideMs : info.hideMs, hidden, sizeof(hidden) );
+			sprintf_s( name, "%s%s", mine ? g_myName : info.name, mine ? " (you)" : "" );
+			uint32_t level = mine ? (g_haveLocal ? here : 0) : info.level;
+			if ( HiddenFromMe( i ) ) strcpy_s( where, "hiding" );
+			else if ( !mine && level && level == here ) strcpy_s( where, "here" );
+			else strcpy_s( where, LevelName( level ) );
+			const char* cells[4] = { name, r == ROLE_HIDER ? "Hider" : "Seeker", hidden, where };
+			g_menu.TableRow( cells, 4, mine ? Menu::GREEN : (r == ROLE_HIDER ? Menu::GOLD : Menu::WHITE) );
+			listed++;
+		}
+		if ( !listed ) {
+			const char* cells[1] = { me < 0 ? "Not in a room" : "Nobody here is playing" };
+			g_menu.TableRow( cells, 1, Menu::DIM );
+		}
+	}
+	g_menu.EndGroup();
 	if ( g_menu.Page( "Appearance" ) ) {
 		static const int ORDER[NUM_OUTFITS + 1] = { OUTFIT_DEFAULT, 0, SNOWY_OUTFIT, 1, 2, RETRO_OUTFIT };   // Default, Harry, Snowy Harry, Nicole, Native, Retro Harry.
 		static const char* names[NUM_OUTFITS + 1];
@@ -5349,7 +6001,7 @@ static void DrawMenu( float sw, float sh, float h )
 			static const int NUM_READY = sizeof(READY) / sizeof(READY[0]);
 			static int editing = RETRO_SHIRT;
 			bool changed = false;
-			g_menu.Header( "Retro Harry's colors" );
+			g_menu.Section( "Retro Harry's colors" );
 			for ( int part = 0; part < RETRO_PARTS; part++ ) {
 				uint32_t swatches[NUM_READY + 1];
 				int index = -1;
@@ -5406,8 +6058,21 @@ static void DrawMenu( float sw, float sh, float h )
 	}
 	if ( g_menu.Page( "Keys" ) ) {
 		g_menu.Info( "F1", "This menu" );
+		{
+			char pad[48], key[48];
+			if ( g_binding == BIND_BUTTON ) strcpy_s( pad, "press a button... (Esc : leave it)" );
+			else strcpy_s( pad, PadButtonName( g_swapButton ) );
+			if ( g_binding == BIND_KEY ) strcpy_s( key, "press a key... (Esc : leave it)" );
+			else strcpy_s( key, KeyName( g_swapKey ) );
+			if ( g_menu.Button( "Swap roles, controller : hold", pad,
+				"Hide and seek : hold this and press left or right on the d-pad to switch between hider and seeker. "
+				"Enter, then press the button to use." ) ) StartBinding( BIND_BUTTON );
+			if ( g_menu.Button( "Swap roles, keyboard : hold", key,
+				"Hide and seek : hold this and press the left or right arrow to switch between hider and seeker. "
+				"Enter, then press the key to use." ) ) StartBinding( BIND_KEY );
+		}
 		g_menu.Info( "F10", "Animation viewer ( [ ] \\ ' and F11 inside it)" );
-		g_menu.Header( "For testing" );
+		g_menu.Section( "For testing" );
 		g_menu.Info( "F5", "Spawn a puppet that copies you", Menu::DIM );
 		g_menu.Info( "F6", "Puppet's animation state", Menu::DIM );
 		g_menu.Info( "F7", "Next playback delay", Menu::DIM );
@@ -5447,7 +6112,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 	if ( g_animSurvey ) return;   // Clean frames.
 	uint32_t now = NetNowMs();
 	if ( InterlockedExchange( &g_reqMenu, 0 ) ) SetMenuOpen( !g_menu.IsOpen() );
-	bool any = g_showList || g_animViewer || g_menu.IsOpen();
+	bool any = g_showList || g_animViewer || g_menu.IsOpen() || PlayingHs();
 	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame && g_presentCount - g_peers[i].tagFrame <= TAG_GRACE_FRAMES;
 	for ( int i = 0; i < MAX_TOASTS && !any; i++ ) any = g_toasts[i].text[0] && now - g_toasts[i].time < TOAST_MS;
 	if ( !any ) return;
@@ -5465,7 +6130,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const Peer& p = g_peers[i];
 		float tagX, tagY, tagDepth;
-		if ( !g_showTags || g_menu.IsOpen() || !PlaceNameTag( p, dev, &tagX, &tagY, &tagDepth ) ) continue;
+		if ( !g_showTags || g_menu.IsOpen() || HiddenFromMe( p.id ) || !PlaceNameTag( p, dev, &tagX, &tagY, &tagDepth ) ) continue;
 		float from = (float) g_tagFadeFrom, to = (float) g_tagFadeTo;
 		float alpha = to > from ? 1.0F - (tagDepth - from) / (to - from) : (tagDepth < from ? 1.0F : 0.0F);
 		if ( alpha <= 0.0F ) continue;
@@ -5501,17 +6166,29 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		}
 	}
 
-	// Messages, top middle (of the room the player list leaves).
-	float ty = h;
+	// Messages : bottom middle, the newest lowest (clear of the player list, whatever its width).
+	float ty = floorf( sh - h * 3.5F );
 	for ( int i = 0; i < MAX_TOASTS; i++ ) {
 		if ( !g_toasts[i].text[0] || now - g_toasts[i].time >= TOAST_MS ) continue;
 		float alpha = (TOAST_MS - (now - g_toasts[i].time)) / 1000.0F;   // Fades out over the last second.
 		float w = OverlayTextWidth( g_toasts[i].text );
-		float x = floorf( (listLeft - w) * 0.5F );
-		if ( x < pad ) x = pad;
+		float x = floorf( (sw - w) * 0.5F );
 		OverlayRect( x - pad, ty - pad * 0.5F, w + 2.0F * pad, h + pad, WithAlpha( 0xA0000000, alpha ) );
 		OverlayText( x, ty, g_toasts[i].text, WithAlpha( 0xFFFFE080, alpha ) );
-		ty += h * 1.4F;
+		ty -= h * 1.4F;
+	}
+
+	// Hide and seek : our role and hide time, top left, under the game's health.
+	if ( PlayingHs() && !g_menu.IsOpen() ) {
+		char hidden[16], text[48];
+		FormatHideTime( g_myHideMs, hidden, sizeof(hidden) );
+		const char* role = g_myRole == ROLE_HIDER ? "HIDER" : "SEEKER";
+		sprintf_s( text, "%s   %s", role, hidden );
+		float x = floorf( sw * (28.0F / 640.0F) + pad ), y = floorf( sh * 0.14F );   // The box's left : the first health box's (the game's HUD is laid out 640 wide).
+		float w = OverlayTextWidth( text );
+		OverlayRect( x - pad, y - pad * 0.5F, w + 2.0F * pad, h + pad, 0xA0000000 );
+		OverlayText( x, y, role, g_myRole == ROLE_HIDER ? 0xFFFFE080 : 0xFFFFFFFF );
+		OverlayText( x + w - OverlayTextWidth( hidden ), y, hidden, 0xFFFFFFFF );
 	}
 
 	// The animation viewer, bottom left.
@@ -5732,6 +6409,11 @@ public:
 				g_allowPuppetFade = GetEnvironmentVariableA( "PTLE_MP_FADEALLOW", env, sizeof(env) ) && env[0] == '1';
 				{ char lv[16] = { 0, }; if ( GetEnvironmentVariableA( "PTLE_MP_LEVEL", lv, sizeof(lv) ) ) AUTOTEST_LEVEL = strtoul( lv, 0, 16 ); }   // Another level (its CRC, hex).
 				mp_log( "[AT] Distance test.\n" );
+			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_HSTEST", env, sizeof(env) ) && env[0] >= '1' && env[0] <= '9' ) {
+				g_hsTest = env[0] - '0';
+				g_testHideReport = true;
+				mp_log( "[AT] Hide and seek test %d.\n", g_hsTest );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_SKINTEST", env, sizeof(env) ) && env[0] == '1' ) {
 				g_skinTest = true;

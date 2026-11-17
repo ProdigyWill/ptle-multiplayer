@@ -6,6 +6,20 @@ title; players with another version are marked on its Players page.
 ## Unreleased (0.2.0)
 
 ### New
+- **Hide and seek** : F1 → **Gamemodes** → **Hide and seek**, and turn
+  **Enabled** on (everyone who plays turns it on; one game mode at a time). The
+  page also has your role and hide time, and a table of who's playing. Everyone starts as a
+  seeker; switch yourself to **Hider** and go hide. Hold **L1 / LB** and press
+  left or right on the d-pad (keyboard : **Left Shift** + left or right arrow) to
+  swap roles without the menu; no item comes out while you do. Both can be
+  changed on the Keys page. Your role and hide time show at the top left. Your
+  hide time adds up while you're hidden (not while loading or paused) and is
+  kept between games, until you use **Reset my timer**. A seeker who touches a
+  hider catches them : the hider's Harry dies, comes back at the last loadzone
+  as a seeker, and everyone sees who caught whom. Only seekers have name tags,
+  and the player lists say "hiding" instead of where a hider is. There's no
+  head start or area limit in the game : agree on those among yourselves.
+- Messages ("Bob joined", "F1 : menu"...) now show at the bottom of the screen.
 - Outfit **Default** : Harry wears what the area gives him, jungle or snowy
   clothes, as in the game. **Harry** now always means the jungle clothes, even in
   the snow. The list reads Default, Harry, Snowy Harry, Nicole, Native, Retro Harry.
