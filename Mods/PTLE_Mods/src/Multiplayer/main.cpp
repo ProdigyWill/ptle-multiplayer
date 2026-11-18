@@ -2938,16 +2938,8 @@ static void SaveWheels( const char* ini )
 
 static const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (his own go up to 253), taking turns.
 // More of a layer (EAnimController, 0x619300 moves them on) :
-static const uint32_t LAYER_FPS = 0x00;             // float : the clip's frames a second ...
-static const uint32_t LAYER_AT_END = 0x0D;          // byte : at the clip's end, 0 : from the start again, 1 : stay on the last frame.
-static const uint32_t LAYER_TIME = 0x38;            // float : seconds played.
-static const uint32_t LAYER_FRAME = 0x3C;           // float : where in the clip.
-static const uint32_t LAYER_SPEED = 0x48;           // float : ... times this.
 static const uint32_t LAYER_TARGET = 0x60;          // float : the weight the game set it to (or is fading it to).
-static const uint32_t LAYER_FADING = 0x9C;          // byte : fading to its target.
-static const uint32_t LAYER_ENDED = 0x9D;           // byte : got to the clip's end (Restart clears it).
-static const uint32_t LAYER_TICKED = 0x9E;          // byte : in the controller's list of layers it moves on. One faded out
-                                                    // to nothing is dropped from it, and posed from no clip : a T-pose.
+
 static const uint32_t CLIP_FRAMES = 0x14;           // int, in the clip (layer +0x78) : its frames (the last is this - 1).
 GET_METHOD( 0x61E4F0, void, AnimCtrl_SetTicked, EAnimController*, void*, bool );
 static const float EMOTE_MOVE = 0.5F;               // Harry got moved this far from where he started : over.
@@ -2991,32 +2983,32 @@ static bool EmoteHoldsHarry()
 	return g_emote.active && (g_emote.ending >= 0 || g_emote.finishing);
 }
 
-static float ClipSecondsLeft( uint8_t* layer )
+static float ClipSecondsLeft( AnimLayer* layer )
 {
-	uint8_t* clip = *(uint8_t**) (layer + LAYER_CLIP);
-	float rate = *(float*) (layer + LAYER_FPS) * *(float*) (layer + LAYER_SPEED);
+	ERAnim* clip = layer->m_anim;
+	float rate = layer->m_fps * layer->m_speed;
 	if ( !clip ) return 0.0F;
 	if ( rate <= 0.0F ) return 1e6F;   // Stopped : not getting to its end.
-	return ((float) (*(int*) (clip + CLIP_FRAMES) - 1) - *(float*) (layer + LAYER_FRAME)) / rate;
+	return ((float) (clip->m_framesCount - 1) - layer->m_frame) / rate;
 }
 
 // Ours, whatever the game does : starting one of Harry's idles, it fades every other
 // layer out (ours too) and drops them.
-static void KeepLayer( EAnimController* ctrl, uint8_t* layer )
+static void KeepLayer( EAnimController* ctrl, AnimLayer* layer )
 {
-	layer[LAYER_FADING] = 0;
+	layer->m_fading = 0;
 	*(float*) (layer + LAYER_TARGET) = 1.0F;
-	if ( !layer[LAYER_TICKED] ) AnimCtrl_SetTicked( ctrl, layer, true );
+	if ( !layer->m_ticked ) AnimCtrl_SetTicked( ctrl, layer, true );
 }
 
 static void DropLayer( EIHarry* harry, int key )
 {
-	uint8_t* layer = GetAnimLayer( harry, key );
+	AnimLayer* layer = GetAnimLayer( harry, key );
 	if ( !layer ) return;
-	*(float*) (layer + LAYER_WEIGHT) = 0.0F;
+	layer->m_weight = 0.0F;
 	*(float*) (layer + LAYER_TARGET) = 0.0F;
-	layer[LAYER_FADING] = 0;
-	AnimCtrl_SetTicked( &FIELD( harry, EAnimController, CHAR_ANIMCTRL ), layer, false );
+	layer->m_fading = 0;
+	AnimCtrl_SetTicked( &harry->m_animController, layer, false );
 }
 
 // Ours (layer key) at w (and key2 at w2); the game's own at the weights it wants (it only
@@ -3024,12 +3016,12 @@ static void DropLayer( EIHarry* harry, int key )
 static void SetEmoteWeights( EIHarry* harry, int key, float w, int key2 = -1, float w2 = 0.0F )
 {
 	for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
-		uint8_t* layer = GetAnimLayer( harry, i );
+		AnimLayer* layer = GetAnimLayer( harry, i );
 		if ( !layer ) continue;
-		if ( i == key ) *(float*) (layer + LAYER_WEIGHT) = w;
-		else if ( i == key2 ) *(float*) (layer + LAYER_WEIGHT) = w2;
-		else if ( i == EMOTE_LAYERS[0] || i == EMOTE_LAYERS[1] ) *(float*) (layer + LAYER_WEIGHT) = 0.0F;
-		else *(float*) (layer + LAYER_WEIGHT) = *(float*) (layer + LAYER_TARGET) * (1.0F - w - w2);
+		if ( i == key ) layer->m_weight = w;
+		else if ( i == key2 ) layer->m_weight = w2;
+		else if ( i == EMOTE_LAYERS[0] || i == EMOTE_LAYERS[1] ) layer->m_weight = 0.0F;
+		else layer->m_weight = *(float*) (layer + LAYER_TARGET) * (1.0F - w - w2);
 	}
 }
 
@@ -3091,8 +3083,8 @@ static void StopEmote( EIHarry* harry, const char* why, uint32_t fadeMs = EMOTE_
 		g_emoteFade.since = NetNowMs();
 		g_emoteFade.ms = fadeMs;
 		g_emoteFade.on = true;
-		uint8_t* layer = GetAnimLayer( harry, g_emoteFade.layer );
-		if ( !fadeMs || !layer || *(float*) (layer + LAYER_WEIGHT) <= 0.0F ) EndFade( harry );
+		AnimLayer* layer = GetAnimLayer( harry, g_emoteFade.layer );
+		if ( !fadeMs || !layer || layer->m_weight <= 0.0F ) EndFade( harry );
 	}
 	mp_log( "[EM] Emote ended (%s) after %u ms, %d play%s.\n", why, NetNowMs() - g_emote.start, g_emote.plays, g_emote.plays == 1 ? "" : "s" );
 }
@@ -3110,14 +3102,14 @@ static const char* WhyNoEmote( EIHarry* harry )
 static void EmoteTick( EIHarry* harry )
 {
 	uint32_t now = NetNowMs();
-	EAnimController* ctrl = &FIELD( harry, EAnimController, CHAR_ANIMCTRL );
+	EAnimController* ctrl = &harry->m_animController;
 	Vector3f at = harry->m_position;
 	float dx = at.x - g_stillAt.x, dy = at.y - g_stillAt.y, dz = at.z - g_stillAt.z;
 	if ( !g_stillSince || dx * dx + dy * dy + dz * dz > 0.05F * 0.05F ) { g_stillAt = at; g_stillSince = now; }
 
 	// The last one blending out.
 	if ( g_emoteFade.on ) {
-		uint8_t* layer = GetAnimLayer( harry, g_emoteFade.layer );
+		AnimLayer* layer = GetAnimLayer( harry, g_emoteFade.layer );
 		uint32_t gone = now - g_emoteFade.since;
 		if ( !layer || gone >= g_emoteFade.ms ) EndFade( harry );
 		else {
@@ -3164,8 +3156,8 @@ static void EmoteTick( EIHarry* harry )
 		else if ( byYou && !held && g_emote.holding && !(d.hold[0] < 0.0F && d.hold[1] < 0.0F) ) {
 			mp_log( "[EM] %s : finishing (%s).\n", d.name, over );
 			g_emote.finishing = true;
-			uint8_t* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
-			if ( mine ) *(float*) (mine + LAYER_SPEED) = 1.0F;
+			AnimLayer* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
+			if ( mine ) mine->m_speed = 1.0F;
 		}
 		else {
 			StopEmote( harry, over, held && byYou ? EMOTE_SKIP_FADE_MS : EMOTE_FADE_MS );
@@ -3174,12 +3166,12 @@ static void EmoteTick( EIHarry* harry )
 	}
 
 	if ( g_emote.started ) {
-		uint8_t* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
+		AnimLayer* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
 		if ( mine ) {
-			float frame = *(float*) (mine + LAYER_FRAME);
+			float frame = mine->m_frame;
 			if ( HasHold( d ) && g_emote.clip == d.clip && g_emote.ending < 0 && !g_emote.finishing ) {
 				// Its hold : from its first frame on, it stays (between the two frames, again and again).
-				uint8_t* clip = *(uint8_t**) (mine + LAYER_CLIP);
+				ERAnim* clip = mine->m_anim;
 				float last = clip ? (float) (*(int*) (clip + CLIP_FRAMES) - 1) : 0.0F;
 				float a = d.hold[0] < 0.0F ? last : d.hold[0], b = d.hold[1] < 0.0F ? last : d.hold[1];
 				if ( frame >= a ) {
@@ -3187,14 +3179,14 @@ static void EmoteTick( EIHarry* harry )
 					if ( b > a ) {
 						// There and back (a clip has no loop of its own : jumping back shows), easing in and out
 						// at each end (at its fastest, as fast as the clip plays).
-						float fps = *(float*) (mine + LAYER_FPS);
+						float fps = mine->m_fps;
 						float half = fps > 0.0F ? (b - a) / fps * 1.5707963F : 1.0F;   // Seconds, a to b.
 						float phase = (float) (now - g_emote.holdSince) / 1000.0F / half;
-						*(float*) (mine + LAYER_SPEED) = 0.0F;
-						*(float*) (mine + LAYER_FRAME) = frame = a + (b - a) * 0.5F * (1.0F - cosf( 3.1415927F * phase ));
+						mine->m_speed = 0.0F;
+						mine->m_frame = frame = a + (b - a) * 0.5F * (1.0F - cosf( 3.1415927F * phase ));
 						g_emote.plays = 1 + (int) (phase / 2.0F);
 					}
-					else if ( a < last ) { *(float*) (mine + LAYER_SPEED) = 0.0F; *(float*) (mine + LAYER_FRAME) = frame = a; }
+					else if ( a < last ) { mine->m_speed = 0.0F; mine->m_frame = frame = a; }
 				}
 			}
 			else if ( g_emote.loop ) {   // The game loops it : count the plays.
@@ -3208,7 +3200,7 @@ static void EmoteTick( EIHarry* harry )
 					StopEmote( harry, "played", left > 0.05F ? (uint32_t) (left * 1000.0F) : 50 );
 					return;
 				}
-				if ( mine[LAYER_ENDED] ) {   // The next clip, right away.
+				if ( mine->m_ended ) {   // The next clip, right away.
 					if ( intro ) BeginClip( d.clip, true );
 					else if ( g_emote.ending == 0 ) { g_emote.ending = 1; BeginClip( d.ending[1], false ); }
 				}
@@ -3220,23 +3212,23 @@ static void EmoteTick( EIHarry* harry )
 	if ( !g_emote.started ) {
 		AnimCtrl_SetClip( ctrl, key, g_emote.clip );
 		AnimCtrl_Restart( ctrl, key );
-		uint8_t* layer = GetAnimLayer( harry, key );
+		AnimLayer* layer = GetAnimLayer( harry, key );
 		if ( layer ) {
-			layer[LAYER_AT_END] = g_emote.loop ? 0 : 1;
-			*(float*) (layer + LAYER_SPEED) = 1.0F;
-			if ( g_emote.startFrame > 0.0F ) *(float*) (layer + LAYER_FRAME) = g_emote.startFrame;
+			layer->m_atEnd = !g_emote.loop;
+			layer->m_speed = 1.0F;
+			if ( g_emote.startFrame > 0.0F ) layer->m_frame = g_emote.startFrame;
 		}
 		if ( g_emote.blendFrom >= 0 ) g_emote.blendSince = now;
 		else DropLayer( harry, EMOTE_LAYERS[1 - g_emote.slot] );
 		g_emote.started = true;
 		g_emote.plays++;
 	}
-	uint8_t* mine = GetAnimLayer( harry, key );
+	AnimLayer* mine = GetAnimLayer( harry, key );
 	if ( !mine || GetLayerClipCRC( mine ) != g_emote.clip ) { StopEmote( harry, "the clip didn't load", 0 ); return; }
 	KeepLayer( ctrl, mine );
 	// Blending from the clip before (its last frame held) into this one.
 	float w = 1.0F;
-	uint8_t* from = g_emote.blendFrom >= 0 ? GetAnimLayer( harry, g_emote.blendFrom ) : 0;
+	AnimLayer* from = g_emote.blendFrom >= 0 ? GetAnimLayer( harry, g_emote.blendFrom ) : 0;
 	if ( from && now - g_emote.blendSince < g_emote.blendMs ) {
 		KeepLayer( ctrl, from );
 		w = (float) (now - g_emote.blendSince) / (float) g_emote.blendMs;
@@ -3347,9 +3339,9 @@ static void EmotePreviewTick( EIHarry* harry )
 		return;
 	}
 	// At the clip's end : again, or a chain's next (intro, its loop twice, its ending).
-	uint8_t* layer = GetAnimLayer( g_viewerPeer->beast, MIRROR_LAYERS[g_viewerPeer->mirrorSlot] );
+	AnimLayer* layer = GetAnimLayer( g_viewerPeer->beast, MIRROR_LAYERS[g_viewerPeer->mirrorSlot] );
 	if ( !layer || GetLayerClipCRC( layer ) != g_animSurveyClip ) return;
-	if ( !layer[LAYER_ENDED] ) { g_previewArmed = true; return; }
+	if ( !layer->m_ended ) { g_previewArmed = true; return; }
 	if ( !g_previewArmed ) return;
 	if ( !chain ) { SetPreviewClip( g_animSurveyClip ); return; }
 	const EmoteDef& d = EMOTES[e];
@@ -5216,7 +5208,7 @@ static void AutotestStep( EIHarry* harry )
 		static DWORD stillFrom = 0, longestStill = 0;
 		{
 			int bones = 0;
-			Matrix4f* pose = GetPose( (uint8_t*) harry + CHAR_ANIMCTRL, &bones );
+			Matrix4f* pose = GetPose( &harry->m_animController, &bones );
 			float sum = 0.0F;
 			for ( int b = 0; pose && b < bones && b < MAX_CHAR_BONES; b++ )
 				for ( int r = 0; r < 4; r++ ) for ( int c = 0; c < 4; c++ ) sum += pose[b].data[r][c] * (float) (1 + b * 16 + r * 4 + c);
@@ -5226,11 +5218,11 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_emote.active && g_emote.ending >= 0 ) sawEnding[g_emote.ending] = true;
 		if ( g_emote.active && now - lastLog >= 500 ) {
 			lastLog = now;
-			uint8_t* l = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
+			AnimLayer* l = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
 			int layer = -1; float w = 0;
 			uint32_t clip = GetPlayingClip( harry, &layer, &w );
 			mp_log( "[AT] Emote %s : clip 0x%.8X, frame %.3f, clock %.3f, play %d; Harry shows 0x%.8X (layer %d, %.2f), the puppet 0x%.8X.\n",
-				EMOTES[g_emote.emote].name, g_emote.clip, l ? *(float*) (l + LAYER_FRAME) : 0.0F, l ? *(float*) (l + LAYER_TIME) : 0.0F, g_emote.plays,
+				EMOTES[g_emote.emote].name, g_emote.clip, l ? l->m_frame : 0.0F, l ? l->m_time : 0.0F, g_emote.plays,
 				clip, layer, w, g_cur->mirrorClip );
 		}
 		if ( step == 0 && t >= 1500 ) {
@@ -5307,9 +5299,9 @@ static void AutotestStep( EIHarry* harry )
 			Local::Check( "turning the camera (numpad 7) doesn't end it", g_emote.active && g_emote.emote == running );
 		}
 		else if ( step == 3 && t >= 16000 ) {   // Long enough for one of Harry's idles (it fades every layer out).
-			uint8_t* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
+			AnimLayer* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
 			mp_log( "[AT] Emote : Running Man, %d plays; longest still %u ms.\n", g_emote.plays, longestStill );
-			Local::Check( "Running Man loops on, through Harry's idles", g_emote.active && g_emote.emote == running && g_emote.plays >= 8 && mine && mine[LAYER_TICKED] && longestStill < 200 );
+			Local::Check( "Running Man loops on, through Harry's idles", g_emote.active && g_emote.emote == running && g_emote.plays >= 8 && mine && mine->m_ticked && longestStill < 200 );
 			RequestSnapshot( "emote_2b_running" );
 			watch = false;
 			SendKey( 'W', true );
@@ -5376,8 +5368,8 @@ static void AutotestStep( EIHarry* harry )
 		// Holds : Teleport Zen floats till you move (then finishes); Death lies there (then gets up).
 		else if ( step == 130 && t >= 2500 ) { g_emoteRequest = zen; step = 131; phaseStart = now; }
 		else if ( step == 131 && t >= 10000 ) {
-			uint8_t* l = g_emote.active ? GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] ) : 0;
-			float f = l ? *(float*) (l + LAYER_FRAME) : -1.0F;
+			AnimLayer* l = g_emote.active ? GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] ) : 0;
+			float f = l ? l->m_frame : -1.0F;
 			mp_log( "[AT] Emote : Teleport Zen at frame %.1f, %d plays.\n", f, g_emote.plays );
 			Local::Check( "Teleport Zen floats on, smiling (its frames 246 - 288, there and back)", g_emote.active && g_emote.holding && f >= 245.9F && f <= 288.1F && g_emote.plays >= 2 );
 			RequestSnapshot( "emote_11_zen" );
