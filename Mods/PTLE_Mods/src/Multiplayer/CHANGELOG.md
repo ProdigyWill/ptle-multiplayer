@@ -3,10 +3,10 @@
 What's new in each build given to players. The version shows in the F1 menu's
 title; players with another version are marked on its Players page.
 
-## Unreleased (0.2.0)
+## 0.2.0 (2026-11-17)
 
 ### New
-- **Hide and seek** : F1 → **Gamemodes** → **Hide and seek**, and turn
+- **Hide and seek** : F1 â†’ **Gamemodes** â†’ **Hide and seek**, and turn
   **Enabled** on (everyone who plays turns it on; one game mode at a time). The
   page also has your role and hide time, and a table of who's playing. Everyone starts as a
   seeker; switch yourself to **Hider** and go hide. Hold **L1 / LB** and press
@@ -28,7 +28,7 @@ title; players with another version are marked on its Players page.
   floats in meditation, in Death and Death 2 Harry lies there, then gets up,
   and Breakdance Finish keeps its pose.
   You need to be standing still with no item out to start one. While the wheel
-  is out, the right stick (the arrows) doesn't move Harry's arm. F1 → **Emotes** builds your
+  is out, the right stick (the arrows) doesn't move Harry's arm. F1 â†’ **Emotes** builds your
   wheels (up to 4 of 8) from all of Harry's animations, with a search,
   categories and a preview beside you (choose a slot to see its emote). Two
   wheels to start with : Party and Silly. The buttons can be changed on the Keys
