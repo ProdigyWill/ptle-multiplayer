@@ -52,8 +52,12 @@
 #include "ptle/EIHarry.h"
 #include "ptle/EIEvilHarryP.h"
 #include "ptle/EBeastStateMachine.h"
+#include "ptle/ERAnim.h"
 #include "ptle/ERLevel.h"
+#include "ptle/ERCharacter.h"
 #include "ptle/EIStaticModel.h"
+#include "ptle/EItemRaft.h"
+
 #include "ptle/math/Matrix4f.h"
 #include "ptle/math/Vector3f.h"
 #include "ptle/types/types.h"
@@ -78,10 +82,8 @@ GET_METHOD( 0x412850, void, EIBeast_LoadBeastAsset, EIBeast* );
 GET_FUNC(   0x6F8EC0, uint32_t, HashPath, char* );
 
 
-// Virtual tables (see "Memory Research/PC/Virtual tables.txt").
-static const uint32_t VTABLE_HARRY       = 0x87D300;
-static const uint32_t VTABLE_EVILHARRY_P = 0x875240;
 static const uint32_t VTABLE_SLOT_TICK   = 0x2C;     // EInstance::Tick().
+static const uint32_t VTABLE_SLOT_RENDER = 0x34;     // EInstance::Render( context, arg ).
 
 static const uint32_t HWND_GAME_WINDOW   = 0x93ED60;
 
@@ -91,10 +93,13 @@ static const size_t EXPECTED_BEASTNAME_OFFSET = 0x30C;
 
 
 typedef void (__thiscall *TickFunc)( EInstance* );
+typedef void (__thiscall *RenderFunc)( EInstance* self, void* context, void* arg );
 static TickFunc g_origHarryTick = 0;
 static TickFunc g_origEvilHarryTick = 0;
+static RenderFunc g_origEvilHarryRender = 0;
 
-static Logger* logger() { return Gizmod::getInstance()->getLogger(); }
+// Shortcut.
+static inline Logger* logger() { return Gizmod::getInstance()->getLogger(); }
 
 
 
@@ -110,7 +115,7 @@ static char g_logDir[MAX_PATH] = { 0, };
 // %LOCALAPPDATA%\PTLE Multiplayer (created) : what the mod writes goes there.
 static bool GetDataDir( char* path )   // MAX_PATH.
 {
-	if ( FAILED( SHGetFolderPathA( 0, CSIDL_LOCAL_APPDATA, 0, 0, path ) ) ) return false;
+	if ( FAILED(SHGetFolderPathA(0, CSIDL_LOCAL_APPDATA, 0, 0, path)) ) return false;
 	strcat_s( path, MAX_PATH, "\\PTLE Multiplayer" );
 	CreateDirectoryA( path, 0 );
 	return true;
@@ -121,7 +126,7 @@ static void OpenLogFile()
 	InitializeCriticalSection( &g_logLock );
 
 	char path[MAX_PATH];
-	if ( !GetDataDir( path ) ) return;
+	if ( !GetDataDir(path) ) return;
 	strcat_s( path, "\\logs" );
 	CreateDirectoryA( path, 0 );
 	// PTLE_MP_INSTANCE=<name> : logs\<name>\ (several games running at once).
@@ -312,6 +317,11 @@ static void MatsMul( const Matrix4f* m, int count, const Matrix4f& b, Matrix4f* 
 	for ( int i = 0; i < count; i++ ) MatMul( m[i], b, &out[i] );
 }
 
+static inline void CopyMatrix( Matrix4f& to, const Matrix4f& from )
+{
+	memcpy( &to, &from, sizeof(Matrix4f) );
+}
+
 static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the autotest section).
 
 // Animation survey (PTLE_MP_ANIMSURVEY=1) : every clip loaded on Harry and on Evil
@@ -433,7 +443,6 @@ static const Outfit OUTFITS[] = {
 static const int SNOWY_OUTFIT = 4;
 static uint32_t g_forceHarryModel = 0;   // The model Harry gets instead of the level's, when a level loads (0 : the level's).
 static const int NUM_OUTFITS = sizeof(OUTFITS) / sizeof(OUTFITS[0]);
-static const uint32_t HARRY_MODEL = 0x130, BEAST_MODEL = 0x2F4, CHAR_MODEL_SET = 0x12C;
 static const int OUTFIT_DEFAULT = -1;   // Chosen : whatever the level gives Harry.
 static int g_myOutfit = OUTFIT_DEFAULT;  // The one chosen (Multiplayer.ini, [Appearance] Outfit, by name) : worn from the next level load.
 static int g_myWornOutfit = 0;   // The one Harry wears now : what the others are told.
@@ -945,45 +954,32 @@ static void NetUpdate()
 // its clip instance at +0x78 (clip CRC at +0x0C) and its weight at +0x4C.
 // 0x61CAD0( layer, clipCRC ) loads a clip into a layer (creating the layer).
 // --------------------------------------------------------------------------------
-GET_METHOD( 0x6F3A50, int,  AnimMap_Find,     void*, int, void** );
+GET_METHOD( 0x6F3A50, int,  AnimMap_Find,     void*, int, AnimLayer** );
 GET_METHOD( 0x61CAD0, void, AnimCtrl_SetClip, EAnimController*, int, uint32_t );
 
-static const uint32_t CHAR_ANIMCTRL   = 0xB4;
-static const uint32_t ANIMCTRL_LAYERS = 0x2C;
-static const uint32_t LAYER_CLIP      = 0x78;
-static const uint32_t LAYER_WEIGHT    = 0x4C;
-static const uint32_t CLIP_CRC        = 0x0C;
 static const int      MAX_LAYER_SCAN  = 256;
 
-// Every animated model (characters at +0xB4, and the animated items) is posed by an
-// EAnimController : world-space bone matrices at +0x4, its skeleton (ERCharacter) at
-// +0x18 with the bone count at +0x18, and at +0x24 the frame it last posed at
-// (0x61A970 poses again only when that differs from the frame counter).
-static const uint32_t ANIMCTRL_POSE     = 0x04;
-static const uint32_t ANIMCTRL_SKELETON = 0x18;
-static const uint32_t SKELETON_BONES    = 0x18;
-static const uint32_t ANIMCTRL_STAMP    = 0x24;
-static const uint32_t RENDER_FRAME      = 0x91779C;   // uint32_t : the frame counter it compares with.
+static const uint32_t* RENDER_FRAME   = (const uint32_t*) 0x91779C;   // Global frame counter.
 
-static Matrix4f* GetPose( uint8_t* animCtrl, int* bones )
+static Matrix4f* GetPose( EAnimController* animCtrl, int* bones )
 {
-	void* skeleton = FIELD( animCtrl, void*, ANIMCTRL_SKELETON );
-	*bones = skeleton ? FIELD( skeleton, int, SKELETON_BONES ) : 0;
-	return FIELD( animCtrl, Matrix4f*, ANIMCTRL_POSE );
+	ERCharacter* skeleton = animCtrl->m_characterResource;
+	*bones = skeleton ? skeleton->m_numBones : 0;
+	return animCtrl->m_pose;
 }
 
-static uint8_t* GetAnimLayer( EICharacter* c, int key )
+static AnimLayer* GetAnimLayer( EICharacter* c, int key )
 {
-	void* layer = 0;
-	void* map = (uint8_t*) c + CHAR_ANIMCTRL + ANIMCTRL_LAYERS;
-	if ( !AnimMap_Find( map, key, &layer ) ) return 0;
-	return (uint8_t*) layer;
+	AnimLayer* layer = 0;
+	TreeMap* map = &c->m_animController.m_animMap;
+	if ( !AnimMap_Find(map, key, &layer) ) return 0;
+	return layer;
 }
 
-static uint32_t GetLayerClipCRC( uint8_t* layer )
+static inline uint32_t GetLayerClipCRC( AnimLayer* layer )
 {
-	uint8_t* clip = *(uint8_t**) (layer + LAYER_CLIP);
-	return clip ? *(uint32_t*) (clip + CLIP_CRC) : 0;
+	ERAnim* anim = layer->m_anim;
+	return anim ? anim->m_crc : 0;
 }
 
 // Layer 217 holds a frozen pose (its clock never moves) that Harry blends from
@@ -998,9 +994,9 @@ static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight 
 	int bestLayer = -1;
 	for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
 		if ( i == HOLD_POSE_LAYER ) continue;
-		uint8_t* layer = GetAnimLayer( c, i );
+		AnimLayer* layer = GetAnimLayer( c, i );
 		if ( !layer ) continue;
-		float w = *(float*) (layer + LAYER_WEIGHT);
+		float w = layer->m_weight;
 		uint32_t crc = GetLayerClipCRC( layer );
 		if ( crc && w > bestWeight ) { best = crc; bestWeight = w; bestLayer = i; }
 	}
@@ -1016,26 +1012,25 @@ static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight 
 // he starts putting it away). The game's item table (0x8EEB90, 9 entries of 0x1C
 // bytes) has each item's object at +4.
 // --------------------------------------------------------------------------------
-static const uint32_t ITEM_TABLE = 0x8EEB90;
-static const uint32_t ITEM_ENTRY_SIZE = 0x1C;
+static ItemStruct* ITEM_TABLE = (ItemStruct*) 0x8EEB90;
 static const int NUM_ITEMS = 9;
 static const int ITEM_SLING = 0, ITEM_TORCH = 1, ITEM_PICKAXES = 2, ITEM_TNT = 3, ITEM_SHIELD = 4, ITEM_RAFT = 5,
                  ITEM_GAS_MASK = 6, ITEM_CANTEEN = 7, ITEM_STINK_BOMB = 8;
-static const uint32_t ITEM_MANAGER_HELD = 0x14;
-static const uint32_t ITEM_WORLD_MATRIX = 0x30;   // Matrix4f the item draws its model with while out.
-static const uint32_t HARRY_RIGHT_HAND = 0x470;   // Matrix4f (the torch draws at 1.5 x it).
-static const uint32_t HARRY_LEFT_HAND = 0x4B0;    // Matrix4f (the pickaxes draw on both hands).
 
-static void* GetItemObject( int index ) { return *(void**) (ITEM_TABLE + index * ITEM_ENTRY_SIZE + 4); }
+#include "ptle/EItemBase.h"
+static inline EItemBase* GetItemObject( int index )
+{
+	return ITEM_TABLE[index].m_object;
+}
 
 static int GetHeldItem( EIHarry* harry )
 {
-	void* manager = harry->m_itemHotbar;
-	if ( !manager ) return -1;
-	void* held = FIELD( manager, void*, ITEM_MANAGER_HELD );
+	EInventory* inv = harry->m_inventory;
+	if ( !inv ) return -1;
+	EItemBase* held = inv->m_itemInHandNext;
 	if ( !held ) return -1;
 	for ( int i = 0; i < NUM_ITEMS; i++ )
-		if ( GetItemObject( i ) == held ) return i;
+		if ( GetItemObject(i) == held ) return i;
 	return -1;
 }
 
@@ -1049,8 +1044,13 @@ static void PushLocalSnapshot( EIHarry* harry )
 	SendLocalSnapshot();   // The previous one, complete now.
 
 	int worn = 0;
-	for ( int i = 1; i < NUM_OUTFITS; i++ ) if ( FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[i].model ) worn = i;
-	if ( worn != g_myWornOutfit || !g_haveLocal ) mp_log( "[MP] Harry wears the %s outfit (model 0x%.8X; chosen : %s).\n", OUTFITS[worn].name, FIELD( harry, uint32_t, HARRY_MODEL ), g_myOutfit < 0 ? "Default" : OUTFITS[g_myOutfit].name );
+	for ( int i = 1; i < NUM_OUTFITS; i++ ) {
+		if ( harry->m_modelCRC == OUTFITS[i].model ) {
+			worn = i;
+			break;
+		}
+	}
+	if ( worn != g_myWornOutfit || !g_haveLocal ) mp_log( "[MP] Harry wears the %s outfit (model 0x%.8X; chosen : %s).\n", OUTFITS[worn].name, harry->m_modelCRC, g_myOutfit < 0 ? "Default" : OUTFITS[g_myOutfit].name );
 	g_myWornOutfit = worn;
 	ApplyMyOutfit();
 
@@ -1083,15 +1083,15 @@ static void PushLocalSnapshot( EIHarry* harry )
 	// Harry is posed by now (his pose stamp is this frame's).
 	s.bones = 0;
 	Matrix4f inverse;
-	if ( MatInverseAffine( harry->m_transformMatrix, &inverse ) ) {
-		int bones = 0;
-		Matrix4f* pose = GetPose( (uint8_t*) harry + CHAR_ANIMCTRL, &bones );
-		if ( pose && bones > 0 && bones <= MAX_CHAR_BONES ) {
-			MatsMul( pose, bones, inverse, s.pose );
-			s.bones = bones;
+	if ( MatInverseAffine(harry->m_transformMatrix, &inverse) ) {
+		int nbones = 0;
+		Matrix4f* pose = GetPose( &harry->m_animController, &nbones );
+		if ( pose && nbones > 0 && nbones <= MAX_CHAR_BONES ) {
+			MatsMul( pose, nbones, inverse, s.pose );
+			s.bones = nbones;
 		}
-		MatMul( FIELD( harry, Matrix4f, HARRY_RIGHT_HAND ), inverse, &s.handR );
-		MatMul( FIELD( harry, Matrix4f, HARRY_LEFT_HAND ), inverse, &s.handL );
+		MatMul( harry->m_matRHandHold, inverse, &s.handR );
+		MatMul( harry->m_matLHand, inverse, &s.handL );
 	}
 	static int lastItem = -1;
 	if ( s.heldItem != lastItem ) {
@@ -1159,13 +1159,7 @@ static void SpawnPuppet( EIHarry* harry )
 		return;
 	}
 
-	const type_info_t* type = get_type_by_vtable( VTABLE_EVILHARRY_P );
-	if ( !type ) {
-		mp_log( "[MP] EIEvilHarryP type not registered.\n" );
-		return;
-	}
-
-	EIEvilHarryP* p = instantiate_object<EIEvilHarryP>( type );
+	EIEvilHarryP* p = instantiate_object<EIEvilHarryP>();
 
 	p->EIBeast::m_position.x = harry->m_position.x;
 	p->EIBeast::m_position.y = harry->m_position.y + 15.0F;
@@ -1175,10 +1169,6 @@ static void SpawnPuppet( EIHarry* harry )
 	p->m_rotation.z = 0.0F;
 	p->m_rotation.w = 1.0F;
 
-	// The asset loads by this name. Once loaded the name becomes the game's empty
-	// string (see below) : the beast's destructor frees its name with the game's heap
-	// (0x6F0490 -> 0x617D50) unless it's that one, and freeing our static memory
-	// corrupted the heap when the level unloaded.
 	p->m_beastTypeCRC = HashPath( (char*) "BEvilHarryP" );
 	p->m_beastTypeName = g_puppetName;
 	EIBeast_LoadBeastAsset( p );
@@ -1381,10 +1371,7 @@ static void DropLostPuppets()   // Each Harry tick.
 	}
 }
 
-// The game's own setters (writing the fields directly isn't enough : the model kept
-// rendering at the spawn point). SetPos also moves the instance in the level's
-// spatial structure (0x62B470), rebuilds the transform (vtable +0x124) and updates
-// the collision object at +0x270. SetRot writes +0x140 and calls vtable +0x120.
+
 GET_METHOD( 0x60FEA0, void, EICharacter_SetPos, EICharacter*, Vector3f*, bool );
 GET_METHOD( 0x60FFA0, void, EICharacter_SetRot, EICharacter*, Vector3f* );
 
@@ -1416,18 +1403,6 @@ static bool GetPuppetTargetPosition( Vector3f* out )
 	return true;
 }
 
-// Raw field access. Spawn-time dump (Mama-Oullo Tower) showed : +0x134 position,
-// +0x140 rotation, +0x14C scale (1,1,1), +0x160 transform matrix with its
-// translation row at +0x190, +0x2FC EIBeast position, +0x310 quaternion.
-// (0x414B10, vtable +0x120, rebuilds the matrix rotation and applies the scale;
-// it does NOT set the translation.)
-//
-// The beast tick (0x414F80) reads its world position from +0x360, the translation
-// row of a matrix at +0x330, and stores it at +0x370 ("previous position") when
-// done. +0x330 is the beast's real world transform.
-static const uint32_t BEAST_SCALE       = 0x14C;
-static const uint32_t BEAST_WORLD       = 0x330;   // Matrix4f.
-static const uint32_t BEAST_PREV_POS    = 0x370;   // Vector3f.
 
 // --------------------------------------------------------------------------------
 // Locomotion : the puppet's animation and facing come from how its target moves
@@ -1545,31 +1520,24 @@ static void UpdateLocomotion( EIEvilHarryP* p )
 GET_METHOD( 0x61D0D0, void, AnimCtrl_FadeTo,  EAnimController*, int, float );
 GET_METHOD( 0x61D8A0, void, AnimCtrl_Restart, EAnimController*, int );
 
-static const uint32_t BEAST_ANIMCTRL     = 0xB4;
-static const uint32_t BEAST_ANIM_MOVE    = 0x494;   // CRC.
-static const uint32_t BEAST_ANIM_IDLE    = 0x498;   // CRC.
-static const uint32_t BEAST_LOCO_BASE    = 0x52C;   // int.
-static const uint32_t BEAST_CUR_LAYER    = 0x530;   // int.
-static const uint32_t BEAST_STATE_LAYER  = 0x38;    // In EBeastState (0x58 bytes).
-
 static int GetStateAnimLayer( EIBeast* p, int state )
 {
 	EBeastStateMachine* sm = p->GetStateMachine();
 	if ( !sm || !sm->m_states || state < 0 || state >= (int) sm->m_numStates ) return -1;
-	return FIELD( &sm->m_states[state], int, BEAST_STATE_LAYER );
+	return sm->m_states[state].m_animID;
 }
 
 // Crossfades to an animation layer, like the beast's PlayAnim does.
 static void PlayAnimLayer( EIEvilHarryP* p, int layer )
 {
-	EAnimController* ctrl = &FIELD( p, EAnimController, BEAST_ANIMCTRL );
-	int current = FIELD( p, int, BEAST_CUR_LAYER );
+	EAnimController* ctrl = &p->m_animController;
+	int current = p->m_animIndex;
 	if ( layer < 0 || layer == current ) return;
 
 	if ( current >= 0 ) AnimCtrl_FadeTo( ctrl, current, 0.0F );
 	AnimCtrl_Restart( ctrl, layer );
 	AnimCtrl_FadeTo( ctrl, layer, 1.0F );
-	FIELD( p, int, BEAST_CUR_LAYER ) = layer;
+	p->m_animIndex = layer;
 }
 
 // Mirroring : the puppet plays the replayed player's own clip (Harry's jump, climb,
@@ -1585,10 +1553,10 @@ static bool ApplyMirroredClip( EIEvilHarryP* p )
 	uint32_t clip = forced ? forced : (t ? t->clipCRC : 0);
 	if ( !g_mirrorClips || !clip ) return false;
 
-	int current = FIELD( p, int, BEAST_CUR_LAYER );
+	int current = p->m_animIndex;
 	if ( clip == g_cur->mirrorClip && current == MIRROR_LAYERS[g_cur->mirrorSlot] ) return true;
 
-	EAnimController* ctrl = &FIELD( p, EAnimController, BEAST_ANIMCTRL );
+	EAnimController* ctrl = &p->m_animController;
 	int next = (current == MIRROR_LAYERS[g_cur->mirrorSlot]) ? 1 - g_cur->mirrorSlot : g_cur->mirrorSlot;
 	AnimCtrl_SetClip( ctrl, MIRROR_LAYERS[next], clip );
 	PlayAnimLayer( p, MIRROR_LAYERS[next] );
@@ -1605,7 +1573,7 @@ static void ApplyLocomotionAnim( EIEvilHarryP* p )
 	int wanted = g_cur->idleLayer;
 	if ( g_cur->airborne && g_cur->airLayer >= 0 ) wanted = g_cur->airLayer;
 	else if ( g_cur->moving ) wanted = (g_cur->sprinting && g_cur->sprintLayer >= 0) ? g_cur->sprintLayer : g_cur->runLayer;
-	int current = FIELD( p, int, BEAST_CUR_LAYER );
+	int current = p->m_animIndex;
 	if ( wanted < 0 || wanted == current ) return;
 
 	// The idle state may re-play its own animation; count it to spot fights.
@@ -1618,12 +1586,12 @@ static void ApplyLocomotionAnim( EIEvilHarryP* p )
 static void SetRunAnimation( EIEvilHarryP* p, const char* stateName )
 {
 	if ( !stateName ) {
-		int base = FIELD( p, int, BEAST_LOCO_BASE );
-		g_cur->runLayer = FIELD( p, uint32_t, BEAST_ANIM_MOVE ) ? base : -1;
+		int base = p->m_locoBase;
+		g_cur->runLayer = p->m_animMoveCRC ? base : -1;
 		mp_log( "[MP] Run animation : quickdata move anim, layer %d.\n", g_cur->runLayer );
 	}
 	else {
-		g_cur->runLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+		g_cur->runLayer = GetStateAnimLayer( p, FindStateIndex(p, stateName) );
 		mp_log( "[MP] Run animation : \"%s\" state's anim, layer %d.\n", stateName, g_cur->runLayer );
 	}
 }
@@ -1633,19 +1601,19 @@ static void SetRunAnimation( EIEvilHarryP* p, const char* stateName )
 static void SetIdleAnimation( EIEvilHarryP* p, const char* stateName )
 {
 	if ( !stateName ) {
-		int base = FIELD( p, int, BEAST_LOCO_BASE );
-		g_cur->idleLayer = FIELD( p, uint32_t, BEAST_ANIM_IDLE ) ? base + 1 : -1;
+		int base = p->m_locoBase;
+		g_cur->idleLayer = p->m_animIdleCRC ? base + 1 : -1;
 		mp_log( "[MP] Idle animation : quickdata idle anim, layer %d.\n", g_cur->idleLayer );
 	}
 	else {
-		g_cur->idleLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+		g_cur->idleLayer = GetStateAnimLayer( p, FindStateIndex(p, stateName) );
 		mp_log( "[MP] Idle animation : \"%s\" state's anim, layer %d.\n", stateName, g_cur->idleLayer );
 	}
 }
 
 static void SetAirAnimation( EIEvilHarryP* p, const char* stateName )
 {
-	g_cur->airLayer = GetStateAnimLayer( p, FindStateIndex( p, stateName ) );
+	g_cur->airLayer = GetStateAnimLayer( p, FindStateIndex(p, stateName) );
 	mp_log( "[MP] Air animation : \"%s\" state's anim, layer %d.\n", stateName, g_cur->airLayer );
 }
 
@@ -1659,9 +1627,8 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 	g_cur->idleLayer = GetStateAnimLayer( p, g_cur->idleState );
 
 	mp_log( "[MP] Beast anims : move CRC 0x%.8X, idle CRC 0x%.8X, locomotion base layer %d, current layer %d, idle layer %d, runner layer %d.\n",
-		FIELD( p, uint32_t, BEAST_ANIM_MOVE ), FIELD( p, uint32_t, BEAST_ANIM_IDLE ),
-		FIELD( p, int, BEAST_LOCO_BASE ), FIELD( p, int, BEAST_CUR_LAYER ),
-		g_cur->idleLayer, GetStateAnimLayer( p, FindStateIndex( p, "runner" ) ) );
+		p->m_animMoveCRC, p->m_animIdleCRC, p->m_locoBase, p->m_animIndex,
+		g_cur->idleLayer, GetStateAnimLayer(p, FindStateIndex(p, "runner")) );
 
 	SetIdleAnimation( p, 0 );
 	if ( g_cur->idleLayer < 0 ) g_cur->idleLayer = GetStateAnimLayer( p, g_cur->idleState );
@@ -1692,15 +1659,15 @@ static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry )
 // rigid-body matrix stay upright. Detected by that raise.
 static const float BALL_RAISE_MIN = 0.5F;
 
-static bool IsBallMode( const PlayerSnapshot* t )
+static inline bool IsBallMode( const PlayerSnapshot* t )
 {
 	return t && t->transform.data[3][2] - t->position.z > BALL_RAISE_MIN;
 }
 
-static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSnapshot* t )
+static void SetBeastWorldMatrix( EIEvilHarryP* p, const Vector3f& pos, const PlayerSnapshot* t )
 {
-	Matrix4f& world = FIELD( p, Matrix4f, BEAST_WORLD );
-	if ( IsBallMode( t ) ) {
+	Matrix4f& world = p->m_worldMatrix;
+	if ( IsBallMode(t) ) {
 		// Take Harry's spinning, raised matrix as is (same skeleton, same forward axis).
 		world = t->transform;
 		world.data[3][0] = pos.x + (t->transform.data[3][0] - t->position.x);
@@ -1723,10 +1690,10 @@ static void SetBeastWorld( EIEvilHarryP* p, const Vector3f& pos, const PlayerSna
 static void PrePositionPuppet( EIEvilHarryP* p )
 {
 	Vector3f pos;
-	if ( GetPuppetTargetPosition( &pos ) ) {
-		p->EIBeast::m_position = pos;
-		SetBeastWorld( p, pos, GetPuppetTarget() );
-		FIELD( p, Vector3f, BEAST_PREV_POS ) = pos;
+	if ( GetPuppetTargetPosition(&pos) ) {
+		p->m_position = pos;
+		SetBeastWorldMatrix( p, pos, GetPuppetTarget() );
+		p->m_previousPosition = pos;
 	}
 }
 
@@ -1735,31 +1702,26 @@ static void PrePositionPuppet( EIEvilHarryP* p )
 // back; with it at 0 Harry walks straight through. (The collision layer masks at
 // +0x230/+0x564/+0x574/+0x584 made no difference, cleared or not.)
 // The puppet is only a visual, so it is never solid.
-static const uint32_t BEAST_BODY_SOLID = 0x4C4;   // uint8_t.
 static bool g_puppetSolid = false;                 // Autotest flips it to compare.
 
-static void ApplyPuppetCollision( EIEvilHarryP* p )
+static inline void ApplyPuppetCollision( EIEvilHarryP* p )
 {
-	FIELD( p, uint8_t, BEAST_BODY_SOLID ) = g_puppetSolid ? 1 : 0;
+	p->m_enableCollision = g_puppetSolid;
 }
 
-// Evil Harry's hands hold two static models (m_pickaxeModel0/1, attached to his
-// hand bones). They stay hidden : the puppet gets a copy of Harry's own pickaxes,
-// like his other items. Bit 0 of an instance's flags (+0x2C) is "visible".
-static const uint32_t INSTANCE_FLAGS = 0x2C;
+// EInstance flags (offset 0x2C).
 static const uint32_t INSTANCE_VISIBLE = 0x1;
 
-static void ShowModel( void* model, bool show )
+static inline void ShowModel( EInstance* model, bool show )
 {
-	if ( !model ) return;
-	uint32_t& flags = FIELD( model, uint32_t, INSTANCE_FLAGS );
-	flags = show ? (flags | INSTANCE_VISIBLE) : (flags & ~INSTANCE_VISIBLE);
+	uint32_t flags = model->m_flags;
+	model->m_flags = show ? (flags | INSTANCE_VISIBLE) : (flags & ~INSTANCE_VISIBLE);
 }
 
 static void ApplyPuppetItem( EIEvilHarryP* p )
 {
-	ShowModel( p->m_pickaxeModel0, false );
-	ShowModel( p->m_pickaxeModel1, false );
+	if ( p->m_pickaxeModel0 ) ShowModel( p->m_pickaxeModel0, false );
+	if ( p->m_pickaxeModel1 ) ShowModel( p->m_pickaxeModel1, false );
 }
 
 // The puppet shows Harry's pose from the snapshot : his bones relative to his
@@ -1772,13 +1734,12 @@ static int g_puppetPoseCopies = 0;   // For the autotest.
 
 static void ApplyPuppetPose( EIEvilHarryP* p, const PlayerSnapshot* t )
 {
-
-	uint8_t* animCtrl = (uint8_t*) p + CHAR_ANIMCTRL;
+	EAnimController* animCtrl = &p->m_animController;
 	int bones = 0;
 	Matrix4f* pose = GetPose( animCtrl, &bones );
 	if ( !pose || !t->bones || bones != t->bones ) return;
 	MatsMul( t->pose, bones, p->m_transformMatrix, pose );
-	FIELD( animCtrl, uint32_t, ANIMCTRL_STAMP ) = *(uint32_t*) RENDER_FRAME;
+	animCtrl->m_frameStamp = *RENDER_FRAME;
 	g_puppetPoseCopies++;
 }
 
@@ -1793,13 +1754,7 @@ static void ApplyPuppetPose( EIEvilHarryP* p, const PlayerSnapshot* t )
 // the item there relative to the puppet's transform, with those fields forced for
 // the duration of the call.
 typedef void (__thiscall *ItemDrawFunc)( void* item, void* context, void* arg );
-typedef void (__thiscall *RenderFunc)( EInstance* self, void* context, void* arg );
 static const uint32_t ITEM_SLOT_DRAW = 4 * 4;
-static const uint32_t VTABLE_SLOT_RENDER = 0x34;      // EInstance::Render( context, arg ).
-static const uint32_t ITEM_OWNER = 0x20;              // The player holding it.
-static const uint32_t ITEM_STATE = 0x70;              // 3 : out.
-static const uint32_t ITEM_ACTIVE = 0x91;             // uint8_t.
-static const uint32_t RAFT_INFLATED = 0x108;          // uint8_t.
 static Matrix4f g_puppetItemPose[MAX_ITEM_BONES];     // The copy's bones (static : 16-byte aligned).
 
 // "anim" : offset of the item's animated model (an EAnimController), 0 if none.
@@ -1820,7 +1775,6 @@ static const struct { int item; uint32_t vtable; uint32_t anim; uint32_t shown; 
 };
 static const int NUM_DRAWN_ITEMS = sizeof(DRAWN_ITEMS) / sizeof(DRAWN_ITEMS[0]);
 static ItemDrawFunc g_origItemDraw[NUM_DRAWN_ITEMS];
-static RenderFunc g_origEvilHarryRender = 0;
 
 static int g_puppetItemDraws = 0;     // For the autotest.
 static int g_aimItemDraws = 0;
@@ -1828,20 +1782,20 @@ static bool g_testSkipHarryItemDraw = false;   // Autotest : Harry's item isn't 
 static int g_copyDrawsAlone = 0;      // For the autotest : copies drawn while Harry draws no item.
 static DWORD g_harryItemDrawTime = 0;
 
-static void NoteHarryItemDraw( int slot, void* item )
+static void NoteHarryItemDraw( int slot, EItemBase* item )
 {
-	EIHarry* owner = FIELD( item, EIHarry*, ITEM_OWNER );
+	EIHarry* owner = item->m_harry;
 	PlayerSnapshot* s = LatestSnapshot();
 	if ( !owner || owner != Gizmod::getHarry() || !s ) return;
 	// Until it has inflated, the raft's draw only poses it (something else shows it).
-	if ( DRAWN_ITEMS[slot].item == ITEM_RAFT && !FIELD( item, uint8_t, RAFT_INFLATED ) ) return;
+	if ( DRAWN_ITEMS[slot].item == ITEM_RAFT && !((EItemRaft*) item)->m_inflated ) return;
 	Matrix4f inverse;
 	if ( !MatInverseAffine( owner->m_transformMatrix, &inverse ) ) return;
 
 	s->itemBones = 0;
 	if ( DRAWN_ITEMS[slot].anim ) {
 		int bones = 0;
-		Matrix4f* pose = GetPose( (uint8_t*) item + DRAWN_ITEMS[slot].anim, &bones );
+		Matrix4f* pose = GetPose( (EAnimController*) ((uint8_t*) item + DRAWN_ITEMS[slot].anim), &bones );
 		static bool logged[NUM_DRAWN_ITEMS] = { false, };
 		if ( !logged[slot] ) {
 			mp_log( "[MP] Item %d's animated model has %d bones.\n", DRAWN_ITEMS[slot].item, bones );
@@ -1852,9 +1806,9 @@ static void NoteHarryItemDraw( int slot, void* item )
 		s->itemBones = bones;
 	}
 	Matrix4f world;
-	memcpy( &world, (uint8_t*) item + ITEM_WORLD_MATRIX, sizeof(world) );
+	CopyMatrix( world, item->m_matrix );
 	MatMul( world, inverse, &s->itemLocal );
-	s->itemState = FIELD( item, int, ITEM_STATE );
+	s->itemState = item->m_state;
 	s->drawnSlot = slot;
 	g_harryItemDrawTime = GetTickCount();
 }
@@ -1880,8 +1834,8 @@ static void KeepUndrawnItem( EIHarry* harry )   // On the snapshot about to be s
 	int slot = g_lastItemDraw.slot;
 	if ( slot < 0 ) return;
 	int index = DRAWN_ITEMS[slot].item;
-	uint8_t* item = (uint8_t*) GetItemObject( index );
-	if ( !item || GetHeldItem( harry ) != index || FIELD( item, int, ITEM_STATE ) != 3 ) { g_lastItemDraw.slot = -1; return; }   // Put away.
+	EItemBase* item = GetItemObject( index );
+	if ( !item || GetHeldItem(harry) != index || item->m_state != 3 ) { g_lastItemDraw.slot = -1; return; }   // Put away.
 	s.drawnSlot = slot;
 	s.itemState = g_lastItemDraw.itemState;
 	s.itemBones = g_lastItemDraw.itemBones;
@@ -1908,12 +1862,12 @@ static void SwapMatrix( void* field, const Matrix4f& m, const Matrix4f& base, Ma
 static void DrawItemAt( int slot, const PlayerSnapshot* t, const Matrix4f& base, void* context, void* arg )
 {
 	int index = DRAWN_ITEMS[slot].item;
-	uint8_t* item = (uint8_t*) GetItemObject( index );
+	EItemBase* item = GetItemObject( index );
 	EIHarry* harry = Gizmod::getHarry();
 	if ( !item || !harry ) return;
 
 	// Animated items : the snapshot's bones, marked posed so the draw keeps them.
-	uint8_t* anim = DRAWN_ITEMS[slot].anim ? item + DRAWN_ITEMS[slot].anim : 0;
+	EAnimController* anim = (EAnimController*) (DRAWN_ITEMS[slot].anim ? (uint8_t*) item + DRAWN_ITEMS[slot].anim : 0);
 	Matrix4f* harryPose = 0;
 	uint32_t stamp = 0;
 	if ( anim ) {
@@ -1921,41 +1875,41 @@ static void DrawItemAt( int slot, const PlayerSnapshot* t, const Matrix4f& base,
 		harryPose = GetPose( anim, &bones );   // (None yet if Harry never took his out : the copy brings its own.)
 		if ( !t->itemBones || bones != t->itemBones ) return;
 		MatsMul( t->itemPose, bones, base, g_puppetItemPose );
-		stamp = FIELD( anim, uint32_t, ANIMCTRL_STAMP );
-		FIELD( anim, Matrix4f*, ANIMCTRL_POSE ) = g_puppetItemPose;
-		FIELD( anim, uint32_t, ANIMCTRL_STAMP ) = *(uint32_t*) RENDER_FRAME;
+		stamp = anim->m_frameStamp;
+		anim->m_pose = g_puppetItemPose;
+		anim->m_frameStamp = *RENDER_FRAME;
 	}
 
 	Matrix4f savedMatrix, savedRight, savedLeft;
-	SwapMatrix( item + ITEM_WORLD_MATRIX, t->itemLocal, base, &savedMatrix );
+	SwapMatrix( &item->m_matrix, t->itemLocal, base, &savedMatrix );
 	bool hands = index == ITEM_PICKAXES;   // They draw on Harry's hands.
 	if ( hands ) {
-		SwapMatrix( (uint8_t*) harry + HARRY_RIGHT_HAND, t->handR, base, &savedRight );
-		SwapMatrix( (uint8_t*) harry + HARRY_LEFT_HAND, t->handL, base, &savedLeft );
+		SwapMatrix( &harry->m_matRHandHold, t->handR, base, &savedRight );
+		SwapMatrix( &harry->m_matLHand, t->handL, base, &savedLeft );
 	}
-	int savedState = FIELD( item, int, ITEM_STATE );
-	uint8_t savedActive = FIELD( item, uint8_t, ITEM_ACTIVE );
+	int savedState = item->m_state;
+	bool savedActive = item->m_active;
 	uint32_t shown = DRAWN_ITEMS[slot].shown;
-	uint8_t savedShown = shown ? FIELD( item, uint8_t, shown ) : 0;
-	FIELD( item, int, ITEM_STATE ) = t->itemState;
-	FIELD( item, uint8_t, ITEM_ACTIVE ) = 1;
-	if ( shown ) FIELD( item, uint8_t, shown ) = 1;
+	bool savedShown = shown ? FIELD(item, bool, shown) : false;
+	item->m_state = t->itemState;
+	item->m_active = true;
+	if ( shown ) FIELD(item, bool, shown) = true;
 
 	g_origItemDraw[slot]( item, context, arg );
 	g_puppetItemDraws++;
 	if ( GetTickCount() - g_harryItemDrawTime > 150 ) g_copyDrawsAlone++;
 
-	if ( shown ) FIELD( item, uint8_t, shown ) = savedShown;
-	FIELD( item, uint8_t, ITEM_ACTIVE ) = savedActive;
-	FIELD( item, int, ITEM_STATE ) = savedState;
+	if ( shown ) FIELD(item, bool, shown) = savedShown;
+	item->m_active = savedActive;
+	item->m_state = savedState;
 	if ( hands ) {
-		memcpy( (uint8_t*) harry + HARRY_LEFT_HAND, &savedLeft, sizeof(Matrix4f) );
-		memcpy( (uint8_t*) harry + HARRY_RIGHT_HAND, &savedRight, sizeof(Matrix4f) );
+		CopyMatrix( harry->m_matLHand, savedLeft );
+		CopyMatrix( harry->m_matRHandHold, savedRight );
 	}
-	memcpy( item + ITEM_WORLD_MATRIX, &savedMatrix, sizeof(Matrix4f) );
+	CopyMatrix( item->m_matrix, savedMatrix );
 	if ( anim ) {
-		FIELD( anim, Matrix4f*, ANIMCTRL_POSE ) = harryPose;
-		FIELD( anim, uint32_t, ANIMCTRL_STAMP ) = stamp;
+		anim->m_pose = harryPose;
+		anim->m_frameStamp = stamp;
 	}
 }
 
@@ -1972,9 +1926,9 @@ static void DrawPuppetItem( int slot, void* context, void* arg )
 // right after Harry's own raft, so the other players' rafts vanished whenever Harry
 // put his away).
 #define ITEM_DRAW_HOOK( n ) \
-	static void __fastcall ItemDraw_Hook##n( void* item, void*, void* context, void* arg ) \
+	static void __fastcall ItemDraw_Hook##n( EItemBase* item, void*, void* context, void* arg ) \
 	{ \
-		if ( g_testSkipHarryItemDraw && FIELD( item, EIHarry*, ITEM_OWNER ) == Gizmod::getHarry() ) return; \
+		if ( g_testSkipHarryItemDraw && item->m_harry == Gizmod::getHarry() ) return; \
 		g_origItemDraw[n]( item, context, arg ); \
 		NoteHarryItemDraw( n, item ); \
 	}
@@ -2304,11 +2258,11 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 static void InstallItemDrawHooks()
 {
 	for ( int i = 0; i < NUM_DRAWN_ITEMS; i++ ) {
-		uint32_t slot = DRAWN_ITEMS[i].vtable + ITEM_SLOT_DRAW;
+		const uint32_t slot = DRAWN_ITEMS[i].vtable + ITEM_SLOT_DRAW;
 		g_origItemDraw[i] = injector::ReadMemory<ItemDrawFunc>( slot, true );
 		injector::WriteMemory( slot, ITEM_DRAW_HOOKS[i], true );
 	}
-	uint32_t render = VTABLE_EVILHARRY_P + VTABLE_SLOT_RENDER;
+	const uint32_t render = EIEvilHarryP::VTABLE + VTABLE_SLOT_RENDER;
 	g_origEvilHarryRender = injector::ReadMemory<RenderFunc>( render, true );
 	injector::WriteMemory( render, &EvilHarryRender_Hook, true );
 }
@@ -2368,21 +2322,25 @@ static const uint32_t DISTANCE_FADE_VTABLES[] = {   // Every vtable with it in t
 	0x897ED0, 0x898660, 0x898C20, 0x899130, 0x8999C8, 0x899DE0, 0x89A6D8, 0x8A18A0,
 	0x8A1CF0, 0x8A2C70,
 };
-typedef bool (__thiscall *DistanceFadeFunc)( void* self, float distance );
+typedef bool (__thiscall *DistanceFadeFunc)( EInstance* self, float distance );
 static volatile LONG g_fadesStopped = 0;
 static float g_lastPuppetFade = 1.0F;   // What the game wanted for a puppet (tests).
 static volatile LONG g_puppetFadeCalls = 0;
 
-static bool __fastcall DistanceFade_Hook( void* self, void*, float distance )
+static bool __fastcall DistanceFade_Hook( EInstance* self, void*, float distance )
 {
-	bool gone = ((DistanceFadeFunc) DISTANCE_FADE_FUNC)( self, distance );
-	float& fade = FIELD( self, float, 0x24 );
+	const bool gone = ((DistanceFadeFunc) DISTANCE_FADE_FUNC)( self, distance );
+	float fade = self->m_opacity3;
 	bool puppet = IsAnyPuppet( self );
-	if ( puppet ) { InterlockedIncrement( &g_puppetFadeCalls ); g_lastPuppetFade = fade; }
+	if ( puppet ) {
+		InterlockedIncrement( &g_puppetFadeCalls );
+		g_lastPuppetFade = fade;
+	}
 	if ( g_allowPuppetFade ) return gone;
-	if ( puppet && fade < 1.0F && InterlockedIncrement( &g_fadesStopped ) == 1 ) mp_log( "[MP] A puppet was fading out with distance (%.2f) : kept in full view.\n", fade );
-	fade = 1.0F;
-	FIELD( self, float, 0x1C ) = FIELD( self, float, 0x20 ) * FIELD( self, float, 0x28 );
+
+	if ( puppet && fade < 1.0F && InterlockedIncrement(&g_fadesStopped) == 1 ) mp_log( "[MP] A puppet was fading out with distance (%.2f) : kept in full view.\n", fade );
+	self->m_opacity3 = 1.0F;
+	self->m_opacityFinal = self->m_opacity2 * self->m_alphaUser;
 	return false;
 }
 
@@ -2416,29 +2374,30 @@ static void DrivePuppet( EIEvilHarryP* p )
 	ApplyPuppetCollision( p );
 
 	Vector3f pos;
-	if ( !GetPuppetTargetPosition( &pos ) ) { ApplyPuppetItem( p ); return; }
+	if ( !GetPuppetTargetPosition(&pos) ) {
+		ApplyPuppetItem( p );
+		return;
+	}
 
 	const PlayerSnapshot* t = GetPuppetTarget();
 	ApplyPuppetItem( p );
 	Vector3f rot = t->rotationEuler;
 
-	p->EIBeast::m_position = pos;
-	EICharacter_SetPos( p, &pos, true );   // Spatial structure, bounds, collision.
-	EICharacter_SetRot( p, &rot );         // Rebuilds rotation + scale of the matrix.
+	p->m_position = pos;
+	EICharacter_SetPos( p, &pos, true );
+	EICharacter_SetRot( p, &rot );
 
-	// The beast's own world transform (what its tick and AI work from).
-	SetBeastWorld( p, pos, t );
+	SetBeastWorldMatrix( p, pos, t );
 
 	// Same orientation and position in the header transform.
-	const Matrix4f& world = FIELD( p, Matrix4f, BEAST_WORLD );
+	const Matrix4f& world = p->m_worldMatrix;
 	for ( int r = 0; r < 3; r++ )
 		for ( int c = 0; c < 3; c++ )
 			p->m_transformMatrix.data[r][c] = world.data[r][c];
-	p->m_transformMatrix.data[3][0] = world.data[3][0];   // Raised when rolling.
+	p->m_transformMatrix.data[3][0] = world.data[3][0];
 	p->m_transformMatrix.data[3][1] = world.data[3][1];
 	p->m_transformMatrix.data[3][2] = world.data[3][2];
-	FIELD( p, Vector3f, BEAST_PREV_POS ) = pos;
-
+	p->m_previousPosition = pos;
 }
 
 
@@ -2722,7 +2681,7 @@ static void AddFoundClips( EICharacter* harry, EICharacter* beast )
 		if ( !owners[o] ) continue;
 		for ( int key = 0; key < 4096 && g_animNoteCount < MAX_ANIM_NOTES; key++ ) {
 			if ( o == 1 && (key == MIRROR_LAYERS[0] || key == MIRROR_LAYERS[1]) ) continue;
-			uint8_t* layer = GetAnimLayer( owners[o], key );
+			AnimLayer* layer = GetAnimLayer( owners[o], key );
 			uint32_t crc = layer ? GetLayerClipCRC( layer ) : 0;
 			if ( !crc ) continue;
 			bool known = false;
@@ -3976,7 +3935,7 @@ static int g_retroMatched = 0, g_retroUnmatched = 0;   // For the autotest.
 static bool HasBoneAt( EICharacter* c, const float bone[3][4] )
 {
 	int bones = 0;
-	const Matrix4f* pose = GetPose( (uint8_t*) c + CHAR_ANIMCTRL, &bones );
+	const Matrix4f* pose = GetPose( &c->m_animController, &bones );
 	if ( !pose || bones <= 0 || bones > MAX_CHAR_BONES ) return false;
 	for ( int i = 0; i < bones; i++ ) {
 		const float* t = pose[i].data[3];
@@ -4667,11 +4626,11 @@ static DWORD WINAPI AutotestThread( void* )
 static void LogTelemetry( EIHarry* harry, const char* tag )
 {
 	if ( g_cur->beast ) {
-		const Matrix4f& w = FIELD( g_cur->beast, Matrix4f, BEAST_WORLD );
+		const Matrix4f& w = g_cur->beast->m_worldMatrix;
 		mp_log( "[AT] %s beast world (%.1f, %.1f, %.1f), anim layer %d, moving %d, speed %.3f, heading %.0f\n", tag,
-			w.data[3][0], w.data[3][1], w.data[3][2], FIELD( g_cur->beast, int, BEAST_CUR_LAYER ),
+			w.data[3][0], w.data[3][1], w.data[3][2], g_cur->beast->m_animIndex,
 			(int) g_cur->moving, g_cur->moveSpeed, g_cur->heading * 180.0F / MP_PI );
-		const Vector3f& r = FIELD( g_cur->beast, Vector3f, BEAST_SCALE );
+		const Vector3f& r = g_cur->beast->m_scale;
 		mp_log( "[AT] %s harry (%.1f, %.1f, %.1f) puppet (%.1f, %.1f, %.1f) scale (%.2f, %.2f, %.2f) matrix (%.1f, %.1f, %.1f) state %d\n", tag,
 			harry->m_position.x, harry->m_position.y, harry->m_position.z,
 			g_cur->beast->EICharacter::m_position.x, g_cur->beast->EICharacter::m_position.y, g_cur->beast->EICharacter::m_position.z,
@@ -4688,13 +4647,13 @@ static void LogTelemetry( EIHarry* harry, const char* tag )
 // Gives Harry the raft, pickaxes, torch and TNT (like CheatLab's "give stuff").
 static void GiveTestItems( EIHarry* harry )
 {
-	void** wheel = harry->m_itemHotbar;
+	EInventory* wheel = harry->m_inventory;
 	if ( !wheel ) return;
-	wheel[0] = GetItemObject( ITEM_RAFT );       // Up.
-	wheel[1] = GetItemObject( ITEM_PICKAXES );   // Right.
-	wheel[2] = GetItemObject( ITEM_TORCH );      // Down.
-	wheel[3] = GetItemObject( ITEM_TNT );        // Left.
-	for ( int i = 0; i < 8; i++ ) FIELD( ITEM_TABLE + i * ITEM_ENTRY_SIZE, int, 0x14 ) = 1;   // Unlocked.
+	wheel->m_hotbar[0] = GetItemObject( ITEM_RAFT );       // Up.
+	wheel->m_hotbar[1] = GetItemObject( ITEM_PICKAXES );   // Right.
+	wheel->m_hotbar[2] = GetItemObject( ITEM_TORCH );      // Down.
+	wheel->m_hotbar[3] = GetItemObject( ITEM_TNT );        // Left.
+	for ( int i = 0; i < 8; i++ ) ITEM_TABLE[i].m_unlocked = 1;
 	mp_log( "[AT] Gave raft, pickaxes, torch, TNT.\n" );
 }
 
@@ -4879,7 +4838,7 @@ static void AutotestStep( EIHarry* harry )
 			int layers = 0;
 			for ( int key = 0; key < 4096; key++ ) {
 				if ( o == 1 && (key == MIRROR_LAYERS[0] || key == MIRROR_LAYERS[1]) ) continue;
-				uint8_t* layer = GetAnimLayer( owners[o], key );
+				AnimLayer* layer = GetAnimLayer( owners[o], key );
 				if ( !layer ) continue;
 				layers++;
 				uint32_t crc = GetLayerClipCRC( layer );
@@ -5031,10 +4990,10 @@ static void AutotestStep( EIHarry* harry )
 				float dx = b->EIBeast::m_position.x - cam.data[3][0], dy = b->EIBeast::m_position.y - cam.data[3][1], dz = b->EIBeast::m_position.z - cam.data[3][2];
 				float d = sqrtf( dx * dx + dy * dy + dz * dz );
 				int renders = g_puppetPoseCopies - posesAt; posesAt = g_puppetPoseCopies;
-				float a = FIELD( b, float, 0x1C );
+				float a = b->m_opacityFinal;
 				if ( renders > 0 && t > 12000 ) { if ( d > maxDepthDrawn ) maxDepthDrawn = d; if ( a < minAlphaDrawn ) minAlphaDrawn = a; }
-				mp_log( "[AT] Distance %5u ms : the other's puppet %.1f from the camera, rendered %d, game fade %.2f, +1C %.2f +20 %.2f +24 %.2f +28 %.2f, +628 %.1f, tag depth %.1f\n",
-					t, d, renders, g_lastPuppetFade, a, FIELD( b, float, 0x20 ), FIELD( b, float, 0x24 ), FIELD( b, float, 0x28 ), FIELD( b, float, 0x628 ), g_cur->tagDepth );
+				mp_log( "[AT] Distance %5u ms : the other's puppet %.1f from the camera, rendered %d, game fade %.2f, +1C %.2f +20 %.2f +24 %.2f +28 %.2f, tag depth %.1f\n",
+					t, d, renders, g_lastPuppetFade, a, b->m_opacity2, b->m_opacity3, b->m_alphaUser, g_cur->tagDepth );
 			}
 			if ( g_distTest == 3 && ((step == 0 && t >= 15000) || (step == 1 && t >= 20000) || (step == 2 && t >= 25000)) ) {
 				char name[32]; sprintf_s( name, "distw_%d", step ); RequestSnapshot( name ); step++;
@@ -5079,7 +5038,7 @@ static void AutotestStep( EIHarry* harry )
 		static float startYaw, maxDiff, maxDrift, lastYaw, turned; static int samples;
 		float hYaw = atan2f( -harry->m_transformMatrix.data[1][1], -harry->m_transformMatrix.data[1][0] );
 		float tYaw = atan2f( -tg->transform.data[1][1], -tg->transform.data[1][0] );
-		const Matrix4f& w = FIELD( b, Matrix4f, BEAST_WORLD );
+		const Matrix4f& w = b->m_worldMatrix;
 		float pYaw = atan2f( w.data[1][1], w.data[1][0] ) + g_forwardLocalAngle - MP_PI / 2.0F;   // (SetBeastWorld : row 1 = heading - forward + 90 deg.)
 		auto wrap = []( float a ) { while ( a > MP_PI ) a -= 2.0F * MP_PI; while ( a < -MP_PI ) a += 2.0F * MP_PI; return a; };
 		if ( step == 0 ) {
@@ -5828,7 +5787,7 @@ static void AutotestStep( EIHarry* harry )
 			g_testOutfit = step;
 			if ( t < 2500 ) break;
 
-			bool ok = g_cur->shownOutfit == step && FIELD( b, uint32_t, BEAST_MODEL ) == OUTFITS[step].model;
+			bool ok = g_cur->shownOutfit == step && b->m_modelCRC == OUTFITS[step].model;
 			mp_log( "[AT] Outfit : the puppet as %s : %s\n", OUTFITS[step].name, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			char name[40];
@@ -5847,7 +5806,7 @@ static void AutotestStep( EIHarry* harry )
 		else if ( step == 100 ) {
 			if ( t < 9000 ) break;
 			bool ok = g_myWornOutfit == SNOWY_OUTFIT;
-			mp_log( "[AT] Outfit : Snowy Harry chosen, after the level loaded again (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			mp_log( "[AT] Outfit : Snowy Harry chosen, after the level loaded again (model 0x%.8X) : %s\n", harry->m_modelCRC, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_6_snowy" );
 			g_myOutfit = 0;   // Then Harry, in a snowy level (Spinja Lair) : still the jungle clothes.
@@ -5857,8 +5816,8 @@ static void AutotestStep( EIHarry* harry )
 		}
 		else if ( step == 101 ) {
 			if ( t < 12000 ) break;
-			bool ok = Gizmod::getCurrentLevelCRC() == 0x7652BAFC && g_myWornOutfit == 0 && FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[0].model;
-			mp_log( "[AT] Outfit : Harry chosen, in a snowy level (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			bool ok = Gizmod::getCurrentLevelCRC() == 0x7652BAFC && g_myWornOutfit == 0 && harry->m_modelCRC == OUTFITS[0].model;
+			mp_log( "[AT] Outfit : Harry chosen, in a snowy level (model 0x%.8X) : %s\n", harry->m_modelCRC, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_7_harry_in_snow" );
 			g_myOutfit = OUTFIT_DEFAULT;   // Then Default there : the snowy clothes, as the game has it.
@@ -5869,7 +5828,7 @@ static void AutotestStep( EIHarry* harry )
 		else if ( step == 102 ) {
 			if ( t < 12000 ) break;
 			bool ok = g_myWornOutfit == SNOWY_OUTFIT;
-			mp_log( "[AT] Outfit : Default chosen, in a snowy level (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			mp_log( "[AT] Outfit : Default chosen, in a snowy level (model 0x%.8X) : %s\n", harry->m_modelCRC, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_8_default_in_snow" );
 			step = 103; phaseStart = now;
@@ -5880,8 +5839,8 @@ static void AutotestStep( EIHarry* harry )
 		}
 		else if ( step == NUM_OUTFITS + 1 ) {
 			if ( t < 9000 ) break;
-			bool ok = g_myWornOutfit == 3 && FIELD( harry, uint32_t, HARRY_MODEL ) == OUTFITS[3].model;
-			mp_log( "[AT] Outfit : Harry after the level loaded again (model 0x%.8X) : %s\n", FIELD( harry, uint32_t, HARRY_MODEL ), ok ? "ok" : "WRONG" );
+			bool ok = g_myWornOutfit == 3 && harry->m_modelCRC == OUTFITS[3].model;
+			mp_log( "[AT] Outfit : Harry after the level loaded again (model 0x%.8X) : %s\n", harry->m_modelCRC, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			SpawnPuppet( harry );   // It replays us : Retro too.
 			static const uint8_t TEST[RETRO_PARTS][3] = { { 245, 245, 245 }, { 255, 161, 123 }, { 220, 50, 40 }, { 50, 100, 220 } };
@@ -6115,7 +6074,7 @@ static void AutotestStep( EIHarry* harry )
 			const AnimNote* n = g_animIndex < g_animNoteCount ? &g_animNotes[g_animIndex] : 0;
 			mp_log( "[AT] Viewer %s : open %d, clip #%d 0x%.8X star %d, playing 0x%.8X on layer %d.\n", SCRIPT[step].shot,
 				(int) g_animViewer, n ? n->num : -1, n ? n->crc : 0, n ? (int) n->star : -1,
-				g_viewerPeer ? g_viewerPeer->mirrorClip : 0, g_cur->beast ? FIELD( g_cur->beast, int, BEAST_CUR_LAYER ) : -1 );
+				g_viewerPeer ? g_viewerPeer->mirrorClip : 0, g_cur->beast ? g_cur->beast->m_animIndex : -1 );
 		}
 		step++;
 		break;
@@ -6365,7 +6324,7 @@ static void AutotestStep( EIHarry* harry )
 				GiveTestItems( harry );
 				g_puppetOffset.x = -6.0F;   // On Harry's right-hand side, which holds the items.
 			}
-			if ( STEPS[step].upItem != KEEP ) harry->m_itemHotbar[0] = STEPS[step].upItem == EMPTY ? 0 : GetItemObject( STEPS[step].upItem );
+			if ( STEPS[step].upItem != KEEP ) harry->m_inventory->m_hotbar[0] = STEPS[step].upItem == EMPTY ? 0 : GetItemObject( STEPS[step].upItem );
 			if ( STEPS[step].key && STEPS[step].move ) {
 				InterlockedExchange( &g_holdMs, 3500 );   // Held past the check, so the puppet still shows it.
 				InterlockedExchange( &g_holdKey, STEPS[step].key );
@@ -6397,10 +6356,9 @@ static void AutotestStep( EIHarry* harry )
 		else if ( !snapped && t >= 4000 ) {   // Past the replay delay.
 			int i = step - 1;
 			int held = GetHeldItem( harry );
-			void* m0 = g_cur->beast ? g_cur->beast->m_pickaxeModel0 : 0;
-			void* m1 = g_cur->beast ? g_cur->beast->m_pickaxeModel1 : 0;
-			bool shown = (m0 && (FIELD( m0, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE))
-			          || (m1 && (FIELD( m1, uint32_t, INSTANCE_FLAGS ) & INSTANCE_VISIBLE));
+			EInstance* m0 = g_cur->beast ? g_cur->beast->m_pickaxeModel0 : 0;
+			EInstance* m1 = g_cur->beast ? g_cur->beast->m_pickaxeModel1 : 0;
+			const bool shown = (m0 && (m0->m_flags & INSTANCE_VISIBLE)) || (m1 && (m1->m_flags & INSTANCE_VISIBLE));
 			int draws = g_puppetItemDraws - drawsAtStart;   // Puppet copies drawn over the last 0.9 s.
 			int poses = g_puppetPoseCopies - posesAtStart;
 			int want = STEPS[i].expect;
@@ -6445,7 +6403,7 @@ static void AutotestStep( EIHarry* harry )
 				m.data[0][0], m.data[0][1], m.data[0][2], m.data[1][0], m.data[1][1], m.data[1][2], m.data[2][0], m.data[2][1], m.data[2][2],
 				m.data[3][0], m.data[3][1], m.data[3][2],
 				rb.data[0][0], rb.data[0][1], rb.data[0][2], rb.data[2][0], rb.data[2][1], rb.data[2][2], rb.data[3][0], rb.data[3][1], rb.data[3][2],
-				g_cur->beast ? FIELD( g_cur->beast, Matrix4f, BEAST_WORLD ).data[3][2] : 0.0F );
+				g_cur->beast ? g_cur->beast->m_worldMatrix.data[3][2] : 0.0F );
 			lastLog = now;
 		}
 		if ( (!snapped && t >= 1500) || (snapped && t >= 2300 && t < 2360) ) {
@@ -6683,8 +6641,8 @@ static void ApplyPuppetOutfit( EIEvilHarryP* p )
 	if ( g_testOutfit >= 0 ) outfit = g_testOutfit;
 	if ( outfit == g_cur->shownOutfit ) return;
 	uint32_t model = OUTFITS[outfit].model;
-	FIELD( p, uint32_t, BEAST_MODEL ) = model;
-	FIELD( p, uint32_t, CHAR_MODEL_SET ) = model;
+	p->m_modelCRC = model;
+	p->m_characterCRC = model;
 	((void (__thiscall *)( void*, uint32_t )) 0x60F770)( p, model );
 	mp_log( "[MP] Player %d's puppet wears the %s outfit.\n", g_cur->id, OUTFITS[outfit].name );
 	g_cur->shownOutfit = outfit;
@@ -7767,14 +7725,14 @@ public:
 
 		register_types();
 
-		uint32_t harrySlot = VTABLE_HARRY + VTABLE_SLOT_TICK;
-		uint32_t evilSlot  = VTABLE_EVILHARRY_P + VTABLE_SLOT_TICK;
-
-		g_origHarryTick     = injector::ReadMemory<TickFunc>( harrySlot, true );
+		// Replace Harry and Evil Harry tick functions with our own.
+		const uint32_t harrySlot = EIHarry::VTABLE + VTABLE_SLOT_TICK;
+		const uint32_t evilSlot  = EIEvilHarryP::VTABLE + VTABLE_SLOT_TICK;
+		g_origHarryTick = injector::ReadMemory<TickFunc>( harrySlot, true );
 		g_origEvilHarryTick = injector::ReadMemory<TickFunc>( evilSlot, true );
-
 		injector::WriteMemory( harrySlot, &HarryTick_Hook, true );
-		injector::WriteMemory( evilSlot,  &EvilHarryTick_Hook, true );
+		injector::WriteMemory( evilSlot, &EvilHarryTick_Hook, true );
+
 		InstallItemDrawHooks();
 		InstallPitHooks();
 		InstallFadeHooks();
