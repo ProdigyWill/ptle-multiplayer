@@ -4352,13 +4352,17 @@ static void EmoteKeys( uint8_t* keys )
 			if ( (raw[k] & 0x80) && !(before[k] & 0x80) && !KeyKeepsEmote( k ) ) { if ( !g_emoteCancel ) g_emoteCancel = "a key"; break; }
 		if ( EmoteHoldsHarry() ) for ( int k = 1; k < 256; k++ ) if ( !KeyKeepsEmote( k ) ) keys[k] = 0;
 	}
-	// The arrows : not for the game while they point the wheel, nor after, until they're let go.
+	// The arrows (and the game's right stick keys) : not for the game while the wheel is out, nor
+	// after, until they're let go. Whichever opened it : a controller's right stick can come as
+	// the arrows too (JoyToKey and the like).
+	int stickKeys[8];
+	for ( int i = 0; i < 4; i++ ) { stickKeys[i] = DIK_ARROWS[i]; stickKeys[4 + i] = ((const int*) KEY_BINDINGS)[4 + i]; }
 	static bool arrowsHeld = false;
 	bool anyArrow = false;
-	for ( int i = 0; i < 4; i++ ) anyArrow |= (raw[DIK_ARROWS[i]] & 0x80) != 0;
-	if ( g_wheelUi.open && !g_wheelUi.byPad ) arrowsHeld = true;
+	for ( int i = 0; i < 8; i++ ) if ( stickKeys[i] > 0 && stickKeys[i] < 256 ) anyArrow |= (raw[stickKeys[i]] & 0x80) != 0;
+	if ( g_wheelUi.open ) arrowsHeld = true;
 	else if ( !anyArrow ) arrowsHeld = false;
-	if ( arrowsHeld ) for ( int i = 0; i < 4; i++ ) keys[DIK_ARROWS[i]] = 0;
+	if ( arrowsHeld ) for ( int i = 0; i < 8; i++ ) if ( stickKeys[i] > 0 && stickKeys[i] < 256 ) keys[stickKeys[i]] = 0;
 	if ( held ) keys[g_emoteKey] = 0;
 	memcpy( before, raw, sizeof(before) );
 }
@@ -5465,10 +5469,16 @@ static void AutotestStep( EIHarry* harry )
 		}
 		// The wheel, by controller : L1, the right stick to the right (Running Man), R1 twice, let go.
 		else if ( step == 9 && t >= 2500 ) { g_testPad[PAD_BUTTONS + 4] = 0x80; step = 10; phaseStart = now; }
-		else if ( step == 10 && t >= 300 ) { *(LONG*) (g_testPad + 0x0C) = 1000; *(LONG*) (g_testPad + 0x18) = 1000; step = 11; phaseStart = now; }
+		else if ( step == 10 && t >= 300 ) {
+			*(LONG*) (g_testPad + 0x0C) = 1000; *(LONG*) (g_testPad + 0x18) = 1000;
+			arrowFrames = (uint32_t) g_testArrowFrames;
+			SendKey( VK_RIGHT, true );   // As JoyToKey sends it, from the same stick.
+			step = 11; phaseStart = now;
+		}
 		else if ( step == 11 && t >= 400 ) {
 			Local::Check( "L1 + the right stick : the wheel, Running Man picked", WheelShown() && g_wheelUi.byPad && g_wheelUi.hover == 2 );
 			Local::Check( "the game doesn't get the right stick (nor the slider it can be on)", *(LONG*) (0x940B78 + 0x0C) == 0 && *(LONG*) (0x940B78 + 0x18) == 0 );
+			Local::Check( "nor the arrows (JoyToKey's right stick)", (uint32_t) g_testArrowFrames == arrowFrames );
 			RequestSnapshot( "emote_4_wheel" );
 			step = 12; phaseStart = now;
 		}
@@ -5487,7 +5497,8 @@ static void AutotestStep( EIHarry* harry )
 		}
 		else if ( step == 16 && t >= 300 ) { g_testPad[PAD_BUTTONS + 4] = 0; step = 17; phaseStart = now; }
 		else if ( step == 17 && t >= 300 ) {
-			Local::Check( "nor after, while it's still pushed", *(LONG*) (0x940B78 + 0x0C) == 0 && *(LONG*) (0x940B78 + 0x18) == 0 );
+			Local::Check( "nor after, while it's still pushed", *(LONG*) (0x940B78 + 0x0C) == 0 && *(LONG*) (0x940B78 + 0x18) == 0 && (uint32_t) g_testArrowFrames == arrowFrames );
+			SendKey( VK_RIGHT, false );
 			*(LONG*) (g_testPad + 0x0C) = 0;
 			*(LONG*) (g_testPad + 0x18) = 0;
 			Local::Check( "letting go of L1 plays it", !g_wheelUi.open && g_emote.active && g_emote.emote == running );
