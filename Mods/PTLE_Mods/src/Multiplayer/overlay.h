@@ -19,6 +19,7 @@ float OverlayTextWidth( const char* text );
 // ARGB colors. The text gets a dark shadow.
 void OverlayText( float x, float y, const char* text, uint32_t color );
 void OverlayRect( float x, float y, float w, float h, uint32_t color );
+void OverlayTriangle( float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color );
 
 // Draws what was queued and restores the game's state.
 void OverlayEnd();

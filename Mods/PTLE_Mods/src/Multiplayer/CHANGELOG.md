@@ -19,6 +19,14 @@ title; players with another version are marked on its Players page.
   as a seeker, and everyone sees who caught whom. Only seekers have name tags,
   and the player lists say "hiding" instead of where a hider is. There's no
   head start or area limit in the game : agree on those among yourselves.
+- **Emotes** : hold **L1 / LB**, point the right stick at an emote on the wheel
+  and let go to play it (keyboard : hold **T**, point the mouse or press 1 - 8).
+  **R1** (Tab) flips to your next wheel. Everyone sees you dance. Loops keep going
+  until you move or press anything; you need to be standing still with no item
+  out to start one. F1 → **Emotes** builds your wheels (up to 4 of 8) from all of
+  Harry's animations, with a search, categories and a preview beside you. Two
+  wheels to start with : Party and Silly. The buttons can be changed on the Keys
+  page, including **needs R1 too** (L1 + R1) if L1 alone gets in your way.
 - Messages ("Bob joined", "F1 : menu"...) now show at the bottom of the screen.
 - Outfit **Default** : Harry wears what the area gives him, jungle or snowy
   clothes, as in the game. **Harry** now always means the jungle clothes, even in

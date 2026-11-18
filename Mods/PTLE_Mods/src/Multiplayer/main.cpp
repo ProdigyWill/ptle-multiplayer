@@ -345,6 +345,7 @@ static int g_aimTest = 0;   // 2 : with the raft out instead (Down looks from Ha
                    // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
 static int g_distTest = 0;                        // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn; two games : 2 runs away, 3 watches. PTLE_MP_FADEALLOW=1 : puppets fade as before.
 static bool g_allowPuppetFade = false;
+static int g_emoteTest = 0;                      // PTLE_MP_EMOTETEST=1 : emotes, one game.
 static int g_hsTest = 0;                         // PTLE_MP_HSTEST=1 : hide and seek, one game (role, hide time).
 static bool g_skinTest = false;                  // PTLE_MP_SKINTEST=1 : the autotest puts each outfit's model on the puppet.
 static bool g_menuTest = false;                  // PTLE_MP_MENUTEST=1 : the autotest drives the menu (F1).
@@ -643,7 +644,14 @@ static bool g_animViewer = false;
 static Peer* g_viewerPeer = 0;          // The puppet it uses.
 static Vector3f g_viewerPin;            // Where that puppet stands.
 
-static bool IsViewerPeer( const Peer* p ) { return g_animViewer && p == g_viewerPeer; }
+// The Emotes page's preview uses the same : g_viewerPeer, while it's choosing. Between
+// previews its puppet is parked out of sight (not drawn, far below), kept for the next.
+static bool g_emotePreview = false;
+static Peer* g_parkedPeer = 0;
+static Vector3f g_parkedPin;
+
+static bool IsParkedPeer( const Peer* p ) { return p && p == g_parkedPeer && !((g_animViewer || g_emotePreview) && p == g_viewerPeer); }
+static bool IsViewerPeer( const Peer* p ) { return ((g_animViewer || g_emotePreview) && p == g_viewerPeer) || IsParkedPeer( p ); }
 
 // The clip the current peer's puppet is made to play (survey, viewer), else 0.
 static uint32_t ForcedClip()
@@ -1395,6 +1403,7 @@ static bool GetPuppetTargetPosition( Vector3f* out )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
 	if ( !t ) return false;
+	if ( IsParkedPeer( g_cur ) ) { *out = g_parkedPin; return true; }
 	if ( IsViewerPeer( g_cur ) ) { *out = g_viewerPin; return true; }
 	if ( g_puppetPinned ) {
 		*out = g_puppetPin;
@@ -2280,6 +2289,7 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 		return;
 	}
 	CurrentPeer current( peer );
+	if ( IsParkedPeer( peer ) ) return;   // The emote preview's, between previews.
 	const PlayerSnapshot* t = GetPuppetTarget();
 	// Online with nobody to show here (they left, or are in another level) : not drawn.
 	if ( g_networked && !t ) return;
@@ -2454,7 +2464,7 @@ static const int TAG_FADE_MAX = 1000, TAG_FADE_STEP = 10;
 static int g_tagFadeFrom = 100, g_tagFadeTo = 200;
 static bool g_showList = false;   // The player list stays on screen while playing.
 static char g_iniPath[MAX_PATH] = { 0, };
-enum { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_PREV, MK_COUNT };
+enum { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_PREV, MK_DELETE, MK_PGUP, MK_PGDN, MK_SLEFT, MK_SRIGHT, MK_COUNT };
 static volatile LONG g_menuKeys[MK_COUNT];   // Presses, from the hotkey thread.
 static volatile LONG g_menuOpen = 0;         // For the hotkey thread and the keyboard poll.
 static volatile DWORD g_menuBlockUntil = 0;  // Keys stay away from the game a moment after it closes (the Esc that closed it).
@@ -2509,14 +2519,14 @@ static void WriteClipboard( const char* text )
 	else GlobalFree( h );
 }
 
-// The keys that type : digits, letters, space, comma, #, ( ), backspace.
+// The keys that type : digits, letters (Shift : capitals), space, , . - ' # ( ) !, backspace.
 static void PollTyping( bool active )
 {
 	static bool was[256] = { false, };
 	bool ctrl = (GetAsyncKeyState( VK_CONTROL ) & 0x8000) != 0, shift = (GetAsyncKeyState( VK_SHIFT ) & 0x8000) != 0;
 	for ( int vk = 0x08; vk < 0xE0; vk++ ) {
 		bool typing = (vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
-			|| vk == VK_SPACE || vk == VK_OEM_COMMA || vk == VK_BACK;
+			|| vk == VK_SPACE || vk == VK_OEM_COMMA || vk == VK_OEM_PERIOD || vk == VK_OEM_MINUS || vk == VK_OEM_7 || vk == VK_BACK;
 		if ( !typing ) continue;
 		bool down = active && (GetAsyncKeyState( vk ) & 0x8000) != 0;
 		if ( down && !was[vk] ) {
@@ -2529,11 +2539,15 @@ static void PollTyping( bool active )
 				if ( vk == VK_BACK ) c = '\b';
 				else if ( vk == VK_SPACE ) c = ' ';
 				else if ( vk == VK_OEM_COMMA ) c = ',';
+				else if ( vk == VK_OEM_PERIOD ) c = '.';
+				else if ( vk == VK_OEM_MINUS ) c = '-';
+				else if ( vk == VK_OEM_7 ) c = '\'';
+				else if ( vk == '1' && shift ) c = '!';
 				else if ( vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9 ) c = (char) ('0' + vk - VK_NUMPAD0);
 				else if ( vk == '3' && shift ) c = '#';
 				else if ( vk == '9' && shift ) c = '(';
 				else if ( vk == '0' && shift ) c = ')';
-				else if ( vk >= 'A' && vk <= 'Z' ) c = (char) (vk - 'A' + 'a');
+				else if ( vk >= 'A' && vk <= 'Z' ) c = (char) (vk - 'A' + (shift ? 'A' : 'a'));
 				else c = (char) vk;
 				AddTyped( c );
 			}
@@ -2588,16 +2602,24 @@ static DWORD WINAPI HotkeyThread( void* )
 			wasDown[i] = down;
 		}
 
-		// The menu's keys, while it's open. Held arrows repeat.
-		static const int MENU_VK[7] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB };
-		static bool menuDown[7] = { false, };
-		static DWORD menuNext[7];
+		// The menu's keys, while it's open. Held arrows (and Page Up / Down) repeat; with
+		// Shift, Tab goes back and Left / Right are the Shift ones.
+		static const int NUM_MENU_VK = 10;
+		static const int MENU_VK[NUM_MENU_VK] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB, VK_DELETE, VK_PRIOR, VK_NEXT };
+		static const int MENU_SLOT[NUM_MENU_VK] = { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_DELETE, MK_PGUP, MK_PGDN };
+		static bool menuDown[NUM_MENU_VK] = { false, };
+		static DWORD menuNext[NUM_MENU_VK];
 		bool menu = g_menuOpen && GameHasFocus();
-		for ( int i = 0; i < 7; i++ ) {
+		bool shift = (GetAsyncKeyState( VK_SHIFT ) & 0x8000) != 0;
+		for ( int i = 0; i < NUM_MENU_VK; i++ ) {
 			bool down = menu && (GetAsyncKeyState( MENU_VK[i] ) & 0x8000) != 0;
 			DWORD now = GetTickCount();
-			if ( down && (!menuDown[i] || (i < 4 && (int) (now - menuNext[i]) >= 0)) ) {
-				int slot = (i == 6 && (GetAsyncKeyState( VK_SHIFT ) & 0x8000)) ? MK_PREV : i;
+			bool repeats = i < 4 || i >= 8;
+			if ( down && (!menuDown[i] || (repeats && (int) (now - menuNext[i]) >= 0)) ) {
+				int slot = MENU_SLOT[i];
+				if ( shift && slot == MK_NEXT ) slot = MK_PREV;
+				if ( shift && slot == MK_LEFT ) slot = MK_SLEFT;
+				if ( shift && slot == MK_RIGHT ) slot = MK_SRIGHT;
 				InterlockedIncrement( &g_menuKeys[slot] );
 				menuNext[i] = now + (menuDown[i] ? 70 : 350);
 			}
@@ -2757,6 +2779,7 @@ static void CloseAnimViewer( const char* why )
 
 static void OpenAnimViewer( EIHarry* harry )
 {
+	if ( g_emotePreview ) { Toast( "Close the menu first" ); return; }
 	// Its puppet : offline the main one (it replays Harry); online one of a free
 	// player slot, so other players' puppets are left alone.
 	Peer* vp = MainPeer();
@@ -2836,6 +2859,523 @@ static void HandleAnimViewer( EIHarry* harry )
 	}
 }
 
+// --------------------------------------------------------------------------------
+// Emotes : Harry plays one of his own clips, the game's own animation held at no
+// weight meanwhile. The others see it as they see everything Harry does (his pose
+// and clip go in the snapshot). The clips are the catalogue's (emotes_data.h, made
+// by make-emotes.py from the animation notes); up to 4 wheels of 8 hold the ones
+// a player picked.
+// --------------------------------------------------------------------------------
+struct EmoteDef
+{
+	const char* id;        // Chains : their name in the ini (the others go by their clip).
+	const char* name;
+	int category;          // EMOTE_CATEGORIES.
+	bool loops;            // Plays again until Harry moves.
+	bool favourite;
+	uint32_t intro;        // Chains : played once first, then the clip loops.
+	uint32_t clip;
+};
+#include "emotes_data.h"
+
+static const int MAX_WHEELS = 4, WHEEL_SLOTS = 8, WHEEL_NAME_SIZE = 24;
+struct EmoteWheel
+{
+	char name[WHEEL_NAME_SIZE];
+	int slot[WHEEL_SLOTS];   // EMOTES index, -1 : empty. Clockwise from the top.
+};
+static EmoteWheel g_wheels[MAX_WHEELS];
+static int g_wheelCount = 0;
+static int g_emoteButton = 4;        // DirectInput button held for the wheel : L1 / LB.
+static bool g_emoteNeedsR1 = false;  // ... with R1 / RB too.
+static int g_emoteKey = 0x14;        // DirectInput key code : T.
+static int g_wheelIndex = 0;         // The wheel up in the game (kept between openings).
+
+static int FindEmoteByName( const char* name )
+{
+	for ( int i = 0; name && i < NUM_EMOTES; i++ ) if ( _stricmp( EMOTES[i].name, name ) == 0 ) return i;
+	return -1;
+}
+
+// In the ini : a chain's id, a clip's CRC (hex), "-" for nothing.
+static int FindEmoteByCode( const char* code )
+{
+	if ( !code[0] || strcmp( code, "-" ) == 0 ) return -1;
+	for ( int i = 0; i < NUM_EMOTES; i++ ) if ( EMOTES[i].id && _stricmp( EMOTES[i].id, code ) == 0 ) return i;
+	char* end = 0;
+	unsigned long crc = strtoul( code, &end, 16 );
+	if ( !end || *end ) return -1;
+	for ( int i = 0; i < NUM_EMOTES; i++ ) if ( !EMOTES[i].id && EMOTES[i].clip == crc ) return i;
+	return -1;
+}
+
+static void EmoteCode( int e, char* out, size_t size )
+{
+	if ( e < 0 || e >= NUM_EMOTES ) strcpy_s( out, size, "-" );
+	else if ( EMOTES[e].id ) strcpy_s( out, size, EMOTES[e].id );
+	else sprintf_s( out, size, "%.8X", EMOTES[e].clip );
+}
+
+// The wheels everyone starts with (Reset puts them back; the others start empty).
+static void DefaultWheel( int w )
+{
+	static const char* const PARTY[WHEEL_SLOTS] = { "Victory Dance", "Jig", "Running Man", "Breakdance", "Pickaxe Spin", "Teleport Zen", "Scratch Butt", "T-Pose" };
+	static const char* const SILLY[WHEEL_SLOTS] = { "Bug Buzz", "Dizzy Walk", "Poison Gas Walk", "Death", "Death 2", "Breakdance Finish", 0, 0 };
+	EmoteWheel& wheel = g_wheels[w];
+	if ( w == 0 ) strcpy_s( wheel.name, "Party" );
+	else if ( w == 1 ) strcpy_s( wheel.name, "Silly" );
+	else sprintf_s( wheel.name, "Wheel %d", w + 1 );
+	for ( int s = 0; s < WHEEL_SLOTS; s++ ) wheel.slot[s] = w == 0 ? FindEmoteByName( PARTY[s] ) : w == 1 ? FindEmoteByName( SILLY[s] ) : -1;
+}
+
+// [Emotes] Wheels=N, WheelK=Name|slot,slot,... (each : EmoteCode).
+static void LoadWheels( const char* ini )
+{
+	for ( int w = 0; w < MAX_WHEELS; w++ ) DefaultWheel( w );
+	g_wheelCount = GetPrivateProfileIntA( "Emotes", "Wheels", 0, ini );
+	if ( g_wheelCount <= 0 || g_wheelCount > MAX_WHEELS ) { g_wheelCount = 2; return; }
+	for ( int w = 0; w < g_wheelCount; w++ ) {
+		char key[16], line[512];
+		sprintf_s( key, "Wheel%d", w + 1 );
+		if ( !GetPrivateProfileStringA( "Emotes", key, "", line, sizeof(line), ini ) ) continue;
+		char* bar = strchr( line, '|' );
+		if ( !bar ) continue;
+		*bar = 0;
+		strncpy_s( g_wheels[w].name, line, _TRUNCATE );
+		char* next = bar + 1;
+		for ( int s = 0; s < WHEEL_SLOTS; s++ ) {
+			char* comma = next ? strchr( next, ',' ) : 0;
+			if ( comma ) *comma = 0;
+			g_wheels[w].slot[s] = next ? FindEmoteByCode( next ) : -1;
+			next = comma ? comma + 1 : 0;
+		}
+	}
+}
+
+static void SaveWheels( const char* ini )
+{
+	char n[16], key[16], line[512];
+	sprintf_s( n, "%d", g_wheelCount );
+	WritePrivateProfileStringA( "Emotes", "Wheels", n, ini );
+	for ( int w = 0; w < MAX_WHEELS; w++ ) {
+		sprintf_s( key, "Wheel%d", w + 1 );
+		if ( w >= g_wheelCount ) { WritePrivateProfileStringA( "Emotes", key, 0, ini ); continue; }
+		strcpy_s( line, g_wheels[w].name );
+		for ( char* c = line; *c; c++ ) if ( *c == '|' ) *c = '/';
+		strcat_s( line, "|" );
+		for ( int s = 0; s < WHEEL_SLOTS; s++ ) {
+			char code[32];
+			EmoteCode( g_wheels[w].slot[s], code, sizeof(code) );
+			if ( s ) strcat_s( line, "," );
+			strcat_s( line, code );
+		}
+		WritePrivateProfileStringA( "Emotes", key, line, ini );
+	}
+}
+
+static const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (his own go up to 253), taking turns.
+static const uint32_t LAYER_TIME = 0x38;            // float : seconds played.
+static const uint32_t LAYER_FRAME = 0x3C;           // float : where in the clip (it stops at the end).
+static const uint32_t LAYER_TARGET = 0x60;          // float : the weight the game set it to (or is fading it to; +0x9C : fading).
+static const float EMOTE_MOVE = 0.5F;               // Harry got moved this far from where he started : over.
+
+struct EmoteState
+{
+	bool active;
+	int emote;            // EMOTES index.
+	uint32_t clip;        // Playing now (a chain's intro, then its clip).
+	bool loop;
+	int slot;             // Which of EMOTE_LAYERS.
+	bool started;
+	float lastFrame;      // The layer's frame ...
+	float frameTime;      // ... and its clock when the frame last moved (it stops at the end, the clock doesn't).
+	int plays;
+	uint32_t start;       // NetNowMs.
+	Vector3f where;       // Harry, at the start.
+	int health;
+};
+static EmoteState g_emote;
+static int g_emoteRequest = -1;           // EMOTES index : the wheel's choice, played on Harry's next tick.
+static const char* g_emoteCancel = 0;     // Set by the input hooks (a button, a key) : over, on the next tick.
+static const char* g_emoteLastEnd = "";   // Why the last one ended (tests).
+static const char* g_emoteRefused = "";   // Why the last one didn't start (tests).
+static Vector3f g_stillAt;                // Harry standing still : where ...
+static uint32_t g_stillSince = 0;         // ... and since when.
+
+static void BeginClip( uint32_t clip, bool loop )
+{
+	g_emote.clip = clip;
+	g_emote.loop = loop;
+	g_emote.slot = 1 - g_emote.slot;
+	g_emote.started = false;
+	g_emote.lastFrame = -1.0F;
+	g_emote.frameTime = 0.0F;
+}
+
+static void StartEmote( EIHarry* harry, int e )
+{
+	const EmoteDef& d = EMOTES[e];
+	g_emote.active = true;
+	g_emote.emote = e;
+	g_emote.plays = 0;
+	g_emote.start = NetNowMs();
+	g_emote.where = harry->m_position;
+	g_emote.health = harry->m_healthValue;
+	g_emoteCancel = 0;
+	BeginClip( d.intro ? d.intro : d.clip, d.intro ? false : d.loops );
+	mp_log( "[EM] Emote : %s (clip 0x%.8X%s%s).\n", d.name, d.clip, d.intro ? ", after its intro" : "", d.loops ? ", loops" : "" );
+}
+
+static void StopEmote( EIHarry* harry, const char* why )
+{
+	if ( !g_emote.active ) return;
+	g_emote.active = false;
+	g_emoteLastEnd = why;
+	if ( harry ) {   // Ours out, the game's own layers back at the weights it wants (it only sets them when it changes them).
+		EAnimController* ctrl = &FIELD( harry, EAnimController, CHAR_ANIMCTRL );
+		for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
+			uint8_t* layer = GetAnimLayer( harry, i );
+			if ( !layer ) continue;
+			if ( i == EMOTE_LAYERS[0] || i == EMOTE_LAYERS[1] ) AnimCtrl_FadeTo( ctrl, i, 0.0F );
+			else *(float*) (layer + LAYER_WEIGHT) = *(float*) (layer + LAYER_TARGET);
+		}
+	}
+	mp_log( "[EM] Emote ended (%s) after %u ms, %d play%s.\n", why, NetNowMs() - g_emote.start, g_emote.plays, g_emote.plays == 1 ? "" : "s" );
+}
+
+// Why Harry can't emote now, 0 if he can.
+static const char* WhyNoEmote( EIHarry* harry )
+{
+	if ( harry->m_healthValue <= 0 ) return "You can't emote now";
+	if ( GetHeldItem( harry ) >= 0 ) return "Put your item away to emote";
+	if ( !harry->m_onGround ) return "Land first to emote";
+	if ( NetNowMs() - g_stillSince < 150 ) return "Stand still to emote";
+	return 0;
+}
+
+static void EmoteTick( EIHarry* harry )
+{
+	uint32_t now = NetNowMs();
+	Vector3f at = harry->m_position;
+	float dx = at.x - g_stillAt.x, dy = at.y - g_stillAt.y, dz = at.z - g_stillAt.z;
+	if ( !g_stillSince || dx * dx + dy * dy + dz * dz > 0.05F * 0.05F ) { g_stillAt = at; g_stillSince = now; }
+
+	if ( g_emoteRequest >= 0 ) {
+		int e = g_emoteRequest;
+		g_emoteRequest = -1;
+		const char* why = WhyNoEmote( harry );
+		if ( why ) {
+			g_emoteRefused = why;
+			mp_log( "[EM] No %s : %s.\n", EMOTES[e].name, why );
+			Toast( "%s", why );
+		}
+		else {
+			if ( g_emote.active ) StopEmote( harry, "another one" );
+			StartEmote( harry, e );
+		}
+	}
+	if ( !g_emote.active ) return;
+
+	// Over : a button or a key, Harry moved (pushed, fell), an item came out, he got hurt.
+	const char* over = g_emoteCancel;
+	g_emoteCancel = 0;
+	dx = at.x - g_emote.where.x; dy = at.y - g_emote.where.y; dz = at.z - g_emote.where.z;
+	if ( !over && dx * dx + dy * dy + dz * dz > EMOTE_MOVE * EMOTE_MOVE ) over = "moved";
+	if ( !over && !harry->m_onGround ) over = "off the ground";
+	if ( !over && GetHeldItem( harry ) >= 0 ) over = "an item";
+	if ( !over && harry->m_healthValue < g_emote.health ) over = "hurt";
+	if ( over ) { StopEmote( harry, over ); return; }
+
+	EAnimController* ctrl = &FIELD( harry, EAnimController, CHAR_ANIMCTRL );
+	if ( g_emote.started ) {
+		// At its end (its frame stops, its clock goes on) : again, the chain's loop, or done.
+		uint8_t* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
+		float frame = mine ? *(float*) (mine + LAYER_FRAME) : 0.0F, time = mine ? *(float*) (mine + LAYER_TIME) : 0.0F;
+		if ( frame != g_emote.lastFrame ) { g_emote.lastFrame = frame; g_emote.frameTime = time; }
+		else if ( time - g_emote.frameTime >= 0.25F ) {
+			const EmoteDef& d = EMOTES[g_emote.emote];
+			if ( d.intro && g_emote.clip == d.intro ) BeginClip( d.clip, true );
+			else if ( g_emote.loop ) {
+				AnimCtrl_Restart( ctrl, EMOTE_LAYERS[g_emote.slot] );
+				g_emote.lastFrame = -1.0F;
+				g_emote.plays++;
+			}
+			else { StopEmote( harry, "played" ); return; }
+		}
+	}
+	int key = EMOTE_LAYERS[g_emote.slot];
+	if ( !g_emote.started ) {
+		AnimCtrl_SetClip( ctrl, key, g_emote.clip );
+		AnimCtrl_Restart( ctrl, key );
+		AnimCtrl_FadeTo( ctrl, key, 1.0F );
+		int other = EMOTE_LAYERS[1 - g_emote.slot];
+		if ( GetAnimLayer( harry, other ) ) AnimCtrl_FadeTo( ctrl, other, 0.0F );
+		g_emote.started = true;
+		g_emote.plays++;
+	}
+	uint8_t* mine = GetAnimLayer( harry, key );
+	if ( !mine || GetLayerClipCRC( mine ) != g_emote.clip ) { StopEmote( harry, "the clip didn't load" ); return; }
+	// The game's own layers : no weight; ours : all of it.
+	for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
+		uint8_t* layer = GetAnimLayer( harry, i );
+		if ( !layer ) continue;
+		*(float*) (layer + LAYER_WEIGHT) = (i == key) ? 1.0F : 0.0F;
+	}
+}
+
+// --------------------------------------------------------------------------------
+// The Emotes page (F1) : a wheel's 8 slots round a ring, and choosing an emote for
+// one, with a preview : the animation viewer's puppet beside Harry, playing the
+// highlighted emote again and again.
+// --------------------------------------------------------------------------------
+static int g_editWheel = 0;       // The wheel the page shows.
+static int g_ringSlot = 0;        // Its slot the ring points at.
+static bool g_chooser = false;    // Choosing an emote for that slot.
+static char g_emoteSearch[32] = "";
+static int g_emoteCategory = 0;   // 0 : favourites, 1 : all, then EMOTE_CATEGORIES.
+static int g_listCursor = 0, g_listScroll = 0;
+static int g_listWant = -2;       // EMOTES index to put the list's cursor on (-1 : "Empty slot"; -2 : none).
+static int g_armed = 0;           // Pressed once, to be pressed again : 1 reset, 2 delete.
+static DWORD g_armedAt = 0;
+static int g_previewWant = -2;    // The chooser, each frame : EMOTES index, -1 : none (idle), -2 : no preview.
+static bool g_previewFailed = false;
+static int g_previewShown = -3;
+static float g_previewFrame = -1.0F, g_previewFrameTime = 0.0F;
+static const uint32_t IDLE_CLIP = 0xB23CB6D0;
+static void SetMenuOpen( bool open );
+static void SaveSettings();
+
+static void SetPreviewClip( uint32_t clip )
+{
+	g_animSurveyClip = clip;
+	if ( g_viewerPeer ) g_viewerPeer->mirrorClip = 0;   // Loads it again, from the start.
+	g_previewFrame = -1.0F;
+}
+
+static bool OpenPreview( EIHarry* harry )
+{
+	// Its puppet : the one parked from last time, else one of a free player slot (not
+	// the main one, so a puppet replaying Harry is left alone).
+	Peer* vp = (g_parkedPeer && g_parkedPeer->beast && !g_parkedPeer->target) ? g_parkedPeer : 0;
+	if ( !vp ) {
+		int me = g_transport ? g_transport->PlayerId() : -1;
+		for ( int i = MAX_PEERS - 1; i >= 0 && !vp; i-- )
+			if ( i != me && &g_peers[i] != MainPeer() && !g_players[i].present && !g_peers[i].heard && !g_peers[i].target ) vp = &g_peers[i];
+		if ( !vp ) { Toast( "No room for the preview (8 players)" ); return false; }
+	}
+	g_viewerPeer = vp;
+	g_emotePreview = true;
+	{
+		CurrentPeer current( vp );
+		if ( !vp->beast ) SpawnPuppet( harry );
+	}
+	if ( !vp->beast ) {
+		g_emotePreview = false;
+		g_viewerPeer = 0;
+		mp_log( "[EM] No preview : Evil Harry can't be placed here.\n" );
+		return false;
+	}
+	g_parkedPeer = vp;   // Parked when the preview closes.
+	// Beside Harry as the camera sees him (along its right axis), facing the camera.
+	float rx = 1.0F, ry = 0.0F;
+	if ( g_haveCamera ) {
+		float x = g_cameraWorld.data[0][0], y = g_cameraWorld.data[0][1], l = sqrtf( x * x + y * y );
+		if ( l > 0.01F ) { rx = x / l; ry = y / l; }
+	}
+	g_viewerPin = harry->m_position;
+	g_viewerPin.x += rx * 7.0F;
+	g_viewerPin.y += ry * 7.0F;
+	g_autoLocomotion = true;
+	g_previewShown = -3;
+	mp_log( "[EM] Preview : the puppet of slot %d.\n", vp->id );
+	return true;
+}
+
+static void ClosePreview( const char* why )
+{
+	if ( !g_emotePreview ) return;
+	g_emotePreview = false;
+	g_parkedPin = g_viewerPin;
+	g_parkedPin.z -= 5000.0F;
+	if ( g_viewerPeer ) g_viewerPeer->mirrorClip = 0;
+	g_viewerPeer = 0;
+	g_animSurveyClip = 0;
+	mp_log( "[EM] Preview closed (%s); its puppet is parked.\n", why );
+}
+
+static void EmotePreviewTick( EIHarry* harry )
+{
+	if ( !g_menu.IsOpen() ) { g_chooser = false; g_previewWant = -2; }
+	// A parked puppet whose slot a player took (or that went with the level) : theirs, or gone.
+	if ( g_parkedPeer && !g_emotePreview && (g_parkedPeer->target || !g_parkedPeer->beast || g_players[g_parkedPeer->id].present) ) g_parkedPeer = 0;
+	bool want = g_previewWant >= -1 && !g_animViewer;
+	if ( !want ) { ClosePreview( "done" ); g_previewFailed = false; return; }
+	if ( !g_emotePreview ) {
+		if ( g_previewFailed ) return;
+		if ( !OpenPreview( harry ) ) { g_previewFailed = true; return; }
+	}
+	if ( !g_viewerPeer || !g_viewerPeer->beast ) { ClosePreview( "puppet gone" ); g_previewFailed = true; return; }
+	int e = g_previewWant;
+	if ( e != g_previewShown ) {
+		g_previewShown = e;
+		SetPreviewClip( e < 0 ? IDLE_CLIP : EMOTES[e].intro ? EMOTES[e].intro : EMOTES[e].clip );
+		return;
+	}
+	// At the clip's end (its frame stops, its clock goes on) : again; a chain's intro, its loop.
+	uint8_t* layer = GetAnimLayer( g_viewerPeer->beast, MIRROR_LAYERS[g_viewerPeer->mirrorSlot] );
+	if ( !layer || GetLayerClipCRC( layer ) != g_animSurveyClip ) return;
+	float frame = *(float*) (layer + LAYER_FRAME), time = *(float*) (layer + LAYER_TIME);
+	if ( frame != g_previewFrame ) { g_previewFrame = frame; g_previewFrameTime = time; }
+	else if ( time - g_previewFrameTime >= 0.5F ) {
+		bool intro = e >= 0 && EMOTES[e].intro && g_animSurveyClip == EMOTES[e].intro;
+		SetPreviewClip( intro ? EMOTES[e].clip : g_animSurveyClip );
+	}
+}
+
+static bool EmoteMatches( int e )
+{
+	const EmoteDef& d = EMOTES[e];
+	if ( g_emoteCategory == 0 && !d.favourite ) return false;
+	if ( g_emoteCategory >= 2 && d.category != g_emoteCategory - 2 ) return false;
+	if ( g_emoteSearch[0] ) {
+		char name[96], search[32];
+		int n = 0;
+		for ( const char* c = d.name; *c && n < 95; c++ ) name[n++] = (char) tolower( (unsigned char) *c );
+		name[n] = 0;
+		n = 0;
+		for ( const char* c = g_emoteSearch; *c && n < 31; c++ ) search[n++] = (char) tolower( (unsigned char) *c );
+		search[n] = 0;
+		if ( !strstr( name, search ) ) return false;
+	}
+	return true;
+}
+
+static void OpenChooser()
+{
+	int e = g_wheels[g_editWheel].slot[g_ringSlot];
+	g_chooser = true;
+	g_emoteSearch[0] = 0;
+	g_listCursor = g_listScroll = 0;
+	g_listWant = e;
+	if ( e >= 0 && !EmoteMatches( e ) ) g_emoteCategory = 1;   // All : it's in there.
+	mp_log( "[EM] Choosing an emote : %s, slot %d.\n", g_wheels[g_editWheel].name, g_ringSlot + 1 );
+}
+
+static void EmotesPage()
+{
+	if ( g_editWheel >= g_wheelCount ) g_editWheel = g_wheelCount - 1;
+	if ( g_editWheel < 0 ) g_editWheel = 0;
+	EmoteWheel& wheel = g_wheels[g_editWheel];
+	if ( g_armed && GetTickCount() - g_armedAt > 4000 ) g_armed = 0;
+	if ( !g_chooser ) {
+		g_previewWant = -2;
+		const char* names[MAX_WHEELS];
+		for ( int w = 0; w < g_wheelCount; w++ ) names[w] = g_wheels[w].name[0] ? g_wheels[w].name : "(no name)";
+		if ( g_menu.Choice( "Wheel", &g_editWheel, names, g_wheelCount,
+			"The wheel shown below. In the game, R1 (Tab on the keyboard) goes from one wheel to the next." ) ) g_armed = 0;
+		if ( g_menu.TextField( "Name", wheel.name, WHEEL_NAME_SIZE, "(no name)", "Its name, in the middle of the wheel. Enter, type it, Enter." ) ) SaveSettings();
+		const char* slots[WHEEL_SLOTS];
+		for ( int i = 0; i < WHEEL_SLOTS; i++ ) slots[i] = wheel.slot[i] >= 0 ? EMOTES[wheel.slot[i]].name : 0;
+		int from = 0;
+		switch ( g_menu.Ring( slots, &g_ringSlot, wheel.name, &from,
+			"Enter or a click : choose this slot's emote.  Left / Right : go round.  Delete : empty it.  Shift + Left / Right : move it round." ) ) {
+		case Menu::RING_CHOOSE:
+			OpenChooser();
+			break;
+		case Menu::RING_CLEAR:
+			wheel.slot[g_ringSlot] = -1;
+			SaveSettings();
+			break;
+		case Menu::RING_SWAP: {
+			int moved = wheel.slot[from];
+			wheel.slot[from] = wheel.slot[g_ringSlot];
+			wheel.slot[g_ringSlot] = moved;
+			SaveSettings();
+			break;
+		}
+		}
+		if ( g_menu.Action( "Try it", "Closes the menu and plays this slot's emote (Harry has to be standing still, with no item out)." ) ) {
+			int e = wheel.slot[g_ringSlot];
+			if ( e < 0 ) Toast( "That slot is empty" );
+			else { SetMenuOpen( false ); g_emoteRequest = e; }
+		}
+		if ( g_wheelCount < MAX_WHEELS && g_menu.Action( "+ New wheel", "Another wheel, empty, to fill (up to 4)." ) ) {
+			EmoteWheel& added = g_wheels[g_wheelCount];
+			sprintf_s( added.name, "Wheel %d", g_wheelCount + 1 );
+			for ( int i = 0; i < WHEEL_SLOTS; i++ ) added.slot[i] = -1;
+			g_editWheel = g_wheelCount++;
+			g_armed = 0;
+			SaveSettings();
+		}
+		if ( g_menu.Action( g_armed == 1 ? "Reset this wheel : press again" : "Reset this wheel",
+			"Puts it back as it was at first (Party and Silly; the others empty). Press twice." ) ) {
+			if ( g_armed == 1 ) {
+				char name[WHEEL_NAME_SIZE];
+				strcpy_s( name, wheel.name );
+				DefaultWheel( g_editWheel );
+				if ( g_editWheel >= 2 ) strcpy_s( wheel.name, name );
+				g_armed = 0;
+				SaveSettings();
+				Toast( "Wheel reset" );
+			}
+			else { g_armed = 1; g_armedAt = GetTickCount(); }
+		}
+		if ( g_wheelCount > 1 && g_menu.Action( g_armed == 2 ? "Delete this wheel : press again" : "Delete this wheel", "Gone for good. Press twice." ) ) {
+			if ( g_armed == 2 ) {
+				for ( int w = g_editWheel; w < g_wheelCount - 1; w++ ) g_wheels[w] = g_wheels[w + 1];
+				g_wheelCount--;
+				if ( g_editWheel >= g_wheelCount ) g_editWheel = g_wheelCount - 1;
+				if ( g_wheelIndex >= g_wheelCount ) g_wheelIndex = 0;
+				g_armed = 0;
+				SaveSettings();
+				Toast( "Wheel deleted" );
+			}
+			else { g_armed = 2; g_armedAt = GetTickCount(); }
+		}
+		return;
+	}
+
+	// Choosing : the menu at the left, the preview at the right.
+	g_menu.SetKeys( "Enter : choose    Esc : back    Mouse : click" );
+	char title[64];
+	sprintf_s( title, "Choose an emote for %s, slot %d", wheel.name, g_ringSlot + 1 );
+	g_menu.Info( title, 0, Menu::GOLD );
+	if ( g_menu.TextField( "Search", g_emoteSearch, sizeof(g_emoteSearch), "(Enter to type)",
+		"Only the emotes with this in their name. Enter, type, Enter." ) ) g_listCursor = g_listScroll = 0;
+	static const char* categories[2 + NUM_EMOTE_CATEGORIES];
+	categories[0] = "Favourites";
+	categories[1] = "All";
+	for ( int i = 0; i < NUM_EMOTE_CATEGORIES; i++ ) categories[2 + i] = EMOTE_CATEGORIES[i];
+	if ( g_menu.Choice( "Category", &g_emoteCategory, categories, 2 + NUM_EMOTE_CATEGORIES,
+		"Favourites : the ones picked out for dancing and fooling about. All : every one of Harry's animations." ) ) g_listCursor = g_listScroll = 0;
+	static int items[NUM_EMOTES + 1];
+	static const char* names[NUM_EMOTES + 1];
+	static const char* tags[NUM_EMOTES + 1];
+	int n = 0;
+	items[n] = -1; names[n] = "Empty slot"; tags[n] = ""; n++;
+	for ( int e = 0; e < NUM_EMOTES; e++ ) {
+		if ( !EmoteMatches( e ) ) continue;
+		items[n] = e;
+		names[n] = EMOTES[e].name;
+		tags[n] = EMOTES[e].intro ? "chain" : EMOTES[e].loops ? "loop" : "once";
+		n++;
+	}
+	if ( g_listWant != -2 ) {
+		for ( int i = 0; i < n; i++ ) if ( items[i] == g_listWant ) g_listCursor = i;
+		g_listWant = -2;
+	}
+	if ( g_menu.List( names, tags, n, &g_listCursor, &g_listScroll, 8,
+		"once : plays, then it's over. loop : plays until you move. chain : a start, then a loop until you move." ) ) {
+		int e = items[g_listCursor];
+		wheel.slot[g_ringSlot] = e;
+		mp_log( "[EM] %s, slot %d : %s.\n", wheel.name, g_ringSlot + 1, e >= 0 ? EMOTES[e].name : "empty" );
+		SaveSettings();
+		g_chooser = false;
+	}
+	if ( g_menu.Back() ) g_chooser = false;
+	g_previewWant = g_chooser && g_listCursor >= 0 && g_listCursor < n ? items[g_listCursor] : -2;
+}
+
 static void HandleHotkeys( EIHarry* harry )
 {
 	bool f5 = InterlockedExchange( &g_reqSpawn, 0 ) != 0;
@@ -2843,6 +3383,7 @@ static void HandleHotkeys( EIHarry* harry )
 	bool f7 = InterlockedExchange( &g_reqDelay, 0 ) != 0;
 	bool f8 = InterlockedExchange( &g_reqStay, 0 ) != 0;
 	HandleAnimViewer( harry );
+	EmotePreviewTick( harry );
 
 	// The puppet went with the last level : F8's "stay here" goes too.
 	if ( !g_cur->beast && g_puppetStaysHere ) g_puppetPinned = g_puppetStaysHere = false;
@@ -3418,6 +3959,199 @@ static void ToggleRole( const char* how )
 	Toast( g_myRole == ROLE_HIDER ? "You're a hider" : "You're a seeker" );
 }
 
+// --------------------------------------------------------------------------------
+// The emote wheel : held open (L1, or T), pointed at with the right stick (the
+// mouse), played when let go (1-8 and a click play at once). R1 (Tab) : the next
+// wheel. While it's open the game doesn't get the right stick and R1 (Tab, 1-8).
+// While Harry emotes, any other button or key, or the left stick, ends it.
+// --------------------------------------------------------------------------------
+static const int PAD_R1 = 5;
+static const uint32_t WHEEL_SHOW_MS = 150;   // Held this long (or pointed) : the wheel shows (a tap of L1 doesn't).
+static const uint32_t WHEEL_KEEP_MS = 300;   // The stick back in the middle : the choice stays this long.
+
+struct WheelUi
+{
+	bool open;
+	bool byPad;          // Else the keyboard's.
+	bool shown;          // Pointed at, or flipped : showing whatever the time.
+	bool done;           // Played (1-8, a click) or given up : nothing more until it's let go.
+	uint32_t since;
+	int hover;           // Slot pointed at, -1 : none.
+	uint32_t hoverAt;
+	LONG centre[6];      // The controller's axes when it opened (lX lY lZ lRx lRy lRz).
+	POINT mouse;         // Where the cursor's way is measured from.
+	bool r1Was, clickWas;
+};
+static WheelUi g_wheelUi;
+
+static bool WheelShown()
+{
+	return g_wheelUi.open && !g_wheelUi.done && (g_wheelUi.shown || NetNowMs() - g_wheelUi.since >= WHEEL_SHOW_MS);
+}
+
+static void WheelOpen( const uint8_t* pad )
+{
+	memset( &g_wheelUi, 0, sizeof(g_wheelUi) );
+	g_wheelUi.open = true;
+	g_wheelUi.byPad = pad != 0;
+	g_wheelUi.since = NetNowMs();
+	g_wheelUi.hover = -1;
+	if ( g_wheelIndex >= g_wheelCount ) g_wheelIndex = 0;
+	if ( pad ) {
+		for ( int i = 0; i < 6; i++ ) g_wheelUi.centre[i] = ((const LONG*) pad)[i];
+		g_wheelUi.r1Was = (pad[PAD_BUTTONS + PAD_R1] & 0x80) != 0;
+		mp_log( "[EM] Wheel opened (controller; axes %ld %ld %ld %ld %ld %ld).\n", g_wheelUi.centre[0], g_wheelUi.centre[1], g_wheelUi.centre[2],
+			g_wheelUi.centre[3], g_wheelUi.centre[4], g_wheelUi.centre[5] );
+	}
+	else {
+		GetCursorPos( &g_wheelUi.mouse );
+		mp_log( "[EM] Wheel opened (keyboard).\n" );
+	}
+}
+
+static void WheelPoint( int slot )
+{
+	g_wheelUi.hover = slot;
+	g_wheelUi.hoverAt = NetNowMs();
+	g_wheelUi.shown = true;
+}
+
+static void WheelNext()
+{
+	if ( g_wheelCount > 1 ) g_wheelIndex = (g_wheelIndex + 1) % g_wheelCount;
+	g_wheelUi.hover = -1;
+	g_wheelUi.shown = true;
+	mp_log( "[EM] Wheel : %s.\n", g_wheels[g_wheelIndex].name );
+}
+
+static void WheelPlay( int slot, const char* how )
+{
+	g_wheelUi.done = true;
+	if ( slot < 0 ) return;
+	int e = g_wheels[g_wheelIndex].slot[slot];
+	mp_log( "[EM] Wheel %s, slot %d (%s) : %s.\n", g_wheels[g_wheelIndex].name, slot + 1, how, e >= 0 ? EMOTES[e].name : "empty" );
+	if ( e >= 0 ) g_emoteRequest = e;
+}
+
+// The slot a direction points at (dy : down), the first at the top, clockwise.
+static int WedgeAt( float dx, float dy )
+{
+	float a = atan2f( dx, -dy );
+	if ( a < 0.0F ) a += 6.2831853F;
+	return ((int) floorf( (a + 0.3926991F) / 0.7853982F )) % WHEEL_SLOTS;
+}
+
+static void EmotePad( uint8_t* state )
+{
+	LONG* axes = (LONG*) state;
+	uint8_t* buttons = state + PAD_BUTTONS;
+	static bool big[6] = { false, };   // The axis goes 0 .. 65535 (or so), not -1000 .. 1000.
+	for ( int i = 0; i < 6; i++ ) if ( axes[i] > 1100 || axes[i] < -1100 ) big[i] = true;
+	DWORD hat = *(DWORD*) (state + PAD_HAT);
+	bool hatCentred = LOWORD( hat ) == 0xFFFF;
+	bool held = g_emoteButton >= 0 && g_emoteButton < 32 && (buttons[g_emoteButton] & 0x80);
+	bool r1 = (buttons[PAD_R1] & 0x80) != 0;
+	bool combo = held && (!g_emoteNeedsR1 || r1);
+	static bool comboWas = false;
+	static uint8_t before[32];
+	static DWORD hatBefore = 0xFFFFFFFF;
+	uint8_t raw[32];
+	memcpy( raw, buttons, sizeof(raw) );
+
+	if ( combo && !comboWas && !g_wheelUi.open ) WheelOpen( state );
+	comboWas = combo;
+	if ( g_wheelUi.open && g_wheelUi.byPad ) {
+		if ( !held ) {
+			if ( !g_wheelUi.done ) WheelPlay( g_wheelUi.hover, "let go" );
+			g_wheelUi.open = false;
+		}
+		else {
+			if ( r1 && !g_wheelUi.r1Was && !g_wheelUi.done ) WheelNext();
+			g_wheelUi.r1Was = r1;
+			// The right stick : a DualShock's (Z, Rz) or an Xbox controller's (Rx, Ry), whichever leans more.
+			static const int PAIRS[2][2] = { { 2, 5 }, { 3, 4 } };
+			float best = 0.0F, bx = 0.0F, by = 0.0F;
+			for ( int p = 0; p < 2; p++ ) {
+				int ix = PAIRS[p][0], iy = PAIRS[p][1];
+				float x = (axes[ix] - g_wheelUi.centre[ix]) / (big[ix] ? 32767.0F : 1000.0F);
+				float y = (axes[iy] - g_wheelUi.centre[iy]) / (big[iy] ? 32767.0F : 1000.0F);
+				if ( x * x + y * y > best ) { best = x * x + y * y; bx = x; by = y; }
+			}
+			if ( !g_wheelUi.done ) {
+				if ( best > 0.5F * 0.5F ) WheelPoint( WedgeAt( bx, by ) );
+				else if ( g_wheelUi.hover >= 0 && NetNowMs() - g_wheelUi.hoverAt > WHEEL_KEEP_MS ) g_wheelUi.hover = -1;
+			}
+			// Hide and seek's role swap is the same button and the d-pad : no wheel then.
+			if ( PlayingHs() && g_emoteButton == g_swapButton && !hatCentred ) g_wheelUi.done = true;
+			for ( int i = 2; i < 6; i++ ) axes[i] = g_wheelUi.centre[i];
+			buttons[PAD_R1] = 0;
+		}
+	}
+	// Emoting : the left stick, another button or the d-pad end it.
+	else if ( g_emote.active ) {
+		static uint32_t restFor = 0;
+		static LONG rest[2];
+		if ( restFor != g_emote.start ) { restFor = g_emote.start; rest[0] = axes[0]; rest[1] = axes[1]; }
+		float x = (axes[0] - rest[0]) / (big[0] ? 32767.0F : 1000.0F), y = (axes[1] - rest[1]) / (big[1] ? 32767.0F : 1000.0F);
+		const char* why = 0;
+		if ( x * x + y * y > 0.4F * 0.4F ) why = "the left stick";
+		for ( int b = 0; b < 32 && !why; b++ )
+			if ( (raw[b] & 0x80) && !(before[b] & 0x80) && b != g_emoteButton && b != PAD_R1 ) why = "a button";
+		if ( !why && !hatCentred && LOWORD( hatBefore ) == 0xFFFF ) why = "the d-pad";
+		if ( why && !g_emoteCancel ) g_emoteCancel = why;
+	}
+	memcpy( before, raw, sizeof(before) );
+	hatBefore = hat;
+}
+
+// Keys that don't end an emote : the wheel's, the function keys, Shift, Ctrl, Alt.
+static bool KeyKeepsEmote( int k )
+{
+	if ( k == g_emoteKey || k == 0x0F || (k >= 0x02 && k <= 0x09) || (k >= 0x3B && k <= 0x44) || k == 0x57 || k == 0x58 ) return true;
+	return k == 0x2A || k == 0x36 || k == 0x1D || k == 0x9D || k == 0x38 || k == 0xB8;
+}
+
+static void EmoteKeys( uint8_t* keys )
+{
+	static uint8_t before[256];
+	uint8_t raw[256];
+	memcpy( raw, keys, sizeof(raw) );
+	bool held = g_emoteKey > 0 && g_emoteKey < 256 && (raw[g_emoteKey] & 0x80);
+	static bool heldWas = false;
+	if ( held && !heldWas && !g_wheelUi.open ) WheelOpen( 0 );
+	heldWas = held;
+	if ( g_wheelUi.open && !g_wheelUi.byPad ) {
+		if ( !held ) {
+			if ( !g_wheelUi.done ) WheelPlay( g_wheelUi.hover, "let go" );
+			g_wheelUi.open = false;
+		}
+		else if ( !g_wheelUi.done ) {
+			if ( (raw[0x0F] & 0x80) && !(before[0x0F] & 0x80) ) WheelNext();   // Tab.
+			for ( int i = 0; i < WHEEL_SLOTS && !g_wheelUi.done; i++ )   // 1 - 8.
+				if ( (raw[0x02 + i] & 0x80) && !(before[0x02 + i] & 0x80) ) { WheelPoint( i ); WheelPlay( i, "number key" ); }
+			// The mouse : which way it went (the start follows it, so turning back is quick).
+			POINT p;
+			if ( !g_wheelUi.done && !g_background && GameHasFocus() && GetCursorPos( &p ) ) {
+				float dx = (float) (p.x - g_wheelUi.mouse.x), dy = (float) (p.y - g_wheelUi.mouse.y);
+				float d = sqrtf( dx * dx + dy * dy );
+				if ( d > 30.0F ) WheelPoint( WedgeAt( dx, dy ) );
+				if ( d > 80.0F ) { g_wheelUi.mouse.x = p.x - (LONG) (dx * 80.0F / d); g_wheelUi.mouse.y = p.y - (LONG) (dy * 80.0F / d); }
+				bool click = (GetAsyncKeyState( VK_LBUTTON ) & 0x8000) != 0;
+				if ( click && !g_wheelUi.clickWas && g_wheelUi.hover >= 0 ) WheelPlay( g_wheelUi.hover, "click" );
+				g_wheelUi.clickWas = click;
+			}
+		}
+		keys[0x0F] = 0;
+		for ( int i = 0; i < WHEEL_SLOTS; i++ ) keys[0x02 + i] = 0;
+	}
+	else if ( g_emote.active ) {
+		for ( int k = 1; k < 256; k++ )
+			if ( (raw[k] & 0x80) && !(before[k] & 0x80) && !KeyKeepsEmote( k ) ) { if ( !g_emoteCancel ) g_emoteCancel = "a key"; break; }
+	}
+	if ( held ) keys[g_emoteKey] = 0;
+	memcpy( before, raw, sizeof(before) );
+}
+
 static void RoleSwapPad( uint8_t* state )
 {
 	DWORD& hat = *(DWORD*) (state + PAD_HAT);
@@ -3449,7 +4183,8 @@ static void* __cdecl PollGamepad_Hook( int index )
 	if ( state ) {
 		memcpy( g_padSeen, state, PAD_STATE_SIZE );
 		g_padSeenAny = true;
-		if ( !MenuBlocksInput() ) RoleSwapPad( (uint8_t*) state );
+		if ( !MenuBlocksInput() ) { EmotePad( (uint8_t*) state ); RoleSwapPad( (uint8_t*) state ); }
+		else if ( g_wheelUi.byPad ) g_wheelUi.open = false;
 		if ( LOWORD( *(DWORD*) ((uint8_t*) state + PAD_HAT) ) != 0xFFFF ) InterlockedIncrement( &g_testHatFrames );
 	}
 	return MenuBlocksInput() ? 0 : state;
@@ -3485,8 +4220,14 @@ static void PollKeyboard_Hook()
 		for ( int i = 0; i < 256; i++ ) ((uint8_t*) KEYS_NOW)[i] = g_fakeKeys[i];
 	}
 	else ((void (*)()) POLL_KEYBOARD)();
-	if ( MenuBlocksInput() ) memset( (void*) KEYS_NOW, 0, 256 );   // The menu has the keyboard.
-	else RoleSwapKeys( (uint8_t*) KEYS_NOW );
+	if ( MenuBlocksInput() ) {   // The menu has the keyboard.
+		memset( (void*) KEYS_NOW, 0, 256 );
+		if ( !g_wheelUi.byPad ) g_wheelUi.open = false;
+	}
+	else {
+		EmoteKeys( (uint8_t*) KEYS_NOW );
+		RoleSwapKeys( (uint8_t*) KEYS_NOW );
+	}
 	if ( ((uint8_t*) KEYS_NOW)[0xCD] & 0x80 ) InterlockedIncrement( &g_testArrowFrames );
 }
 
@@ -3901,6 +4642,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_menuTest ) { phase = 600; phaseStart = now; step = 0; break; }
 		if ( g_skinTest ) { phase = 700; phaseStart = now; step = 0; break; }
 		if ( g_hsTest ) { phase = g_hsTest >= 2 ? 1210 : 1200; phaseStart = now; step = 0; break; }
+		if ( g_emoteTest ) { phase = 1300; phaseStart = now; step = 0; break; }
 		if ( g_distTest ) { phase = 500; phaseStart = now; step = 0; break; }
 		if ( g_aimTest ) { phase = 900; phaseStart = now; step = 0; break; }
 		if ( g_deathTest ) { phase = 400; phaseStart = now; step = 0; break; }
@@ -4289,6 +5031,275 @@ static void AutotestStep( EIHarry* harry )
 		else if ( t > 1000 ) InterlockedExchange( &g_autotestDone, 1 );
 		break;
 	}
+	case 1300: {   // Emotes, one game : how they play and end, the wheel by controller and by keyboard.
+		static int failures = 0;
+		static DWORD lastLog = 0, mark = 0;
+		DWORD t = now - phaseStart;
+		struct Local { static void Check( const char* what, bool ok ) { mp_log( "[AT] Emote : %s : %s\n", what, ok ? "ok" : "WRONG" ); if ( !ok ) failures++; } };
+		static int victory, jig, breakdance, running, dizzy;
+		if ( g_emote.active && now - lastLog >= 500 ) {
+			lastLog = now;
+			uint8_t* l = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
+			int layer = -1; float w = 0;
+			uint32_t clip = GetPlayingClip( harry, &layer, &w );
+			mp_log( "[AT] Emote %s : clip 0x%.8X, frame %.3f, clock %.3f, play %d; Harry shows 0x%.8X (layer %d, %.2f), the puppet 0x%.8X.\n",
+				EMOTES[g_emote.emote].name, g_emote.clip, l ? *(float*) (l + LAYER_FRAME) : 0.0F, l ? *(float*) (l + LAYER_TIME) : 0.0F, g_emote.plays,
+				clip, layer, w, g_cur->mirrorClip );
+		}
+		if ( step == 0 && t >= 1500 ) {
+			g_wheelCount = 2;
+			for ( int w = 0; w < MAX_WHEELS; w++ ) DefaultWheel( w );
+			victory = FindEmoteByName( "Victory Dance" ); jig = FindEmoteByName( "Jig" ); breakdance = FindEmoteByName( "Breakdance" );
+			running = FindEmoteByName( "Running Man" ); dizzy = FindEmoteByName( "Dizzy Walk" );
+			mp_log( "[AT] Emote : %d emotes in the catalogue.\n", NUM_EMOTES );
+			bool all = true;
+			for ( int s = 0; s < WHEEL_SLOTS; s++ ) all &= g_wheels[0].slot[s] >= 0 && (s >= 6 || g_wheels[1].slot[s] >= 0);
+			Local::Check( "the default wheels' emotes are all in the catalogue", all && NUM_EMOTES > 200 );
+			Local::Check( "Breakdance is a chain", breakdance >= 0 && EMOTES[breakdance].intro != 0 && g_wheels[0].slot[3] == breakdance );
+			// The ini : saved, changed, loaded back.
+			char ini[MAX_PATH];
+			GetTempPathA( MAX_PATH, ini );
+			strcat_s( ini, "ptle-emote-test.ini" );
+			DeleteFileA( ini );
+			EmoteWheel saved[MAX_WHEELS];
+			g_wheelCount = 3;
+			strcpy_s( g_wheels[2].name, "Mine, all | mine" );
+			g_wheels[2].slot[5] = dizzy;
+			SaveWheels( ini );
+			memcpy( saved, g_wheels, sizeof(saved) );
+			strcpy_s( g_wheels[2].name, "Mine, all / mine" );   // As it comes back.
+			memcpy( saved[2].name, g_wheels[2].name, sizeof(saved[2].name) );
+			for ( int w = 0; w < MAX_WHEELS; w++ ) DefaultWheel( w );
+			g_wheelCount = 0;
+			LoadWheels( ini );
+			Local::Check( "the wheels go through the ini", g_wheelCount == 3 && [&]() {
+				for ( int w = 0; w < 3; w++ ) if ( strcmp( saved[w].name, g_wheels[w].name ) || memcmp( saved[w].slot, g_wheels[w].slot, sizeof(saved[w].slot) ) ) return false;
+				return true; }() );
+			char line[256] = "";
+			GetPrivateProfileStringA( "Emotes", "Wheel1", "", line, sizeof(line), ini );
+			mp_log( "[AT] Emote : Wheel1=%s\n", line );
+			DeleteFileA( ini );
+			g_wheelCount = 2;
+			DefaultWheel( 2 );
+			g_emoteRequest = victory;
+			step = 1; phaseStart = now;
+		}
+		else if ( step == 1 ) {
+			if ( t >= 1200 && t < 1300 ) RequestSnapshot( "emote_1_victory" );
+			if ( t > 300 && !g_emote.active ) {
+				mp_log( "[AT] Emote : Victory Dance lasted %u ms.\n", t );
+				Local::Check( "Victory Dance plays to its end", strcmp( g_emoteLastEnd, "played" ) == 0 && t >= 2000 );
+				step = 2; phaseStart = now;
+			}
+			else if ( t > 20000 ) { Local::Check( "Victory Dance ends", false ); step = 2; phaseStart = now; }
+		}
+		else if ( step == 2 && t >= 1000 ) {
+			int layer = -1; float w = 0;
+			uint32_t clip = GetPlayingClip( harry, &layer, &w );
+			mp_log( "[AT] Emote : after it, Harry shows 0x%.8X (layer %d, %.2f).\n", clip, layer, w );
+			Local::Check( "the game's own animation is back", clip && layer < EMOTE_LAYERS[0] );
+			RequestSnapshot( "emote_2_after" );
+			g_emoteRequest = jig;
+			step = 3; phaseStart = now;
+		}
+		else if ( step == 3 && t >= 6000 ) {
+			Local::Check( "Jig loops", g_emote.active && g_emote.emote == jig && g_emote.plays >= 2 );
+			SendKey( 'W', true );
+			step = 4; phaseStart = now;
+		}
+		else if ( step == 4 && (!g_emote.active || t > 3000) ) {
+			Local::Check( "a key ends it", !g_emote.active && strcmp( g_emoteLastEnd, "a key" ) == 0 );
+			SendKey( 'W', false );
+			step = 5; phaseStart = now;
+		}
+		else if ( step == 5 && t >= 2500 ) {
+			g_emoteRequest = breakdance;
+			mark = 0;
+			step = 6; phaseStart = now;
+		}
+		else if ( step == 6 ) {
+			if ( !mark && g_emote.active && g_emote.clip == EMOTES[breakdance].clip ) { mark = t; mp_log( "[AT] Emote : Breakdance's loop after %u ms.\n", t ); }
+			if ( t >= 5000 && t < 5100 ) RequestSnapshot( "emote_3_breakdance" );
+			if ( t >= 7000 ) {
+				Local::Check( "Breakdance : its intro, then its loop", mark && g_emote.active && g_emote.clip == EMOTES[breakdance].clip );
+				memset( g_testPad, 0, sizeof(g_testPad) );
+				for ( int i = 0; i < 4; i++ ) *(DWORD*) (g_testPad + PAD_HAT + 4 * i) = 0xFFFFFFFF;
+				g_testPadOn = true;
+				step = 7; phaseStart = now;
+			}
+		}
+		else if ( step == 7 && t >= 300 ) { g_testPad[PAD_BUTTONS + 2] = 0x80; step = 8; phaseStart = now; }
+		else if ( step == 8 && (!g_emote.active || t > 3000) ) {
+			Local::Check( "a button ends it", !g_emote.active && strcmp( g_emoteLastEnd, "a button" ) == 0 );
+			g_testPad[PAD_BUTTONS + 2] = 0;
+			step = 9; phaseStart = now;
+		}
+		// The wheel, by controller : L1, the right stick to the right (Running Man), R1 twice, let go.
+		else if ( step == 9 && t >= 2500 ) { g_testPad[PAD_BUTTONS + 4] = 0x80; step = 10; phaseStart = now; }
+		else if ( step == 10 && t >= 300 ) { *(LONG*) (g_testPad + 0x0C) = 1000; step = 11; phaseStart = now; }
+		else if ( step == 11 && t >= 400 ) {
+			Local::Check( "L1 + the right stick : the wheel, Running Man picked", WheelShown() && g_wheelUi.byPad && g_wheelUi.hover == 2 );
+			RequestSnapshot( "emote_4_wheel" );
+			step = 12; phaseStart = now;
+		}
+		else if ( step == 12 && t >= 300 ) { g_testPad[PAD_BUTTONS + PAD_R1] = 0x80; step = 13; phaseStart = now; }
+		else if ( step == 13 && t >= 300 ) {
+			Local::Check( "R1 : the next wheel", g_wheelIndex == 1 && WheelShown() );
+			RequestSnapshot( "emote_5_wheel2" );
+			g_testPad[PAD_BUTTONS + PAD_R1] = 0;
+			step = 14; phaseStart = now;
+		}
+		else if ( step == 14 && t >= 300 ) { g_testPad[PAD_BUTTONS + PAD_R1] = 0x80; step = 15; phaseStart = now; }
+		else if ( step == 15 && t >= 300 ) {
+			Local::Check( "R1 again : back to the first", g_wheelIndex == 0 );
+			g_testPad[PAD_BUTTONS + PAD_R1] = 0;
+			step = 16; phaseStart = now;
+		}
+		else if ( step == 16 && t >= 300 ) { g_testPad[PAD_BUTTONS + 4] = 0; step = 17; phaseStart = now; }
+		else if ( step == 17 && t >= 300 ) {
+			*(LONG*) (g_testPad + 0x0C) = 0;
+			Local::Check( "letting go of L1 plays it", !g_wheelUi.open && g_emote.active && g_emote.emote == running );
+			step = 18; phaseStart = now;
+		}
+		else if ( step == 18 && t >= 2000 ) { *(LONG*) (g_testPad + 0) = 1000; step = 19; phaseStart = now; }
+		else if ( step == 19 && (!g_emote.active || t > 3000) ) {
+			Local::Check( "the left stick ends it", !g_emote.active && strcmp( g_emoteLastEnd, "the left stick" ) == 0 );
+			*(LONG*) (g_testPad + 0) = 0;
+			g_testPadOn = false;
+			step = 20; phaseStart = now;
+		}
+		// By keyboard : T, Tab (the second wheel), 2 (Dizzy Walk).
+		else if ( step == 20 && t >= 2500 ) { SendKey( 'T', true ); step = 21; phaseStart = now; }
+		else if ( step == 21 && t >= 400 ) {
+			Local::Check( "T : the wheel", WheelShown() && !g_wheelUi.byPad );
+			RequestSnapshot( "emote_6_keyboard" );
+			SendKey( VK_TAB, true );
+			step = 22; phaseStart = now;
+		}
+		else if ( step == 22 && t >= 200 ) {
+			SendKey( VK_TAB, false );
+			Local::Check( "Tab : the next wheel", g_wheelIndex == 1 );
+			SendKey( '2', true );
+			step = 23; phaseStart = now;
+		}
+		else if ( step == 23 && t >= 200 ) {
+			SendKey( '2', false );
+			Local::Check( "2 plays the second slot at once", !WheelShown() && g_emote.active && g_emote.emote == dizzy );
+			SendKey( 'T', false );
+			step = 24; phaseStart = now;
+		}
+		else if ( step == 24 && t >= 1500 ) {
+			Local::Check( "letting go of T after it plays nothing more", g_emote.active && g_emote.emote == dizzy );
+			RequestSnapshot( "emote_7_dizzy" );
+			SendKey( 'W', true );   // Walking : it ends, and no other starts.
+			step = 25; phaseStart = now;
+		}
+		else if ( step == 25 && t >= 600 ) {
+			Local::Check( "walking ended it", !g_emote.active && strcmp( g_emoteLastEnd, "a key" ) == 0 );
+			g_emoteRequest = jig;
+			step = 26; phaseStart = now;
+		}
+		else if ( step == 26 && t >= 300 ) {
+			Local::Check( "no emote while walking", !g_emote.active && strcmp( g_emoteRefused, "Stand still to emote" ) == 0 );
+			SendKey( 'W', false );
+			step = 27; phaseStart = now;
+		}
+		// The Emotes page : the ring (moving an emote round, emptying a slot), choosing an
+		// emote (Esc backs out; search, the list), the preview puppet.
+		else if ( step == 27 && t >= 1500 ) { SetMenuOpen( true ); step = 28; phaseStart = now; }
+		else if ( step == 28 && t >= 500 ) {
+			g_menu.TabCenter( 4, &g_testMouse.x, &g_testMouse.y );
+			g_testMouse.active = true; g_testMouse.down = true;
+			step = 29; phaseStart = now;
+		}
+		else if ( step == 29 && t >= 300 ) { g_testMouse.down = false; step = 30; phaseStart = now; }
+		else if ( step == 30 && t >= 300 ) {
+			g_testMouse.active = false;
+			Local::Check( "the Emotes page", g_menu.CurrentPage() == 4 );
+			InterlockedExchangeAdd( &g_menuKeys[MK_DOWN], 2 );
+			InterlockedExchangeAdd( &g_menuKeys[MK_RIGHT], 2 );
+			step = 31; phaseStart = now;
+		}
+		else if ( step == 31 && t >= 400 ) {
+			Local::Check( "Down, Down, Right, Right : the ring, on slot 3", g_ringSlot == 2 && g_wheels[0].slot[2] == running );
+			RequestSnapshot( "emote_8_page" );
+			InterlockedIncrement( &g_menuKeys[MK_SRIGHT] );
+			step = 32; phaseStart = now;
+		}
+		else if ( step == 32 && t >= 400 ) {
+			Local::Check( "Shift + Right moves it round", g_ringSlot == 3 && g_wheels[0].slot[3] == running && g_wheels[0].slot[2] == breakdance );
+			InterlockedIncrement( &g_menuKeys[MK_SLEFT] );
+			step = 33; phaseStart = now;
+		}
+		else if ( step == 33 && t >= 400 ) {
+			Local::Check( "Shift + Left puts it back", g_ringSlot == 2 && g_wheels[0].slot[2] == running && g_wheels[0].slot[3] == breakdance );
+			InterlockedIncrement( &g_menuKeys[MK_DELETE] );
+			step = 34; phaseStart = now;
+		}
+		else if ( step == 34 && t >= 400 ) {
+			Local::Check( "Delete empties it", g_wheels[0].slot[2] < 0 );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] );
+			step = 35; phaseStart = now;
+		}
+		else if ( step == 35 && t >= 400 ) {
+			Local::Check( "Enter : choosing an emote", g_chooser );
+			InterlockedIncrement( &g_menuKeys[MK_BACK] );
+			step = 36; phaseStart = now;
+		}
+		else if ( step == 36 && t >= 400 ) {
+			Local::Check( "Esc : back to the wheel, the menu still open", !g_chooser && g_menu.IsOpen() );
+			g_wheels[0].slot[2] = FindEmoteByName( "Idle" );   // Not a favourite : the list goes to All, on it.
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] );
+			step = 37; phaseStart = now;
+		}
+		else if ( step == 37 && t >= 2500 ) {
+			Local::Check( "the list starts on the slot's emote (in All), the preview plays it", g_emoteCategory == 1 && g_previewWant == FindEmoteByName( "Idle" ) && g_emotePreview && g_viewerPeer && g_viewerPeer->beast );
+			RequestSnapshot( "emote_9_chooser" );
+			InterlockedIncrement( &g_menuKeys[MK_PGDN] );
+			step = 38; phaseStart = now;
+		}
+		else if ( step == 38 && t >= 1500 ) {
+			Local::Check( "Page Down : further down the list, the preview follows", g_listCursor > 8 && g_previewWant != FindEmoteByName( "Idle" ) );
+			RequestSnapshot( "emote_10_pagedown" );
+			g_listCursor = 0;   // Back to the top ("Empty slot"), then Up : out of the list, to Category, then Search.
+			InterlockedIncrement( &g_menuKeys[MK_UP] );
+			step = 39; phaseStart = now;
+		}
+		else if ( step == 39 && t >= 300 ) { InterlockedIncrement( &g_menuKeys[MK_UP] ); step = 40; phaseStart = now; }
+		else if ( step == 40 && t >= 300 ) { InterlockedIncrement( &g_menuKeys[MK_ACCEPT] ); step = 41; phaseStart = now; }
+		else if ( step == 41 && t >= 300 ) {
+			Local::Check( "Enter on Search : typing", g_menu.IsTyping() );
+			for ( const char* c = "Dizzy W"; *c; c++ ) AddTyped( *c );
+			step = 42; phaseStart = now;
+		}
+		else if ( step == 42 && t >= 300 ) {
+			Local::Check( "typed : it searches as it goes", strcmp( g_emoteSearch, "Dizzy W" ) == 0 );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] );
+			step = 43; phaseStart = now;
+		}
+		else if ( step == 43 && t >= 300 ) { InterlockedIncrement( &g_menuKeys[MK_DOWN] ); step = 44; phaseStart = now; }
+		else if ( step == 44 && t >= 300 ) { InterlockedIncrement( &g_menuKeys[MK_DOWN] ); step = 45; phaseStart = now; }
+		else if ( step == 45 && t >= 300 ) { InterlockedIncrement( &g_menuKeys[MK_DOWN] ); step = 46; phaseStart = now; }
+		else if ( step == 46 && t >= 1500 ) {
+			Local::Check( "Down, Down, Down : the list, its first match", g_previewWant == dizzy );
+			RequestSnapshot( "emote_11_search" );
+			InterlockedIncrement( &g_menuKeys[MK_ACCEPT] );
+			step = 47; phaseStart = now;
+		}
+		else if ( step == 47 && t >= 400 ) {
+			Local::Check( "Enter : it's in the slot, back to the wheel", g_wheels[0].slot[2] == dizzy && !g_chooser );
+			RequestSnapshot( "emote_12_chosen" );
+			DefaultWheel( 0 );
+			InterlockedIncrement( &g_menuKeys[MK_BACK] );
+			step = 48; phaseStart = now;
+		}
+		else if ( step == 48 && t >= 1000 ) {
+			Local::Check( "Esc closes the menu, the preview's puppet is parked", !g_menu.IsOpen() && !g_emotePreview && g_parkedPeer );
+			RequestSnapshot( "emote_13_closed" );
+			InterlockedExchange( &g_autotestDone, failures ? 2 : 1 );
+		}
+		break;
+	}
 	case 1200: {   // Hide and seek, one game : a hider's time goes on, a seeker's stops; the room hears it; the file keeps it.
 		static int failures = 0;
 		static uint32_t startMs = 0, stopMs = 0;
@@ -4664,12 +5675,12 @@ static void AutotestStep( EIHarry* harry )
 		case 7:   // The mouse : click the last page's tab (Keys).
 			if ( t < 1800 ) break;
 			Local::Check( "Harry stays put while it's open", Local::Moved( harry, from ) < 0.5F );
-			g_menu.TabCenter( 4, &g_testMouse.x, &g_testMouse.y );
+			g_menu.TabCenter( 5, &g_testMouse.x, &g_testMouse.y );
 			g_testMouse.active = true; g_testMouse.down = true; step++; phaseStart = now; break;
 		case 8:   // Then the first row of the second page (name tags back on).
 			if ( t < 500 ) break;
 			g_testMouse.down = false;
-			Local::Check( "Clicking a tab opens its page", g_menu.CurrentPage() == 4 );
+			Local::Check( "Clicking a tab opens its page", g_menu.CurrentPage() == 5 );
 			RequestSnapshot( "menu_3_keys" );
 			step = 80; phaseStart = now; break;
 		case 80:   // Click Gamemodes : it opens, on Hide and seek.
@@ -5289,6 +6300,7 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 		InterlockedExchange( &g_reqMenu, 0 );   // An F1 pressed before there was anything to draw (the main menu) doesn't count.
 	}
 	HideTick();
+	EmoteTick( self );
 	PushLocalSnapshot( self );
 	NetUpdate();
 	CheckCaught( self );
@@ -5579,6 +6591,10 @@ static void ReadNetConfig( NetConfig* c )
 		for ( int i = 0; i < NUM_MODES; i++ ) if ( _stricmp( name, MODE_NAMES[i] ) == 0 ) g_gameMode = i;
 		g_swapButton = GetPrivateProfileIntA( "Keys", "RoleSwapButton", 4, ini );
 		g_swapKey = GetPrivateProfileIntA( "Keys", "RoleSwapKey", 0x2A, ini );
+		g_emoteButton = GetPrivateProfileIntA( "Keys", "EmoteButton", 4, ini );
+		g_emoteNeedsR1 = GetPrivateProfileIntA( "Keys", "EmoteNeedsR1", 0, ini ) != 0;
+		g_emoteKey = GetPrivateProfileIntA( "Keys", "EmoteKey", 0x14, ini );
+		LoadWheels( ini );
 		GetPrivateProfileStringA( "Appearance", "Outfit", "Default", name, sizeof(name), ini );
 		g_myOutfit = OUTFIT_DEFAULT;
 		for ( int i = 0; i < NUM_OUTFITS; i++ ) if ( _stricmp( name, OUTFITS[i].name ) == 0 ) g_myOutfit = i;
@@ -5695,7 +6711,11 @@ static void SaveSettings()
 		char n[16];
 		sprintf_s( n, "%d", g_swapButton ); WritePrivateProfileStringA( "Keys", "RoleSwapButton", n, g_iniPath );
 		sprintf_s( n, "%d", g_swapKey );    WritePrivateProfileStringA( "Keys", "RoleSwapKey", n, g_iniPath );
+		sprintf_s( n, "%d", g_emoteButton ); WritePrivateProfileStringA( "Keys", "EmoteButton", n, g_iniPath );
+		WritePrivateProfileStringA( "Keys", "EmoteNeedsR1", g_emoteNeedsR1 ? "1" : "0", g_iniPath );
+		sprintf_s( n, "%d", g_emoteKey );   WritePrivateProfileStringA( "Keys", "EmoteKey", n, g_iniPath );
 	}
+	SaveWheels( g_iniPath );
 	for ( int i = 0; i < RETRO_PARTS; i++ ) {
 		char key[32], value[16];
 		sprintf_s( key, "Retro%s", RETRO_PART_NAMES[i] );
@@ -5778,7 +6798,9 @@ enum { BIND_NONE, BIND_BUTTON, BIND_KEY };
 static int g_binding = BIND_NONE;
 static bool g_bindArmed = false;   // Everything was let go since (the Enter that started it doesn't count).
 
-static void StartBinding( int what ) { g_binding = what; g_bindArmed = false; }
+static int* g_bindTarget = 0;      // The setting it goes in (g_swapButton, g_emoteKey, ...).
+
+static void StartBinding( int what, int* target ) { g_binding = what; g_bindTarget = target; g_bindArmed = false; }
 
 static void SetGameMode( int mode )
 {
@@ -5823,6 +6845,7 @@ static const char* PadButtonName( int button )
 	static int next = 0;
 	char* out = name[next++ & 3];
 	if ( button == 4 ) strcpy_s( out, 40, "L1 / LB (button 5)" );
+	else if ( button == 5 ) strcpy_s( out, 40, "R1 / RB (button 6)" );
 	else sprintf_s( out, 40, "button %d", button + 1 );
 	return out;
 }
@@ -5841,8 +6864,8 @@ static void PollBinding()
 		if ( down < 0 ) return;
 		if ( down == VK_ESCAPE ) { g_binding = BIND_NONE; return; }
 		if ( down == VK_LEFT || down == VK_RIGHT || down == VK_UP || down == VK_DOWN ) return;   // They're the directions.
-		g_swapKey = VkToDik( down );
-		mp_log( "[HS] Role swap key : %s (%d).\n", KeyName( g_swapKey ), g_swapKey );
+		*g_bindTarget = VkToDik( down );
+		mp_log( "[MP] %s key : %s (%d).\n", g_bindTarget == &g_swapKey ? "Role swap" : "Emote wheel", KeyName( *g_bindTarget ), *g_bindTarget );
 	}
 	else {
 		int down = -1;
@@ -5850,8 +6873,8 @@ static void PollBinding()
 		if ( !g_bindArmed ) { g_bindArmed = down < 0 && !escape; return; }
 		if ( escape ) { g_binding = BIND_NONE; return; }
 		if ( down < 0 ) return;
-		g_swapButton = down;
-		mp_log( "[HS] Role swap button : %d.\n", g_swapButton + 1 );
+		*g_bindTarget = down;
+		mp_log( "[MP] %s button : %d.\n", g_bindTarget == &g_swapButton ? "Role swap" : "Emote wheel", down + 1 );
 	}
 	g_binding = BIND_NONE;
 	SaveSettings();
@@ -5870,6 +6893,11 @@ static void DrawMenu( float sw, float sh, float h )
 	in.back = InterlockedExchange( &g_menuKeys[MK_BACK], 0 );
 	in.nextPage = InterlockedExchange( &g_menuKeys[MK_NEXT], 0 );
 	in.prevPage = InterlockedExchange( &g_menuKeys[MK_PREV], 0 );
+	in.del = InterlockedExchange( &g_menuKeys[MK_DELETE], 0 );
+	in.pageUp = InterlockedExchange( &g_menuKeys[MK_PGUP], 0 );
+	in.pageDown = InterlockedExchange( &g_menuKeys[MK_PGDN], 0 );
+	in.shiftLeft = InterlockedExchange( &g_menuKeys[MK_SLEFT], 0 );
+	in.shiftRight = InterlockedExchange( &g_menuKeys[MK_SRIGHT], 0 );
 	static char typed[64], pasted[128];
 	TakeTyped( typed, sizeof(typed) );
 	in.typed = typed[0] ? typed : 0;
@@ -5910,8 +6938,10 @@ static void DrawMenu( float sw, float sh, float h )
 	if ( g_binding != BIND_NONE ) {   // Waiting for a key or a button : the menu doesn't get them.
 		PollBinding();
 		in.up = in.down = in.left = in.right = in.accept = in.back = in.nextPage = in.prevPage = 0;
+		in.del = in.pageUp = in.pageDown = in.shiftLeft = in.shiftRight = 0;
 		in.mouseClicked = false;
 	}
+	g_menu.SetNarrow( g_chooser );
 	g_menu.Begin( in, sw, sh, h, "Multiplayer " MP_VERSION, right[0][0] ? right[0] : 0 );
 	if ( g_menu.Page( "Players" ) ) {
 		for ( int r = 0; r < rows; r++ ) g_menu.Info( left[r], r == 0 ? "" : right[r], colors[r] );
@@ -6056,20 +7086,32 @@ static void DrawMenu( float sw, float sh, float h )
 		}
 		if ( changed ) SaveSettings();
 	}
+	bool emotes = g_menu.Page( "Emotes" );
+	if ( emotes ) EmotesPage();
+	else { g_chooser = false; g_previewWant = -2; }
 	if ( g_menu.Page( "Keys" ) ) {
 		g_menu.Info( "F1", "This menu" );
 		{
-			char pad[48], key[48];
-			if ( g_binding == BIND_BUTTON ) strcpy_s( pad, "press a button... (Esc : leave it)" );
-			else strcpy_s( pad, PadButtonName( g_swapButton ) );
-			if ( g_binding == BIND_KEY ) strcpy_s( key, "press a key... (Esc : leave it)" );
-			else strcpy_s( key, KeyName( g_swapKey ) );
-			if ( g_menu.Button( "Swap roles, controller : hold", pad,
+			// What each binding row shows : the button or key, or that it's waiting for one.
+			struct Bound {
+				static const char* Pad( int* target ) { return g_binding == BIND_BUTTON && g_bindTarget == target ? "press a button... (Esc : leave it)" : PadButtonName( *target ); }
+				static const char* Key( int* target ) { return g_binding == BIND_KEY && g_bindTarget == target ? "press a key... (Esc : leave it)" : KeyName( *target ); }
+			};
+			if ( g_menu.Button( "Swap roles, controller : hold", Bound::Pad( &g_swapButton ),
 				"Hide and seek : hold this and press left or right on the d-pad to switch between hider and seeker. "
-				"Enter, then press the button to use." ) ) StartBinding( BIND_BUTTON );
-			if ( g_menu.Button( "Swap roles, keyboard : hold", key,
+				"Enter, then press the button to use." ) ) StartBinding( BIND_BUTTON, &g_swapButton );
+			if ( g_menu.Button( "Swap roles, keyboard : hold", Bound::Key( &g_swapKey ),
 				"Hide and seek : hold this and press the left or right arrow to switch between hider and seeker. "
-				"Enter, then press the key to use." ) ) StartBinding( BIND_KEY );
+				"Enter, then press the key to use." ) ) StartBinding( BIND_KEY, &g_swapKey );
+			if ( g_menu.Button( "Emote wheel, controller : hold", Bound::Pad( &g_emoteButton ),
+				"Hold it for the emote wheel, point the right stick at an emote and let go to play it. R1 : the next wheel. "
+				"Enter, then press the button to use." ) ) StartBinding( BIND_BUTTON, &g_emoteButton );
+			if ( g_menu.Toggle( "Emote wheel : needs R1 too", &g_emoteNeedsR1,
+				"On : the wheel opens only with R1 held as well (L1 + R1), so the button alone does nothing new. "
+				"R1 pressed again while it's open : the next wheel." ) ) SaveSettings();
+			if ( g_menu.Button( "Emote wheel, keyboard : hold", Bound::Key( &g_emoteKey ),
+				"Hold it for the emote wheel, point the mouse at an emote (or press 1 - 8) and let go to play it. Tab : the next wheel. "
+				"Enter, then press the key to use." ) ) StartBinding( BIND_KEY, &g_emoteKey );
 		}
 		g_menu.Info( "F10", "Animation viewer ( [ ] \\ ' and F11 inside it)" );
 		g_menu.Section( "For testing" );
@@ -6107,12 +7149,92 @@ static void SetMenuOpen( bool open )
 	SyncMenuOpen();
 }
 
+// An emote's name in its wedge : two lines when it doesn't fit on one.
+static void DrawWheelLabel( float x, float y, const char* name, float maxW, float lh, uint32_t color )
+{
+	float w = OverlayTextWidth( name );
+	int split = -1;
+	float bestW = w;
+	char first[64];
+	for ( const char* c = name; w > maxW && *c; c++ ) {
+		int n = (int) (c - name);
+		if ( *c != ' ' || n >= (int) sizeof(first) ) continue;
+		memcpy( first, name, n ); first[n] = 0;
+		float m = max( OverlayTextWidth( first ), OverlayTextWidth( c + 1 ) );
+		if ( m < bestW ) { bestW = m; split = n; }
+	}
+	if ( split < 0 ) { OverlayText( floorf( x - w * 0.5F ), floorf( y - lh * 0.5F ), name, color ); return; }
+	memcpy( first, name, split ); first[split] = 0;
+	const char* second = name + split + 1;
+	OverlayText( floorf( x - OverlayTextWidth( first ) * 0.5F ), floorf( y - lh ), first, color );
+	OverlayText( floorf( x - OverlayTextWidth( second ) * 0.5F ), floorf( y ), second, color );
+}
+
+// A ring's piece, angles from the top, clockwise.
+static void WheelSector( float cx, float cy, float r0, float r1, float a0, float a1, uint32_t color )
+{
+	const int N = 10;
+	for ( int k = 0; k < N; k++ ) {
+		float b0 = a0 + (a1 - a0) * k / N, b1 = a0 + (a1 - a0) * (k + 1) / N;
+		float s0 = sinf( b0 ), c0 = cosf( b0 ), s1 = sinf( b1 ), c1 = cosf( b1 );
+		OverlayTriangle( cx + s0 * r0, cy - c0 * r0, cx + s0 * r1, cy - c0 * r1, cx + s1 * r1, cy - c1 * r1, color );
+		OverlayTriangle( cx + s0 * r0, cy - c0 * r0, cx + s1 * r1, cy - c1 * r1, cx + s1 * r0, cy - c1 * r0, color );
+	}
+}
+
+// The emote wheel, middle of the screen : 8 wedges round the wheel's name.
+static void DrawWheel( float sw, float sh, float h )
+{
+	const float PI = 3.14159265F, STEP = PI / 4.0F;
+	const EmoteWheel& wheel = g_wheels[g_wheelIndex];
+	float cx = floorf( sw * 0.5F ), cy = floorf( sh * 0.47F );
+	float outer = floorf( sh * 0.3F ), inner = floorf( outer * 0.36F ), mid = (inner + outer) * 0.5F;
+	float lh = h * 1.15F;
+	float gap = (3.0F / mid) * 0.5F;   // Half the angle between two wedges (3 pixels, midway).
+	for ( int q = 0; q < 4; q++ ) WheelSector( cx, cy, 0.0F, inner - 3.0F, q * PI * 0.5F, (q + 1) * PI * 0.5F, 0xC0000000 );
+	for ( int s = 0; s < WHEEL_SLOTS; s++ ) {
+		bool on = s == g_wheelUi.hover;
+		int e = wheel.slot[s];
+		float a0 = (s - 0.5F) * STEP + gap, a1 = (s + 0.5F) * STEP - gap, ac = s * STEP;
+		WheelSector( cx, cy, inner, outer, a0, a1, on ? 0xE0503C0C : 0xC0000000 );
+		if ( on ) WheelSector( cx, cy, outer + 3.0F, outer + 7.0F, a0, a1, 0xFFFFE080 );
+		float maxW = (s == 2 || s == 6) ? (outer - inner) * 0.9F : 2.0F * mid * sinf( STEP * 0.5F ) * 0.9F;
+		DrawWheelLabel( cx + sinf( ac ) * mid, cy - cosf( ac ) * mid, e >= 0 ? EMOTES[e].name : "Empty", maxW, lh,
+			e < 0 ? 0xFF808080 : on ? 0xFFFFE080 : 0xFFFFFFFF );
+		if ( !g_wheelUi.byPad ) {   // The number keys.
+			char n[4];
+			sprintf_s( n, "%d", s + 1 );
+			float r = outer + h * 1.1F;
+			OverlayText( floorf( cx + sinf( ac ) * r - OverlayTextWidth( n ) * 0.5F ), floorf( cy - cosf( ac ) * r - h * 0.5F ), n, 0xFFB0B0B0 );
+		}
+	}
+	// The middle : the wheel's name (and which of how many).
+	char count[16];
+	sprintf_s( count, "%d / %d", g_wheelIndex + 1, g_wheelCount );
+	float ny = g_wheelCount > 1 ? cy - lh : cy - h * 0.5F;
+	OverlayText( floorf( cx - OverlayTextWidth( wheel.name ) * 0.5F ), floorf( ny ), wheel.name, 0xFFFFE080 );
+	if ( g_wheelCount > 1 ) OverlayText( floorf( cx - OverlayTextWidth( count ) * 0.5F ), floorf( ny + lh ), count, 0xFFB0B0B0 );
+	// What to do, under it.
+	char hint[160];
+	if ( g_wheelUi.byPad ) {
+		char button[24];
+		if ( g_emoteButton == 4 ) strcpy_s( button, "L1" );
+		else sprintf_s( button, "button %d", g_emoteButton + 1 );
+		sprintf_s( hint, "Right stick : choose   Let go of %s : play%s", button, g_wheelCount > 1 ? (g_emoteNeedsR1 ? "   R1 again : next wheel" : "   R1 : next wheel") : "" );
+	}
+	else sprintf_s( hint, "Mouse or 1 - 8 : choose   Let go of %s : play%s", KeyName( g_emoteKey ), g_wheelCount > 1 ? "   Tab : next wheel" : "" );
+	float hw = OverlayTextWidth( hint ), hy = floorf( cy + outer + h * 2.0F );
+	float pad = h * 0.3F;
+	OverlayRect( floorf( cx - hw * 0.5F ) - pad, hy - pad * 0.5F, hw + 2.0F * pad, h + pad, 0xA0000000 );
+	OverlayText( floorf( cx - hw * 0.5F ), hy, hint, 0xFFD8D8D8 );
+}
+
 static void DrawOverlay( IDirect3DDevice9* dev )
 {
 	if ( g_animSurvey ) return;   // Clean frames.
 	uint32_t now = NetNowMs();
 	if ( InterlockedExchange( &g_reqMenu, 0 ) ) SetMenuOpen( !g_menu.IsOpen() );
-	bool any = g_showList || g_animViewer || g_menu.IsOpen() || PlayingHs();
+	bool any = g_showList || g_animViewer || g_menu.IsOpen() || PlayingHs() || WheelShown();
 	for ( int i = 0; i < MAX_PEERS && !any; i++ ) any = g_peers[i].beast && g_peers[i].tagFrame && g_presentCount - g_peers[i].tagFrame <= TAG_GRACE_FRAMES;
 	for ( int i = 0; i < MAX_TOASTS && !any; i++ ) any = g_toasts[i].text[0] && now - g_toasts[i].time < TOAST_MS;
 	if ( !any ) return;
@@ -6130,7 +7252,7 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const Peer& p = g_peers[i];
 		float tagX, tagY, tagDepth;
-		if ( !g_showTags || g_menu.IsOpen() || HiddenFromMe( p.id ) || !PlaceNameTag( p, dev, &tagX, &tagY, &tagDepth ) ) continue;
+		if ( !g_showTags || g_menu.IsOpen() || WheelShown() || HiddenFromMe( p.id ) || !PlaceNameTag( p, dev, &tagX, &tagY, &tagDepth ) ) continue;
 		float from = (float) g_tagFadeFrom, to = (float) g_tagFadeTo;
 		float alpha = to > from ? 1.0F - (tagDepth - from) / (to - from) : (tagDepth < from ? 1.0F : 0.0F);
 		if ( alpha <= 0.0F ) continue;
@@ -6190,6 +7312,8 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 		OverlayText( x, y, role, g_myRole == ROLE_HIDER ? 0xFFFFE080 : 0xFFFFFFFF );
 		OverlayText( x + w - OverlayTextWidth( hidden ), y, hidden, 0xFFFFFFFF );
 	}
+
+	if ( WheelShown() && !g_menu.IsOpen() ) DrawWheel( sw, sh, h );
 
 	// The animation viewer, bottom left.
 	if ( g_animViewer && g_animIndex < g_animNoteCount ) {
@@ -6409,6 +7533,10 @@ public:
 				g_allowPuppetFade = GetEnvironmentVariableA( "PTLE_MP_FADEALLOW", env, sizeof(env) ) && env[0] == '1';
 				{ char lv[16] = { 0, }; if ( GetEnvironmentVariableA( "PTLE_MP_LEVEL", lv, sizeof(lv) ) ) AUTOTEST_LEVEL = strtoul( lv, 0, 16 ); }   // Another level (its CRC, hex).
 				mp_log( "[AT] Distance test.\n" );
+			}
+			if ( GetEnvironmentVariableA( "PTLE_MP_EMOTETEST", env, sizeof(env) ) && env[0] >= '1' && env[0] <= '9' ) {
+				g_emoteTest = env[0] - '0';
+				mp_log( "[AT] Emote test %d.\n", g_emoteTest );
 			}
 			if ( GetEnvironmentVariableA( "PTLE_MP_HSTEST", env, sizeof(env) ) && env[0] >= '1' && env[0] <= '9' ) {
 				g_hsTest = env[0] - '0';

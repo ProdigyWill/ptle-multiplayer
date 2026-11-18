@@ -14,6 +14,20 @@ static const int HINT_LINES = 3;           // The footer's hint, at most.
 static const float LINE_GAP = 1.3F;        // Footer lines, in text heights.
 static const uint32_t PANEL = 0xD0000000, LINE = 0x30FFFFFF, SELECTED = 0x38FFFFFF, TAB_ON = 0x38FFE080;
 
+// text, cut short with "..." to fit maxW.
+static void FitText( const char* text, float maxW, char* out, size_t size )
+{
+	strncpy_s( out, size, text, _TRUNCATE );
+	if ( OverlayTextWidth( out ) <= maxW ) return;
+	size_t n = strlen( out );
+	while ( n > 0 ) {
+		out[--n] = 0;
+		char trial[256];
+		sprintf_s( trial, "%s...", out );
+		if ( OverlayTextWidth( trial ) <= maxW ) { strncpy_s( out, size, trial, _TRUNCATE ); return; }
+	}
+}
+
 void Menu::Open()
 {
 	m_open = true;
@@ -37,6 +51,10 @@ void Menu::Begin( const MenuInput& input, float screenW, float screenH, float te
 	m_h = textHeight;
 	m_keepOpen = false;
 	m_copy[0] = 0;
+	m_keys = 0;
+	m_capture = m_captureNext;   // A list selected last frame keeps Up / Down.
+	m_captureNext = -1;
+	m_listKeys = m_capture >= 0 && m_capture == m_row;
 	if ( m_editing ) m_in.up = m_in.down = m_in.left = m_in.right = m_in.nextPage = m_in.prevPage = 0;   // Typing : the keys are the text's.
 	m_rowH = floorf( m_h * 1.55F );
 	m_pad = floorf( m_h * 0.6F );
@@ -48,16 +66,17 @@ void Menu::Begin( const MenuInput& input, float screenW, float screenH, float te
 		if ( page < 0 && (m_in.nextPage || m_in.prevPage) ) page += m_pageCount;
 		if ( page != m_page ) { m_page = page; m_row = 0; m_rowCount = 0; }
 	}
-	if ( m_rowCount > 0 ) {
+	if ( m_rowCount > 0 && m_capture != m_row ) {
 		m_row = (m_row + m_in.down - m_in.up) % m_rowCount;
 		if ( m_row < 0 ) m_row += m_rowCount;
 	}
 
 	float w = m_h * 40.0F;
 	if ( w > screenW - 2.0F * m_h ) w = screenW - 2.0F * m_h;
+	if ( m_narrow && w > floorf( screenW * 0.6F ) - 2.0F * m_h ) w = floorf( screenW * 0.6F ) - 2.0F * m_h;
 	float h = m_rowH + m_pad * 0.5F + m_rowH * MAX_ROWS + m_pad * 0.5F   // Title, body,
 		+ m_pad * 0.8F + m_h * LINE_GAP * HINT_LINES + m_pad * 0.6F + m_h + m_pad;   // the hint's lines, the keys.
-	m_panel.x = floorf( (screenW - w) * 0.5F );
+	m_panel.x = m_narrow ? floorf( m_h ) : floorf( (screenW - w) * 0.5F );
 	m_panel.y = floorf( (screenH - h) * 0.5F );
 	m_panel.w = floorf( w );
 	m_panel.h = floorf( h );
@@ -216,16 +235,16 @@ void Menu::Info( const char* left, const char* right, uint32_t color )
 	if ( right ) OverlayText( r.x + r.w - OverlayTextWidth( right ), y, right, color );
 }
 
-bool Menu::Selectable( const char* hint, Rect* row, bool* clicked )
+bool Menu::Selectable( const char* hint, Rect* row, bool* clicked, float height, bool highlight )
 {
-	*row = NextRow();
+	*row = NextRow( height );
 	int index = m_declSelectable++;
 	bool over = Hit( *row );
 	if ( over && (m_in.mouseMoved || m_in.mouseClicked) ) m_row = index;   // The mouse selects what it points at.
 	*clicked = over && m_in.mouseClicked;
 	bool selected = index == m_row;
 	if ( selected ) {
-		OverlayRect( row->x - m_pad * 0.5F, row->y, row->w + m_pad, row->h, SELECTED );
+		if ( highlight ) OverlayRect( row->x - m_pad * 0.5F, row->y, row->w + m_pad, row->h, SELECTED );
 		m_hint = hint;
 	}
 	return selected;
@@ -455,6 +474,172 @@ bool Menu::Action( const char* label, const char* hint )
 	return clicked || (selected && m_in.accept);
 }
 
+bool Menu::TextField( const char* label, char* text, int size, const char* placeholder, const char* hint )
+{
+	Rect r; bool clicked;
+	int index = m_declSelectable;
+	bool selected = Selectable( hint, &r, &clicked );
+	bool editing = m_editing && m_editRow == index;
+	bool changed = false;
+	if ( editing && !selected ) m_editing = editing = false;   // Moved away.
+	if ( editing ) {
+		const char* sources[2] = { m_in.typed, m_in.pasted };
+		for ( int s = 0; s < 2; s++ ) {
+			for ( const char* t = sources[s]; t && *t; t++ ) {
+				size_t n = strlen( text );
+				if ( *t == '\b' ) { if ( n ) { text[n - 1] = 0; changed = true; } }
+				else if ( (unsigned char) *t >= ' ' && (int) n + 1 < size ) { text[n] = *t; text[n + 1] = 0; changed = true; }
+			}
+		}
+		if ( m_in.accept ) m_editing = editing = false;
+		if ( m_in.back ) { m_editing = editing = false; m_keepOpen = true; }
+	}
+	else if ( selected && (m_in.accept || clicked) ) {
+		m_editing = editing = true;
+		m_editRow = index;
+	}
+	if ( selected && m_in.copy && text[0] ) strncpy_s( m_copy, text, _TRUNCATE );
+	if ( editing ) m_keys = "Type    Enter or Esc : done    Ctrl + V : paste";
+
+	Label( r, label, selected );
+	float y = r.y + (m_rowH - m_h) * 0.5F;
+	char shown[256];
+	if ( editing ) sprintf_s( shown, "%s_", text );
+	else strncpy_s( shown, text[0] ? text : (placeholder ? placeholder : ""), _TRUNCATE );
+	float w = OverlayTextWidth( shown );
+	if ( editing ) OverlayRect( r.x + r.w - w - 6.0F, r.y + 2.0F, w + 6.0F, r.h - 4.0F, 0x60000000 );
+	OverlayText( r.x + r.w - w, y, shown, editing ? WHITE : text[0] ? GOLD : DIM );
+	return changed;
+}
+
+int Menu::Ring( const char* const* names, int* cursor, const char* centre, int* swapFrom, const char* hint )
+{
+	const int SLOTS = 8;
+	Rect r; bool clicked;
+	bool selected = Selectable( hint, &r, &clicked, floorf( m_rowH * 7.0F ), false );
+	int action = RING_NONE;
+	float boxW = floorf( m_h * 9.0F < r.w * 0.3F ? m_h * 9.0F : r.w * 0.3F ), boxH = floorf( m_rowH * 0.85F );
+	float cx = r.x + r.w * 0.5F, cy = r.y + r.h * 0.5F;
+	float rx = r.w * 0.5F - boxW * 0.5F, ry = r.h * 0.5F - boxH * 0.5F;
+	Rect boxes[SLOTS];
+	for ( int s = 0; s < SLOTS; s++ ) {
+		float a = s * 0.7853982F;
+		boxes[s].x = floorf( cx + sinf( a ) * rx - boxW * 0.5F );
+		boxes[s].y = floorf( cy - cosf( a ) * ry - boxH * 0.5F );
+		boxes[s].w = boxW;
+		boxes[s].h = boxH;
+		if ( Hit( boxes[s] ) ) {   // The mouse points at a slot, a click chooses for it.
+			if ( m_in.mouseMoved || m_in.mouseClicked ) *cursor = s;
+			if ( m_in.mouseClicked ) action = RING_CHOOSE;
+		}
+	}
+	if ( *cursor < 0 || *cursor >= SLOTS ) *cursor = 0;
+	if ( selected && action == RING_NONE ) {
+		int old = *cursor;
+		int move = m_in.right - m_in.left, swap = m_in.shiftRight - m_in.shiftLeft;
+		if ( swap ) { *cursor = ((old + swap) % SLOTS + SLOTS) % SLOTS; *swapFrom = old; action = RING_SWAP; }
+		else if ( move ) *cursor = ((old + move) % SLOTS + SLOTS) % SLOTS;
+		if ( m_in.accept ) action = RING_CHOOSE;
+		else if ( m_in.del ) action = RING_CLEAR;
+	}
+
+	// Lines from the middle to each slot, faint; the slots over them.
+	for ( int s = 0; s < SLOTS; s++ ) {
+		float a = s * 0.7853982F, steps = 24.0F;
+		for ( int k = 4; k < (int) steps - 3; k++ ) {
+			float f = k / steps;
+			OverlayRect( floorf( cx + sinf( a ) * rx * f ), floorf( cy - cosf( a ) * ry * f ), 2.0F, 2.0F, 0x30FFFFFF );
+		}
+	}
+	for ( int s = 0; s < SLOTS; s++ ) {
+		const Rect& b = boxes[s];
+		bool current = s == *cursor;
+		OverlayRect( b.x, b.y, b.w, b.h, current && selected ? TAB_ON : 0x28FFFFFF );
+		if ( current ) {
+			uint32_t edge = selected ? GOLD : DIM;
+			OverlayRect( b.x - 1.0F, b.y - 1.0F, b.w + 2.0F, 1.0F, edge );
+			OverlayRect( b.x - 1.0F, b.y + b.h, b.w + 2.0F, 1.0F, edge );
+			OverlayRect( b.x - 1.0F, b.y, 1.0F, b.h, edge );
+			OverlayRect( b.x + b.w, b.y, 1.0F, b.h, edge );
+		}
+		char number[4], name[96];
+		sprintf_s( number, "%d", s + 1 );
+		float nw = OverlayTextWidth( "8" ) + m_pad * 0.5F;
+		float ty = b.y + (b.h - m_h) * 0.5F;
+		OverlayText( b.x + m_pad * 0.35F, ty, number, DIM );
+		FitText( names[s] ? names[s] : "Empty", b.w - 2.0F * nw, name, sizeof(name) );
+		OverlayText( floorf( b.x + (b.w - OverlayTextWidth( name )) * 0.5F ), ty, name, !names[s] ? DIM : current && selected ? GOLD : WHITE );
+	}
+	if ( centre ) {
+		char text[64];
+		FitText( centre, rx * 1.2F, text, sizeof(text) );
+		OverlayText( floorf( cx - OverlayTextWidth( text ) * 0.5F ), floorf( cy - m_h * 0.5F ), text, GOLD );
+	}
+	return action;
+}
+
+bool Menu::List( const char* const* names, const char* const* tags, int count, int* cursor, int* scroll, int visible, const char* hint )
+{
+	Rect r; bool clicked;
+	int index = m_declSelectable;
+	float itemH = floorf( m_h * 1.35F );
+	bool selected = Selectable( hint, &r, &clicked, itemH * visible, false );
+	m_captureNext = index;
+	bool chosen = false;
+	if ( *cursor >= count ) *cursor = count - 1;
+	if ( *cursor < 0 ) *cursor = 0;
+	if ( selected && m_listKeys && m_capture == index ) {   // Up / Down are the list's (it was selected already); at its ends, out of it.
+		if ( m_in.up && *cursor == 0 ) m_row = index > 0 ? index - 1 : (m_rowCount > 0 ? m_rowCount - 1 : 0);
+		else if ( m_in.down && *cursor >= count - 1 ) m_row = index + 1 < m_rowCount ? index + 1 : 0;
+		else {
+			*cursor += m_in.down - m_in.up + (m_in.pageDown - m_in.pageUp) * visible;
+			if ( *cursor >= count ) *cursor = count - 1;
+			if ( *cursor < 0 ) *cursor = 0;
+		}
+		if ( m_in.accept && count > 0 ) chosen = true;
+	}
+	// Scrolled so the cursor shows.
+	if ( *cursor < *scroll ) *scroll = *cursor;
+	if ( *cursor >= *scroll + visible ) *scroll = *cursor - visible + 1;
+	if ( *scroll > count - visible ) *scroll = count - visible;
+	if ( *scroll < 0 ) *scroll = 0;
+
+	bool bar = count > visible;
+	float barW = bar ? 4.0F : 0.0F;
+	for ( int i = *scroll; i < count && i < *scroll + visible; i++ ) {
+		Rect item = { r.x, r.y + (i - *scroll) * itemH, r.w - barW - (bar ? m_pad * 0.5F : 0.0F), itemH };
+		if ( Hit( item ) ) {
+			if ( m_in.mouseMoved || m_in.mouseClicked ) *cursor = i;
+			if ( m_in.mouseClicked ) chosen = true;
+		}
+		bool current = i == *cursor;
+		if ( current ) OverlayRect( item.x - m_pad * 0.5F, item.y, item.w + m_pad * 0.5F, item.h, selected ? SELECTED : 0x14FFFFFF );
+		float ty = item.y + (item.h - m_h) * 0.5F;
+		float tagW = 0.0F;
+		if ( tags && tags[i] && tags[i][0] ) {
+			tagW = OverlayTextWidth( tags[i] ) + m_pad;
+			OverlayText( item.x + item.w - OverlayTextWidth( tags[i] ), ty, tags[i], DIM );
+		}
+		char name[128];
+		FitText( names[i], item.w - tagW, name, sizeof(name) );
+		OverlayText( item.x, ty, name, current && selected ? GOLD : WHITE );
+	}
+	if ( count <= 0 ) OverlayText( r.x, r.y + (itemH - m_h) * 0.5F, "Nothing found", DIM );
+	if ( bar ) {   // Where the rows shown are in the whole list.
+		float x = r.x + r.w - barW, h = r.h;
+		OverlayRect( x, r.y, barW, h, 0x20FFFFFF );
+		OverlayRect( x, floorf( r.y + h * *scroll / count ), barW, floorf( h * visible / count ), DIM );
+	}
+	return chosen;
+}
+
+bool Menu::Back()
+{
+	if ( !m_in.back || m_keepOpen ) return false;
+	m_keepOpen = true;
+	return true;
+}
+
 void Menu::End()
 {
 	if ( m_group >= 0 ) EndGroup();
@@ -486,7 +671,7 @@ void Menu::End()
 		float first = top + (HINT_LINES - used) * m_h * LINE_GAP * 0.5F;   // Fewer lines : in the middle of their space.
 		for ( int i = 0; i < used; i++ ) OverlayText( floorf( mid - OverlayTextWidth( line[i] ) * 0.5F ), first + i * m_h * LINE_GAP, line[i], DIM );
 	}
-	const char* keys = m_editing ? "Type a color    Enter : set it    Esc : leave it    Ctrl + V : paste"
+	const char* keys = m_keys ? m_keys : m_editing ? "Type a color    Enter : set it    Esc : leave it    Ctrl + V : paste"
 		: "Arrows : move, change    Tab : next page    Esc : close    Mouse : click";
 	OverlayText( floorf( mid - OverlayTextWidth( keys ) * 0.5F ), top + m_h * LINE_GAP * HINT_LINES + m_pad * 0.6F, keys, 0xFF909090 );
 

@@ -169,6 +169,14 @@ void OverlayRect( float x, float y, float w, float h, uint32_t color )
 	Quad( g_rects, x, y, x + w, y + h, 0.0F, 0.0F, 0.0F, 0.0F, color );
 }
 
+void OverlayTriangle( float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color )
+{
+	Vertex a = { x0 - 0.5F, y0 - 0.5F, 0.0F, 1.0F, color, 0.0F, 0.0F };
+	Vertex b = { x1 - 0.5F, y1 - 0.5F, 0.0F, 1.0F, color, 0.0F, 0.0F };
+	Vertex c = { x2 - 0.5F, y2 - 0.5F, 0.0F, 1.0F, color, 0.0F, 0.0F };
+	g_rects.push_back( a ); g_rects.push_back( b ); g_rects.push_back( c );
+}
+
 // The game's state, put back after drawing.
 static const D3DRENDERSTATETYPE SAVED_RS[] = {
 	D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP,

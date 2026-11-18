@@ -25,6 +25,9 @@ struct MenuInput
 	int up, down, left, right;     // Presses (with key repeat).
 	int accept, back;              // Enter, Esc.
 	int nextPage, prevPage;        // Tab, Shift + Tab.
+	int del;                       // Delete.
+	int pageUp, pageDown;          // Page Up, Page Down (with key repeat).
+	int shiftLeft, shiftRight;     // Shift + Left / Right (not in left, right).
 	float mouseX, mouseY;          // Overlay pixels.
 	bool mouseInside;              // Over the game's image.
 	bool mouseDown;                // Left button held.
@@ -49,6 +52,9 @@ public:
 	bool GroupOpen( int group ) const { return group >= 0 && group < MAX_GROUPS && m_groupShown[group]; }
 	void Open();
 	void Close();
+
+	// Narrow : the menu keeps to the left of the screen (the game shows at the right). Before Begin.
+	void SetNarrow( bool narrow ) { m_narrow = narrow; }
 
 	// status : shown at the right of the title bar (may be 0).
 	void Begin( const MenuInput& input, float screenW, float screenH, float textHeight, const char* title, const char* status );
@@ -85,6 +91,23 @@ public:
 	// (Enter again sets it, Esc gives up); Ctrl + V pastes one; Ctrl + C copies it.
 	bool Colour( const char* label, uint8_t rgb[3], const char* hint = 0 );
 
+	// Text typed in place : Enter (or a click) starts typing, Enter or Esc stops. True
+	// as it changes. placeholder : shown while it's empty (may be 0).
+	bool TextField( const char* label, char* text, int size, const char* placeholder = 0, const char* hint = 0 );
+	// Eight slots round a ring (a wheel's), the first at the top, clockwise; names[i] 0 :
+	// empty. Left / Right move *cursor round it. Returns what the player asked for :
+	// Enter or a click, choose the slot's content; Delete, empty it; Shift + Left / Right,
+	// move it round (*cursor moved with it, *swapFrom where it was).
+	enum { RING_NONE, RING_CHOOSE, RING_CLEAR, RING_SWAP };
+	int Ring( const char* const* names, int* cursor, const char* centre, int* swapFrom, const char* hint = 0 );
+	// A list scrolling through visible rows. While it's selected, Up / Down go through it
+	// (out of it at its ends), Page Up / Down by pages. True : *cursor chosen (Enter, a click).
+	bool List( const char* const* names, const char* const* tags, int count, int* cursor, int* scroll, int visible, const char* hint = 0 );
+	// Esc, this frame : taken by the page (back out of something), the menu stays open.
+	bool Back();
+	// The footer's keys line, this frame (0 : the usual).
+	void SetKeys( const char* keys ) { m_keys = keys; }
+
 	// Text for the clipboard (Ctrl + C on a row that has some), this frame; 0 : none.
 	const char* CopyText() const { return m_copy[0] ? m_copy : 0; }
 	bool IsTyping() const { return m_open && m_editing; }
@@ -102,7 +125,9 @@ private:
 		return y > 0.0F;
 	}
 	Rect NextTab();
-	bool Selectable( const char* hint, Rect* row, bool* clicked );   // Starts a row the player can select; true : it's the selected one.
+	// Starts a row the player can select (height 0 : a row's; highlight : drawn when
+	// selected); true : it's the selected one.
+	bool Selectable( const char* hint, Rect* row, bool* clicked, float height = 0.0F, bool highlight = true );
 	Rect NextRow( float height = 0.0F );   // (0 : a row's height.)
 	bool Hit( const Rect& r ) const;
 	void Label( const Rect& row, const char* label, bool selected );
@@ -135,4 +160,8 @@ private:
 	char m_edit[32] = { 0, };
 	bool m_keepOpen = false;              // Esc ended the typing, not the menu.
 	char m_copy[32] = { 0, };
+	bool m_narrow = false;
+	int m_capture = -1, m_captureNext = -1;   // The list that has Up / Down (this frame, the next).
+	bool m_listKeys = false;                  // ... and it was selected as the frame began.
+	const char* m_keys = 0;
 };
