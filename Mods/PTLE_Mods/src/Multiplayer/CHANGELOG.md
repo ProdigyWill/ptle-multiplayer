@@ -22,10 +22,12 @@ title; players with another version are marked on its Players page.
 - **Emotes** : hold **L1 / LB**, point the right stick at an emote on the wheel
   and let go to play it (keyboard : hold **T**, point the mouse or the arrows, or
   press 1 - 8). **R1** (Tab) flips to your next wheel. Everyone sees you dance.
-  Loops keep going until you move or press anything; Breakdance and Pickaxe Spin
-  play their ending when you do (press something again to skip it). You need to
-  be standing still with no item out to start one. While the wheel is out, the
-  right stick (the arrows) doesn't move Harry's arm. F1 → **Emotes** builds your
+  Loops keep going until you move or press anything (turning the camera doesn't
+  count); Breakdance and Pickaxe Spin play their ending when you do (press
+  something again to skip it). Some stay put until you move : Teleport Zen
+  floats in meditation, and in Death and Death 2 Harry lies there, then gets up.
+  You need to be standing still with no item out to start one. While the wheel
+  is out, the right stick (the arrows) doesn't move Harry's arm. F1 → **Emotes** builds your
   wheels (up to 4 of 8) from all of Harry's animations, with a search,
   categories and a preview beside you (choose a slot to see its emote). Two
   wheels to start with : Party and Silly. The buttons can be changed on the Keys

@@ -1,5 +1,5 @@
 // The emote catalogue : written by make-emotes.py from the animation notes (don't edit by hand).
-// { id (chains), name, category, loops, favourite, intro clip, clip, ending clips (chains) }
+// { id (chains), name, category, loops, favourite, intro clip, clip, ending clips, hold frames, the ending's first frame }
 static const char* const EMOTE_CATEGORIES[] = { "Idles and moves", "Combat", "Items", "Water", "Climbing and levers", "Damage and death", "Raft", "Unused" };
 static const int NUM_EMOTE_CATEGORIES = 8;
 
@@ -25,7 +25,7 @@ static const EmoteDef EMOTES[] = {
 	{ 0, "Walk Shield Up Angle", 2, true, false, 0, 0xC070A539 },   // 016
 	{ 0, "Walk Shield Up", 2, true, false, 0, 0x400ED780 },   // 017
 	{ 0, "Idle", 0, true, false, 0, 0xB23CB6D0 },   // 018
-	{ 0, "Teleport Zen", 0, true, true, 0, 0x9279E598 },   // 019
+	{ 0, "Teleport Zen", 0, false, true, 0, 0x9279E598, { 0x00000000, 0x00000000 }, { 246.0F, 288.0F }, 0.0F },   // 019
 	{ 0, "Running Man", 0, true, true, 0, 0xF11F8411 },   // 020
 	{ 0, "Bug Buzz", 0, false, true, 0, 0xD19BA126 },   // 021
 	{ 0, "Jig", 0, false, true, 0, 0x66CE67E6 },   // 022
@@ -110,8 +110,8 @@ static const EmoteDef EMOTES[] = {
 	{ 0, "Dive Into Water", 3, false, false, 0, 0x5A9A222C },   // 101
 	{ 0, "Hit Swim", 5, true, false, 0, 0x7783DFD5 },   // 102
 	{ 0, "Hit Swim 2 (bugged)", 5, true, false, 0, 0x97B430DA },   // 103
-	{ 0, "Death", 5, false, true, 0, 0xE65F150E },   // 104
-	{ 0, "Death 2", 5, false, true, 0, 0xB52A8757 },   // 105
+	{ 0, "Death", 5, false, true, 0, 0xE65F150E, { 0xBF3F14A6, 0x00000000 }, { -1.0F, -1.0F }, 50.0F },   // 104
+	{ 0, "Death 2", 5, false, true, 0, 0xB52A8757, { 0xBF3F14A6, 0x00000000 }, { -1.0F, -1.0F }, 50.0F },   // 105
 	{ 0, "Fall Death", 5, false, false, 0, 0x50F2F5F7 },   // 106
 	{ 0, "Holding Pickaxe While On Wall Left", 4, true, false, 0, 0x4AE33CA0 },   // 107
 	{ 0, "Holding Pickaxe While On Wall Right", 4, true, false, 0, 0x1A2B9B85 },   // 108

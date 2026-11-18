@@ -10,13 +10,21 @@ CATEGORIES = ["Idles and moves", "Combat", "Items", "Water", "Climbing and lever
 # Display names for some favourites.
 NAMES = { 0x9279E598: "Teleport Zen", 0xD19BA126: "Bug Buzz", 0xE62C6A30: "Breakdance Loop", 0xFD13180C: "Pickaxe Spin Loop" }
 # Loop these whatever their name says (the favourites that are dances).
-LOOPS = { 0xFD13180C, 0xF11F8411, 0x9279E598, 0xE203A1ED, 0x0945FC67, 0x4FFA75E5 }
+LOOPS = { 0xFD13180C, 0xF11F8411, 0xE203A1ED, 0x0945FC67, 0x4FFA75E5 }
 # Play these once whatever their name says (Jig, Bug Buzz).
 ONCE = { 0x66CE67E6, 0xD19BA126 }
 # Chains : (id, name, category, intro clip, looping clip, ending clips), favourites. The
 # ending plays when you move (breakdance outro and finish; pickaxe stop dizzy intro and outro).
 CHAINS = [ ("breakdance", "Breakdance", 0, 0x20C73979, 0xE62C6A30, (0x0CCA1088, 0xC144927F)),
            ("pickaxe-spin", "Pickaxe Spin", 2, 0x6F332AB9, 0xFD13180C, (0x676B0F87, 0x3CE7C4E2)) ]
+
+# Holds : clip -> (first frame, last frame it stays between, ending clips, the ending's first frame).
+# Harry stays there (between the two, there and back, slowing at each end; -1 : the clip's last
+# frame) until you move, then the ending plays (none : the rest of the clip).
+FALLING_RECOVERY = 0xBF3F14A6   # From lying on his back (frame 50), he gets up.
+HOLDS = { 0x9279E598: (246, 288, (0, 0), 0),                      # Teleport Zen : floating, smiling (eyes shut 195 - 295; 246 : the bob's bottom).
+          0xE65F150E: (-1, -1, (FALLING_RECOVERY, 0), 50),        # Death : lying there.
+          0xB52A8757: (-1, -1, (FALLING_RECOVERY, 0), 50) }       # Death 2.
 
 def category( note ):
     n = note.lower()
@@ -60,11 +68,15 @@ def main():
             name = "%s %d" % (name, seen[name.lower()])
         else: seen[name.lower()] = 1
         loop = (crc in LOOPS or loops( note )) and crc not in ONCE
-        out.append( '\t{ 0, "%s", %d, %s, %s, 0, 0x%08X },   // %03d' % (name.replace( '"', "'" ), category( note ), "true" if loop else "false", "true" if star else "false", crc, num) )
+        extra = ""
+        if crc in HOLDS:
+            h0, h1, ending, start = HOLDS[crc]
+            extra = ", { 0x%08X, 0x%08X }, { %d.0F, %d.0F }, %d.0F" % (ending[0], ending[1], h0, h1, start)
+        out.append( '\t{ 0, "%s", %d, %s, %s, 0, 0x%08X%s },   // %03d' % (name.replace( '"', "'" ), category( note ), "true" if loop else "false", "true" if star else "false", crc, extra, num) )
     here = os.path.dirname( os.path.abspath( __file__ ) )
     with open( os.path.join( here, "emotes_data.h" ), "w", encoding="utf-8", newline="\r\n" ) as f:
         f.write( "// The emote catalogue : written by make-emotes.py from the animation notes (don't edit by hand).\n" )
-        f.write( "// { id (chains), name, category, loops, favourite, intro clip, clip, ending clips (chains) }\n" )
+        f.write( "// { id (chains), name, category, loops, favourite, intro clip, clip, ending clips, hold frames, the ending's first frame }\n" )
         f.write( "static const char* const EMOTE_CATEGORIES[] = { %s };\n" % ", ".join( '"%s"' % c for c in CATEGORIES ) )
         f.write( "static const int NUM_EMOTE_CATEGORIES = %d;\n\n" % len( CATEGORIES ) )
         f.write( "static const EmoteDef EMOTES[] = {\n" + "\n".join( out ) + "\n};\n" )
