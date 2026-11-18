@@ -24,7 +24,8 @@ CHAINS = [ ("breakdance", "Breakdance", 0, 0x20C73979, 0xE62C6A30, (0x0CCA1088, 
 FALLING_RECOVERY = 0xBF3F14A6   # From lying on his back (frame 50), he gets up.
 HOLDS = { 0x9279E598: (246, 288, (0, 0), 0),                      # Teleport Zen : floating, smiling (eyes shut 195 - 295; 246 : the bob's bottom).
           0xE65F150E: (-1, -1, (FALLING_RECOVERY, 0), 50),        # Death : lying there.
-          0xB52A8757: (-1, -1, (FALLING_RECOVERY, 0), 50) }       # Death 2.
+          0xB52A8757: (-1, -1, (FALLING_RECOVERY, 0), 50),        # Death 2.
+          0xC144927F: (-1, -1, (0, 0), 0) }                        # Breakdance Finish (on its own, not the chain's) : its pose.
 
 def category( note ):
     n = note.lower()

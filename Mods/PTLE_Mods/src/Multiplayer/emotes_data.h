@@ -91,7 +91,7 @@ static const EmoteDef EMOTES[] = {
 	{ 0, "Breakdance Intro", 0, false, false, 0, 0x20C73979 },   // 082
 	{ 0, "Breakdance Loop", 0, true, true, 0, 0xE62C6A30 },   // 083
 	{ 0, "Breakdance Outro", 0, false, false, 0, 0x0CCA1088 },   // 084
-	{ 0, "Breakdance Finish", 0, false, true, 0, 0xC144927F },   // 085
+	{ 0, "Breakdance Finish", 0, false, true, 0, 0xC144927F, { 0x00000000, 0x00000000 }, { -1.0F, -1.0F }, 0.0F },   // 085
 	{ 0, "Idle Sneak", 0, true, false, 0, 0xF6097AAE },   // 086
 	{ 0, "Walk Intro", 0, true, false, 0, 0xB1D74FB6 },   // 087
 	{ 0, "Rising Strike", 1, false, false, 0, 0x10EE8519 },   // 088

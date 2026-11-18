@@ -3201,8 +3201,8 @@ static void EmoteTick( EIHarry* harry )
 			g_emote.ending = 0;
 			BeginClip( d.ending[0], false, d.endingFrom, d.endingFrom > 0.0F ? EMOTE_ENDING_BLEND_MS : 0 );
 		}
-		// ... or the rest of its clip.
-		else if ( byYou && !held && g_emote.holding ) {
+		// ... or the rest of its clip (none after a hold on its last frame : it fades out).
+		else if ( byYou && !held && g_emote.holding && !(d.hold[0] < 0.0F && d.hold[1] < 0.0F) ) {
 			mp_log( "[EM] %s : finishing (%s).\n", d.name, over );
 			g_emote.finishing = true;
 			uint8_t* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
@@ -5244,7 +5244,7 @@ static void AutotestStep( EIHarry* harry )
 		static DWORD lastLog = 0, mark = 0;
 		DWORD t = now - phaseStart;
 		struct Local { static void Check( const char* what, bool ok ) { mp_log( "[AT] Emote : %s : %s\n", what, ok ? "ok" : "WRONG" ); if ( !ok ) failures++; } };
-		static int victory, jig, breakdance, running, dizzy, pickaxe, zen, death;
+		static int victory, jig, breakdance, running, dizzy, pickaxe, zen, death, bdFinish;
 		static uint32_t arrowFrames = 0;
 		static bool sawEnding[2];
 		// Harry's pose not moving (the same bones as last time) : the longest stretch, while watched.
@@ -5274,7 +5274,7 @@ static void AutotestStep( EIHarry* harry )
 			g_wheelCount = 2;
 			for ( int w = 0; w < MAX_WHEELS; w++ ) DefaultWheel( w );
 			victory = FindEmoteByName( "Victory Dance" ); jig = FindEmoteByName( "Jig" ); breakdance = FindEmoteByName( "Breakdance" );
-			running = FindEmoteByName( "Running Man" ); dizzy = FindEmoteByName( "Dizzy Walk" ); pickaxe = FindEmoteByName( "Pickaxe Spin" ); zen = FindEmoteByName( "Teleport Zen" ); death = FindEmoteByName( "Death" );
+			running = FindEmoteByName( "Running Man" ); dizzy = FindEmoteByName( "Dizzy Walk" ); pickaxe = FindEmoteByName( "Pickaxe Spin" ); zen = FindEmoteByName( "Teleport Zen" ); death = FindEmoteByName( "Death" ); bdFinish = FindEmoteByName( "Breakdance Finish" );
 			mp_log( "[AT] Emote : %d emotes in the catalogue.\n", NUM_EMOTES );
 			bool all = true;
 			for ( int s = 0; s < WHEEL_SLOTS; s++ ) all &= g_wheels[0].slot[s] >= 0 && (s >= 6 || g_wheels[1].slot[s] >= 0);
@@ -5445,6 +5445,21 @@ static void AutotestStep( EIHarry* harry )
 		}
 		else if ( step == 137 && (!g_emote.active || t > 6000) ) {
 			Local::Check( "then it's over", !g_emote.active && strcmp( g_emoteLastEnd, "played" ) == 0 );
+			SendKey( 'W', false );
+			step = 138; phaseStart = now;
+		}
+		// Breakdance Finish (on its own) : its pose stays, till you move.
+		else if ( step == 138 && t >= 2500 ) { g_emoteRequest = bdFinish; step = 139; phaseStart = now; }
+		else if ( step == 139 && (g_emote.holding || t > 10000) ) { step = 140; phaseStart = now; }
+		else if ( step == 140 && t >= 2000 ) {
+			Local::Check( "Breakdance Finish stays at its end", bdFinish >= 0 && g_emote.active && g_emote.emote == bdFinish && g_emote.holding );
+			RequestSnapshot( "emote_14_bdfinish" );
+			SendKey( 'W', true );
+			step = 141; phaseStart = now;
+		}
+		else if ( step == 141 && (!g_emote.active || t > 3000) ) {
+			mp_log( "[AT] Emote : Breakdance Finish over after %u ms (%s).\n", t, g_emoteLastEnd );
+			Local::Check( "W : it fades out", !g_emote.active && t < 500 );
 			SendKey( 'W', false );
 			step = 9; phaseStart = now;
 		}

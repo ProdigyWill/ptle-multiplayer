@@ -25,7 +25,8 @@ title; players with another version are marked on its Players page.
   Loops keep going until you move or press anything (turning the camera doesn't
   count); Breakdance and Pickaxe Spin play their ending when you do (press
   something again to skip it). Some stay put until you move : Teleport Zen
-  floats in meditation, and in Death and Death 2 Harry lies there, then gets up.
+  floats in meditation, in Death and Death 2 Harry lies there, then gets up,
+  and Breakdance Finish keeps its pose.
   You need to be standing still with no item out to start one. While the wheel
   is out, the right stick (the arrows) doesn't move Harry's arm. F1 → **Emotes** builds your
   wheels (up to 4 of 8) from all of Harry's animations, with a search,
