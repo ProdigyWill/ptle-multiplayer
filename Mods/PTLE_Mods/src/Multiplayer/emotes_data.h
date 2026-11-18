@@ -1,11 +1,11 @@
 // The emote catalogue : written by make-emotes.py from the animation notes (don't edit by hand).
-// { id (chains), name, category, loops, favourite, intro clip, clip }
+// { id (chains), name, category, loops, favourite, intro clip, clip, ending clips (chains) }
 static const char* const EMOTE_CATEGORIES[] = { "Idles and moves", "Combat", "Items", "Water", "Climbing and levers", "Damage and death", "Raft", "Unused" };
 static const int NUM_EMOTE_CATEGORIES = 8;
 
 static const EmoteDef EMOTES[] = {
-	{ "breakdance", "Breakdance", 0, true, true, 0x20C73979, 0xE62C6A30 },
-	{ "pickaxe-spin", "Pickaxe Spin", 2, true, true, 0x6F332AB9, 0xFD13180C },
+	{ "breakdance", "Breakdance", 0, true, true, 0x20C73979, 0xE62C6A30, { 0x0CCA1088, 0xC144927F } },
+	{ "pickaxe-spin", "Pickaxe Spin", 2, true, true, 0x6F332AB9, 0xFD13180C, { 0x676B0F87, 0x3CE7C4E2 } },
 	{ 0, "Slow Walk", 0, true, false, 0, 0x36B0BED2 },   // 000
 	{ 0, "Walk", 0, true, false, 0, 0xE3897990 },   // 001
 	{ 0, "Run", 0, true, false, 0, 0x23738677 },   // 002
@@ -27,8 +27,8 @@ static const EmoteDef EMOTES[] = {
 	{ 0, "Idle", 0, true, false, 0, 0xB23CB6D0 },   // 018
 	{ 0, "Teleport Zen", 0, true, true, 0, 0x9279E598 },   // 019
 	{ 0, "Running Man", 0, true, true, 0, 0xF11F8411 },   // 020
-	{ 0, "Bug Buzz", 0, true, true, 0, 0xD19BA126 },   // 021
-	{ 0, "Jig", 0, true, true, 0, 0x66CE67E6 },   // 022
+	{ 0, "Bug Buzz", 0, false, true, 0, 0xD19BA126 },   // 021
+	{ 0, "Jig", 0, false, true, 0, 0x66CE67E6 },   // 022
 	{ 0, "Tired", 7, false, false, 0, 0x3444F367 },   // 023
 	{ 0, "What Was That", 0, false, false, 0, 0x7291E136 },   // 024
 	{ 0, "Scratch Butt", 0, false, true, 0, 0x1BFA84D6 },   // 025

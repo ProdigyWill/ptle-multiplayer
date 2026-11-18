@@ -10,11 +10,13 @@ CATEGORIES = ["Idles and moves", "Combat", "Items", "Water", "Climbing and lever
 # Display names for some favourites.
 NAMES = { 0x9279E598: "Teleport Zen", 0xD19BA126: "Bug Buzz", 0xE62C6A30: "Breakdance Loop", 0xFD13180C: "Pickaxe Spin Loop" }
 # Loop these whatever their name says (the favourites that are dances).
-LOOPS = { 0xFD13180C, 0x66CE67E6, 0xF11F8411, 0x9279E598, 0xD19BA126, 0xE203A1ED, 0x0945FC67, 0x4FFA75E5 }
-ONCE = set()
-# Chains : (id, name, category, intro clip, looping clip), favourites.
-CHAINS = [ ("breakdance", "Breakdance", 0, 0x20C73979, 0xE62C6A30),
-           ("pickaxe-spin", "Pickaxe Spin", 2, 0x6F332AB9, 0xFD13180C) ]
+LOOPS = { 0xFD13180C, 0xF11F8411, 0x9279E598, 0xE203A1ED, 0x0945FC67, 0x4FFA75E5 }
+# Play these once whatever their name says (Jig, Bug Buzz).
+ONCE = { 0x66CE67E6, 0xD19BA126 }
+# Chains : (id, name, category, intro clip, looping clip, ending clips), favourites. The
+# ending plays when you move (breakdance outro and finish; pickaxe stop dizzy intro and outro).
+CHAINS = [ ("breakdance", "Breakdance", 0, 0x20C73979, 0xE62C6A30, (0x0CCA1088, 0xC144927F)),
+           ("pickaxe-spin", "Pickaxe Spin", 2, 0x6F332AB9, 0xFD13180C, (0x676B0F87, 0x3CE7C4E2)) ]
 
 def category( note ):
     n = note.lower()
@@ -48,8 +50,8 @@ def main():
         rows.append( (num, crc, star, note) )
     seen = {}
     out = []
-    for cid, name, cat, intro, clip in CHAINS:
-        out.append( '\t{ "%s", "%s", %d, true, true, 0x%08X, 0x%08X },' % (cid, name, cat, intro, clip) )
+    for cid, name, cat, intro, clip, ending in CHAINS:
+        out.append( '\t{ "%s", "%s", %d, true, true, 0x%08X, 0x%08X, { 0x%08X, 0x%08X } },' % (cid, name, cat, intro, clip, ending[0], ending[1]) )
         seen[name.lower()] = 1
     for num, crc, star, note in rows:
         name = NAMES.get( crc ) or pretty( note ) or ("Clip %03d" % num)
@@ -62,7 +64,7 @@ def main():
     here = os.path.dirname( os.path.abspath( __file__ ) )
     with open( os.path.join( here, "emotes_data.h" ), "w", encoding="utf-8", newline="\r\n" ) as f:
         f.write( "// The emote catalogue : written by make-emotes.py from the animation notes (don't edit by hand).\n" )
-        f.write( "// { id (chains), name, category, loops, favourite, intro clip, clip }\n" )
+        f.write( "// { id (chains), name, category, loops, favourite, intro clip, clip, ending clips (chains) }\n" )
         f.write( "static const char* const EMOTE_CATEGORIES[] = { %s };\n" % ", ".join( '"%s"' % c for c in CATEGORIES ) )
         f.write( "static const int NUM_EMOTE_CATEGORIES = %d;\n\n" % len( CATEGORIES ) )
         f.write( "static const EmoteDef EMOTES[] = {\n" + "\n".join( out ) + "\n};\n" )

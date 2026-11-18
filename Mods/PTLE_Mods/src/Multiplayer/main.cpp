@@ -2875,6 +2875,7 @@ struct EmoteDef
 	bool favourite;
 	uint32_t intro;        // Chains : played once first, then the clip loops.
 	uint32_t clip;
+	uint32_t ending[2];    // Chains : played (one, then the other) when you move.
 };
 #include "emotes_data.h"
 
@@ -2974,33 +2975,101 @@ static void SaveWheels( const char* ini )
 }
 
 static const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (his own go up to 253), taking turns.
+// More of a layer (EAnimController, 0x619300 moves them on) :
+static const uint32_t LAYER_FPS = 0x00;             // float : the clip's frames a second ...
+static const uint32_t LAYER_AT_END = 0x0D;          // byte : at the clip's end, 0 : from the start again, 1 : stay on the last frame.
 static const uint32_t LAYER_TIME = 0x38;            // float : seconds played.
-static const uint32_t LAYER_FRAME = 0x3C;           // float : where in the clip (it stops at the end).
-static const uint32_t LAYER_TARGET = 0x60;          // float : the weight the game set it to (or is fading it to; +0x9C : fading).
+static const uint32_t LAYER_FRAME = 0x3C;           // float : where in the clip.
+static const uint32_t LAYER_SPEED = 0x48;           // float : ... times this.
+static const uint32_t LAYER_TARGET = 0x60;          // float : the weight the game set it to (or is fading it to).
+static const uint32_t LAYER_FADING = 0x9C;          // byte : fading to its target.
+static const uint32_t LAYER_ENDED = 0x9D;           // byte : got to the clip's end (Restart clears it).
+static const uint32_t LAYER_TICKED = 0x9E;          // byte : in the controller's list of layers it moves on. One faded out
+                                                    // to nothing is dropped from it, and posed from no clip : a T-pose.
+static const uint32_t CLIP_FRAMES = 0x14;           // int, in the clip (layer +0x78) : its frames (the last is this - 1).
+GET_METHOD( 0x61E4F0, void, AnimCtrl_SetTicked, EAnimController*, void*, bool );
 static const float EMOTE_MOVE = 0.5F;               // Harry got moved this far from where he started : over.
+static const uint32_t EMOTE_FADE_MS = 200;          // Over : blended back into the game's own animation this long.
+static const uint32_t EMOTE_SKIP_FADE_MS = 120;     // A chain's ending skipped.
 
 struct EmoteState
 {
 	bool active;
 	int emote;            // EMOTES index.
-	uint32_t clip;        // Playing now (a chain's intro, then its clip).
+	uint32_t clip;        // Playing now (a chain's intro, then its clip, then its ending).
 	bool loop;
 	int slot;             // Which of EMOTE_LAYERS.
 	bool started;
-	float lastFrame;      // The layer's frame ...
-	float frameTime;      // ... and its clock when the frame last moved (it stops at the end, the clock doesn't).
+	int ending;           // A chain's ending : which of its clips plays (-1 : not yet). Harry stays put meanwhile.
+	float lastFrame;      // The layer's frame last time (a loop's goes back to the start : another play).
 	int plays;
 	uint32_t start;       // NetNowMs.
 	Vector3f where;       // Harry, at the start.
 	int health;
 };
 static EmoteState g_emote;
+static struct { bool on; int layer; uint32_t since, ms; } g_emoteFade;   // Over, blending out.
 static int g_emoteRequest = -1;           // EMOTES index : the wheel's choice, played on Harry's next tick.
 static const char* g_emoteCancel = 0;     // Set by the input hooks (a button, a key) : over, on the next tick.
 static const char* g_emoteLastEnd = "";   // Why the last one ended (tests).
 static const char* g_emoteRefused = "";   // Why the last one didn't start (tests).
 static Vector3f g_stillAt;                // Harry standing still : where ...
 static uint32_t g_stillSince = 0;         // ... and since when.
+
+// A chain's ending playing : the input hooks keep Harry where he is.
+static bool EmoteHoldsHarry()
+{
+	return g_emote.active && g_emote.ending >= 0;
+}
+
+static float ClipSecondsLeft( uint8_t* layer )
+{
+	uint8_t* clip = *(uint8_t**) (layer + LAYER_CLIP);
+	float rate = *(float*) (layer + LAYER_FPS) * *(float*) (layer + LAYER_SPEED);
+	if ( !clip || rate <= 0.0F ) return 0.0F;
+	return ((float) (*(int*) (clip + CLIP_FRAMES) - 1) - *(float*) (layer + LAYER_FRAME)) / rate;
+}
+
+// Ours, whatever the game does : starting one of Harry's idles, it fades every other
+// layer out (ours too) and drops them.
+static void KeepLayer( EAnimController* ctrl, uint8_t* layer )
+{
+	layer[LAYER_FADING] = 0;
+	*(float*) (layer + LAYER_TARGET) = 1.0F;
+	if ( !layer[LAYER_TICKED] ) AnimCtrl_SetTicked( ctrl, layer, true );
+}
+
+static void DropLayer( EIHarry* harry, int key )
+{
+	uint8_t* layer = GetAnimLayer( harry, key );
+	if ( !layer ) return;
+	*(float*) (layer + LAYER_WEIGHT) = 0.0F;
+	*(float*) (layer + LAYER_TARGET) = 0.0F;
+	layer[LAYER_FADING] = 0;
+	AnimCtrl_SetTicked( &FIELD( harry, EAnimController, CHAR_ANIMCTRL ), layer, false );
+}
+
+// Ours (layer key) at w; the game's own at the weights it wants (it only sets them when
+// it changes them), times 1 - w.
+static void SetEmoteWeights( EIHarry* harry, int key, float w )
+{
+	for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
+		uint8_t* layer = GetAnimLayer( harry, i );
+		if ( !layer ) continue;
+		if ( i == key ) *(float*) (layer + LAYER_WEIGHT) = w;
+		else if ( i == EMOTE_LAYERS[0] || i == EMOTE_LAYERS[1] ) *(float*) (layer + LAYER_WEIGHT) = 0.0F;
+		else *(float*) (layer + LAYER_WEIGHT) = *(float*) (layer + LAYER_TARGET) * (1.0F - w);
+	}
+}
+
+static void EndFade( EIHarry* harry )
+{
+	if ( !g_emoteFade.on ) return;
+	g_emoteFade.on = false;
+	SetEmoteWeights( harry, -1, 0.0F );
+	DropLayer( harry, EMOTE_LAYERS[0] );
+	DropLayer( harry, EMOTE_LAYERS[1] );
+}
 
 static void BeginClip( uint32_t clip, bool loop )
 {
@@ -3009,15 +3078,16 @@ static void BeginClip( uint32_t clip, bool loop )
 	g_emote.slot = 1 - g_emote.slot;
 	g_emote.started = false;
 	g_emote.lastFrame = -1.0F;
-	g_emote.frameTime = 0.0F;
 }
 
 static void StartEmote( EIHarry* harry, int e )
 {
 	const EmoteDef& d = EMOTES[e];
+	EndFade( harry );
 	g_emote.active = true;
 	g_emote.emote = e;
 	g_emote.plays = 0;
+	g_emote.ending = -1;
 	g_emote.start = NetNowMs();
 	g_emote.where = harry->m_position;
 	g_emote.health = harry->m_healthValue;
@@ -3026,19 +3096,21 @@ static void StartEmote( EIHarry* harry, int e )
 	mp_log( "[EM] Emote : %s (clip 0x%.8X%s%s).\n", d.name, d.clip, d.intro ? ", after its intro" : "", d.loops ? ", loops" : "" );
 }
 
-static void StopEmote( EIHarry* harry, const char* why )
+// Over : blended out (fadeMs 0 : at once).
+static void StopEmote( EIHarry* harry, const char* why, uint32_t fadeMs = EMOTE_FADE_MS )
 {
 	if ( !g_emote.active ) return;
 	g_emote.active = false;
 	g_emoteLastEnd = why;
-	if ( harry ) {   // Ours out, the game's own layers back at the weights it wants (it only sets them when it changes them).
-		EAnimController* ctrl = &FIELD( harry, EAnimController, CHAR_ANIMCTRL );
-		for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
-			uint8_t* layer = GetAnimLayer( harry, i );
-			if ( !layer ) continue;
-			if ( i == EMOTE_LAYERS[0] || i == EMOTE_LAYERS[1] ) AnimCtrl_FadeTo( ctrl, i, 0.0F );
-			else *(float*) (layer + LAYER_WEIGHT) = *(float*) (layer + LAYER_TARGET);
-		}
+	if ( harry ) {
+		EndFade( harry );
+		// The layer showing : a clip just begun hasn't loaded yet, the one before it shows.
+		g_emoteFade.layer = EMOTE_LAYERS[g_emote.started ? g_emote.slot : 1 - g_emote.slot];
+		g_emoteFade.since = NetNowMs();
+		g_emoteFade.ms = fadeMs;
+		g_emoteFade.on = true;
+		uint8_t* layer = GetAnimLayer( harry, g_emoteFade.layer );
+		if ( !fadeMs || !layer || *(float*) (layer + LAYER_WEIGHT) <= 0.0F ) EndFade( harry );
 	}
 	mp_log( "[EM] Emote ended (%s) after %u ms, %d play%s.\n", why, NetNowMs() - g_emote.start, g_emote.plays, g_emote.plays == 1 ? "" : "s" );
 }
@@ -3056,9 +3128,21 @@ static const char* WhyNoEmote( EIHarry* harry )
 static void EmoteTick( EIHarry* harry )
 {
 	uint32_t now = NetNowMs();
+	EAnimController* ctrl = &FIELD( harry, EAnimController, CHAR_ANIMCTRL );
 	Vector3f at = harry->m_position;
 	float dx = at.x - g_stillAt.x, dy = at.y - g_stillAt.y, dz = at.z - g_stillAt.z;
 	if ( !g_stillSince || dx * dx + dy * dy + dz * dz > 0.05F * 0.05F ) { g_stillAt = at; g_stillSince = now; }
+
+	// The last one blending out.
+	if ( g_emoteFade.on ) {
+		uint8_t* layer = GetAnimLayer( harry, g_emoteFade.layer );
+		uint32_t gone = now - g_emoteFade.since;
+		if ( !layer || gone >= g_emoteFade.ms ) EndFade( harry );
+		else {
+			KeepLayer( ctrl, layer );
+			SetEmoteWeights( harry, g_emoteFade.layer, 1.0F - (float) gone / (float) g_emoteFade.ms );
+		}
+	}
 
 	if ( g_emoteRequest >= 0 ) {
 		int e = g_emoteRequest;
@@ -3070,57 +3154,72 @@ static void EmoteTick( EIHarry* harry )
 			Toast( "%s", why );
 		}
 		else {
-			if ( g_emote.active ) StopEmote( harry, "another one" );
+			if ( g_emote.active ) StopEmote( harry, "another one", 0 );
 			StartEmote( harry, e );
 		}
 	}
 	if ( !g_emote.active ) return;
+	const EmoteDef& d = EMOTES[g_emote.emote];
 
 	// Over : a button or a key, Harry moved (pushed, fell), an item came out, he got hurt.
 	const char* over = g_emoteCancel;
+	bool byYou = over != 0;
 	g_emoteCancel = 0;
 	dx = at.x - g_emote.where.x; dy = at.y - g_emote.where.y; dz = at.z - g_emote.where.z;
 	if ( !over && dx * dx + dy * dy + dz * dz > EMOTE_MOVE * EMOTE_MOVE ) over = "moved";
 	if ( !over && !harry->m_onGround ) over = "off the ground";
 	if ( !over && GetHeldItem( harry ) >= 0 ) over = "an item";
 	if ( !over && harry->m_healthValue < g_emote.health ) over = "hurt";
-	if ( over ) { StopEmote( harry, over ); return; }
+	if ( over ) {
+		// A chain you end : its ending first (another press skips it).
+		if ( byYou && g_emote.ending < 0 && d.ending[0] ) {
+			mp_log( "[EM] %s : its ending (%s).\n", d.name, over );
+			g_emote.ending = 0;
+			BeginClip( d.ending[0], false );
+		}
+		else {
+			StopEmote( harry, over, g_emote.ending >= 0 && byYou ? EMOTE_SKIP_FADE_MS : EMOTE_FADE_MS );
+			return;
+		}
+	}
 
-	EAnimController* ctrl = &FIELD( harry, EAnimController, CHAR_ANIMCTRL );
 	if ( g_emote.started ) {
-		// At its end (its frame stops, its clock goes on) : again, the chain's loop, or done.
 		uint8_t* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
-		float frame = mine ? *(float*) (mine + LAYER_FRAME) : 0.0F, time = mine ? *(float*) (mine + LAYER_TIME) : 0.0F;
-		if ( frame != g_emote.lastFrame ) { g_emote.lastFrame = frame; g_emote.frameTime = time; }
-		else if ( time - g_emote.frameTime >= 0.25F ) {
-			const EmoteDef& d = EMOTES[g_emote.emote];
-			if ( d.intro && g_emote.clip == d.intro ) BeginClip( d.clip, true );
-			else if ( g_emote.loop ) {
-				AnimCtrl_Restart( ctrl, EMOTE_LAYERS[g_emote.slot] );
-				g_emote.lastFrame = -1.0F;
-				g_emote.plays++;
+		if ( mine ) {
+			float frame = *(float*) (mine + LAYER_FRAME);
+			if ( g_emote.loop ) {   // The game loops it : count the plays.
+				if ( frame < g_emote.lastFrame ) g_emote.plays++;
 			}
-			else { StopEmote( harry, "played" ); return; }
+			else {
+				bool intro = d.intro && g_emote.clip == d.intro;
+				bool more = intro || (g_emote.ending == 0 && d.ending[1]);
+				float left = ClipSecondsLeft( mine );
+				if ( !more && left <= EMOTE_FADE_MS / 1000.0F ) {   // Its last clip : blended out as it finishes.
+					StopEmote( harry, "played", left > 0.05F ? (uint32_t) (left * 1000.0F) : 50 );
+					return;
+				}
+				if ( mine[LAYER_ENDED] ) {   // The next clip, right away.
+					if ( intro ) BeginClip( d.clip, true );
+					else if ( g_emote.ending == 0 ) { g_emote.ending = 1; BeginClip( d.ending[1], false ); }
+				}
+			}
+			g_emote.lastFrame = frame;
 		}
 	}
 	int key = EMOTE_LAYERS[g_emote.slot];
 	if ( !g_emote.started ) {
 		AnimCtrl_SetClip( ctrl, key, g_emote.clip );
 		AnimCtrl_Restart( ctrl, key );
-		AnimCtrl_FadeTo( ctrl, key, 1.0F );
-		int other = EMOTE_LAYERS[1 - g_emote.slot];
-		if ( GetAnimLayer( harry, other ) ) AnimCtrl_FadeTo( ctrl, other, 0.0F );
+		uint8_t* layer = GetAnimLayer( harry, key );
+		if ( layer ) layer[LAYER_AT_END] = g_emote.loop ? 0 : 1;
+		DropLayer( harry, EMOTE_LAYERS[1 - g_emote.slot] );
 		g_emote.started = true;
 		g_emote.plays++;
 	}
 	uint8_t* mine = GetAnimLayer( harry, key );
-	if ( !mine || GetLayerClipCRC( mine ) != g_emote.clip ) { StopEmote( harry, "the clip didn't load" ); return; }
-	// The game's own layers : no weight; ours : all of it.
-	for ( int i = 0; i < MAX_LAYER_SCAN; i++ ) {
-		uint8_t* layer = GetAnimLayer( harry, i );
-		if ( !layer ) continue;
-		*(float*) (layer + LAYER_WEIGHT) = (i == key) ? 1.0F : 0.0F;
-	}
+	if ( !mine || GetLayerClipCRC( mine ) != g_emote.clip ) { StopEmote( harry, "the clip didn't load", 0 ); return; }
+	KeepLayer( ctrl, mine );
+	SetEmoteWeights( harry, key, 1.0F );
 }
 
 // --------------------------------------------------------------------------------
@@ -3140,7 +3239,8 @@ static DWORD g_armedAt = 0;
 static int g_previewWant = -2;    // The chooser, each frame : EMOTES index, -1 : none (idle), -2 : no preview.
 static bool g_previewFailed = false;
 static int g_previewShown = -3;
-static float g_previewFrame = -1.0F, g_previewFrameTime = 0.0F;
+static int g_previewStage = 0;    // A chain : 0 its intro, 1 - 2 its loop, 3 - 4 its ending.
+static bool g_previewArmed = false;   // The clip seen under way (not at its end from last time).
 static const uint32_t IDLE_CLIP = 0xB23CB6D0;
 static void SetMenuOpen( bool open );
 static void SaveSettings();
@@ -3149,7 +3249,7 @@ static void SetPreviewClip( uint32_t clip )
 {
 	g_animSurveyClip = clip;
 	if ( g_viewerPeer ) g_viewerPeer->mirrorClip = 0;   // Loads it again, from the start.
-	g_previewFrame = -1.0F;
+	g_previewArmed = false;
 }
 
 static bool OpenPreview( EIHarry* harry )
@@ -3216,20 +3316,24 @@ static void EmotePreviewTick( EIHarry* harry )
 	}
 	if ( !g_viewerPeer || !g_viewerPeer->beast ) { ClosePreview( "puppet gone" ); g_previewFailed = true; return; }
 	int e = g_previewWant;
+	bool chain = e >= 0 && EMOTES[e].intro;
 	if ( e != g_previewShown ) {
 		g_previewShown = e;
-		SetPreviewClip( e < 0 ? IDLE_CLIP : EMOTES[e].intro ? EMOTES[e].intro : EMOTES[e].clip );
+		g_previewStage = 0;
+		SetPreviewClip( e < 0 ? IDLE_CLIP : chain ? EMOTES[e].intro : EMOTES[e].clip );
 		return;
 	}
-	// At the clip's end (its frame stops, its clock goes on) : again; a chain's intro, its loop.
+	// At the clip's end : again, or a chain's next (intro, its loop twice, its ending).
 	uint8_t* layer = GetAnimLayer( g_viewerPeer->beast, MIRROR_LAYERS[g_viewerPeer->mirrorSlot] );
 	if ( !layer || GetLayerClipCRC( layer ) != g_animSurveyClip ) return;
-	float frame = *(float*) (layer + LAYER_FRAME), time = *(float*) (layer + LAYER_TIME);
-	if ( frame != g_previewFrame ) { g_previewFrame = frame; g_previewFrameTime = time; }
-	else if ( time - g_previewFrameTime >= 0.5F ) {
-		bool intro = e >= 0 && EMOTES[e].intro && g_animSurveyClip == EMOTES[e].intro;
-		SetPreviewClip( intro ? EMOTES[e].clip : g_animSurveyClip );
-	}
+	if ( !layer[LAYER_ENDED] ) { g_previewArmed = true; return; }
+	if ( !g_previewArmed ) return;
+	if ( !chain ) { SetPreviewClip( g_animSurveyClip ); return; }
+	const EmoteDef& d = EMOTES[e];
+	g_previewStage = (g_previewStage + 1) % 5;
+	if ( g_previewStage == 4 && !d.ending[1] ) g_previewStage = 0;
+	if ( g_previewStage == 3 && !d.ending[0] ) g_previewStage = 0;
+	SetPreviewClip( g_previewStage == 0 ? d.intro : g_previewStage <= 2 ? d.clip : d.ending[g_previewStage - 3] );
 }
 
 static bool EmoteMatches( int e )
@@ -3293,11 +3397,6 @@ static void EmotesPage()
 			SaveSettings();
 			break;
 		}
-		}
-		if ( g_menu.Action( "Try it", "Closes the menu and plays this slot's emote (Harry has to be standing still, with no item out)." ) ) {
-			int e = wheel.slot[g_ringSlot];
-			if ( e < 0 ) Toast( "That slot is empty" );
-			else { SetMenuOpen( false ); g_emoteRequest = e; }
 		}
 		if ( g_wheelCount < MAX_WHEELS && g_menu.Action( "+ New wheel", "Another wheel, empty, to fill (up to 4)." ) ) {
 			EmoteWheel& added = g_wheels[g_wheelCount];
@@ -3961,11 +4060,13 @@ static void ToggleRole( const char* how )
 
 // --------------------------------------------------------------------------------
 // The emote wheel : held open (L1, or T), pointed at with the right stick (the
-// mouse), played when let go (1-8 and a click play at once). R1 (Tab) : the next
-// wheel. While it's open the game doesn't get the right stick and R1 (Tab, 1-8).
-// While Harry emotes, any other button or key, or the left stick, ends it.
+// mouse or the arrows), played when let go (1-8 and a click play at once). R1 (Tab) :
+// the next wheel. While it's open the game doesn't get the right stick and R1 (the
+// arrows, Tab, 1-8). While Harry emotes, any other button or key, or the left stick,
+// ends it (a chain plays its ending first).
 // --------------------------------------------------------------------------------
 static const int PAD_R1 = 5;
+static const int DIK_ARROWS[4] = { 0xC8, 0xD0, 0xCB, 0xCD };   // DirectInput key codes : up, down, left, right.
 static const uint32_t WHEEL_SHOW_MS = 150;   // Held this long (or pointed) : the wheel shows (a tap of L1 doesn't).
 static const uint32_t WHEEL_KEEP_MS = 300;   // The stick back in the middle : the choice stays this long.
 
@@ -4087,18 +4188,36 @@ static void EmotePad( uint8_t* state )
 			buttons[PAD_R1] = 0;
 		}
 	}
-	// Emoting : the left stick, another button or the d-pad end it.
+	// Emoting : the left stick, another button or the d-pad end it. A chain's ending
+	// keeps Harry where he is (a new press skips it, and gets to the game next time).
 	else if ( g_emote.active ) {
 		static uint32_t restFor = 0;
 		static LONG rest[2];
 		if ( restFor != g_emote.start ) { restFor = g_emote.start; rest[0] = axes[0]; rest[1] = axes[1]; }
 		float x = (axes[0] - rest[0]) / (big[0] ? 32767.0F : 1000.0F), y = (axes[1] - rest[1]) / (big[1] ? 32767.0F : 1000.0F);
+		bool hold = EmoteHoldsHarry();
 		const char* why = 0;
-		if ( x * x + y * y > 0.4F * 0.4F ) why = "the left stick";
+		if ( !hold && x * x + y * y > 0.4F * 0.4F ) why = "the left stick";
 		for ( int b = 0; b < 32 && !why; b++ )
 			if ( (raw[b] & 0x80) && !(before[b] & 0x80) && b != g_emoteButton && b != PAD_R1 ) why = "a button";
 		if ( !why && !hatCentred && LOWORD( hatBefore ) == 0xFFFF ) why = "the d-pad";
 		if ( why && !g_emoteCancel ) g_emoteCancel = why;
+		if ( hold ) {
+			axes[0] = rest[0]; axes[1] = rest[1];
+			memset( buttons, 0, 32 );
+			*(DWORD*) (state + PAD_HAT) = 0xFFFFFFFF;
+		}
+	}
+	// The right stick reaches with Harry's arm (and aims some items) : not while it points
+	// the wheel, nor after, until it's back in the middle.
+	static bool stickHeld = false;
+	static LONG stickCentre[6];
+	if ( g_wheelUi.open && g_wheelUi.byPad ) { stickHeld = true; memcpy( stickCentre, g_wheelUi.centre, sizeof(stickCentre) ); }
+	else if ( stickHeld ) {
+		bool centred = true;
+		for ( int i = 2; i < 6; i++ ) if ( fabsf( (axes[i] - stickCentre[i]) / (big[i] ? 32767.0F : 1000.0F) ) > 0.25F ) centred = false;
+		if ( centred ) stickHeld = false;
+		else for ( int i = 2; i < 6; i++ ) axes[i] = stickCentre[i];
 	}
 	memcpy( before, raw, sizeof(before) );
 	hatBefore = hat;
@@ -4127,6 +4246,11 @@ static void EmoteKeys( uint8_t* keys )
 		}
 		else if ( !g_wheelUi.done ) {
 			if ( (raw[0x0F] & 0x80) && !(before[0x0F] & 0x80) ) WheelNext();   // Tab.
+			// The arrows (the keyboard's right stick) : 8 ways. Letting go of a diagonal keeps it.
+			int ax = ((raw[0xCD] & 0x80) ? 1 : 0) - ((raw[0xCB] & 0x80) ? 1 : 0), ay = ((raw[0xD0] & 0x80) ? 1 : 0) - ((raw[0xC8] & 0x80) ? 1 : 0);
+			int arrows = 0, arrowsBefore = 0;
+			for ( int i = 0; i < 4; i++ ) { arrows += (raw[DIK_ARROWS[i]] & 0x80) ? 1 : 0; arrowsBefore += (before[DIK_ARROWS[i]] & 0x80) ? 1 : 0; }
+			if ( (ax || ay) && arrows >= arrowsBefore ) WheelPoint( WedgeAt( (float) ax, (float) ay ) );
 			for ( int i = 0; i < WHEEL_SLOTS && !g_wheelUi.done; i++ )   // 1 - 8.
 				if ( (raw[0x02 + i] & 0x80) && !(before[0x02 + i] & 0x80) ) { WheelPoint( i ); WheelPlay( i, "number key" ); }
 			// The mouse : which way it went (the start follows it, so turning back is quick).
@@ -4147,7 +4271,15 @@ static void EmoteKeys( uint8_t* keys )
 	else if ( g_emote.active ) {
 		for ( int k = 1; k < 256; k++ )
 			if ( (raw[k] & 0x80) && !(before[k] & 0x80) && !KeyKeepsEmote( k ) ) { if ( !g_emoteCancel ) g_emoteCancel = "a key"; break; }
+		if ( EmoteHoldsHarry() ) for ( int k = 1; k < 256; k++ ) if ( !KeyKeepsEmote( k ) ) keys[k] = 0;
 	}
+	// The arrows : not for the game while they point the wheel, nor after, until they're let go.
+	static bool arrowsHeld = false;
+	bool anyArrow = false;
+	for ( int i = 0; i < 4; i++ ) anyArrow |= (raw[DIK_ARROWS[i]] & 0x80) != 0;
+	if ( g_wheelUi.open && !g_wheelUi.byPad ) arrowsHeld = true;
+	else if ( !anyArrow ) arrowsHeld = false;
+	if ( arrowsHeld ) for ( int i = 0; i < 4; i++ ) keys[DIK_ARROWS[i]] = 0;
 	if ( held ) keys[g_emoteKey] = 0;
 	memcpy( before, raw, sizeof(before) );
 }
@@ -4189,9 +4321,6 @@ static void* __cdecl PollGamepad_Hook( int index )
 	}
 	return MenuBlocksInput() ? 0 : state;
 }
-
-// DirectInput key codes : the arrows.
-static const int DIK_ARROWS[4] = { 0xC8, 0xD0, 0xCB, 0xCD };   // Up, down, left, right.
 
 static void RoleSwapKeys( uint8_t* keys )
 {
@@ -5036,7 +5165,23 @@ static void AutotestStep( EIHarry* harry )
 		static DWORD lastLog = 0, mark = 0;
 		DWORD t = now - phaseStart;
 		struct Local { static void Check( const char* what, bool ok ) { mp_log( "[AT] Emote : %s : %s\n", what, ok ? "ok" : "WRONG" ); if ( !ok ) failures++; } };
-		static int victory, jig, breakdance, running, dizzy;
+		static int victory, jig, breakdance, running, dizzy, pickaxe;
+		static uint32_t arrowFrames = 0;
+		static bool sawEnding[2];
+		// Harry's pose not moving (the same bones as last time) : the longest stretch, while watched.
+		static bool watch = false;
+		static float poseSum = 0.0F;
+		static DWORD stillFrom = 0, longestStill = 0;
+		{
+			int bones = 0;
+			Matrix4f* pose = GetPose( (uint8_t*) harry + CHAR_ANIMCTRL, &bones );
+			float sum = 0.0F;
+			for ( int b = 0; pose && b < bones && b < MAX_CHAR_BONES; b++ )
+				for ( int r = 0; r < 4; r++ ) for ( int c = 0; c < 4; c++ ) sum += pose[b].data[r][c] * (float) (1 + b * 16 + r * 4 + c);
+			if ( sum != poseSum || !stillFrom ) { poseSum = sum; stillFrom = now; }
+			if ( watch && now - stillFrom > longestStill ) longestStill = now - stillFrom;
+		}
+		if ( g_emote.active && g_emote.ending >= 0 ) sawEnding[g_emote.ending] = true;
 		if ( g_emote.active && now - lastLog >= 500 ) {
 			lastLog = now;
 			uint8_t* l = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
@@ -5050,12 +5195,13 @@ static void AutotestStep( EIHarry* harry )
 			g_wheelCount = 2;
 			for ( int w = 0; w < MAX_WHEELS; w++ ) DefaultWheel( w );
 			victory = FindEmoteByName( "Victory Dance" ); jig = FindEmoteByName( "Jig" ); breakdance = FindEmoteByName( "Breakdance" );
-			running = FindEmoteByName( "Running Man" ); dizzy = FindEmoteByName( "Dizzy Walk" );
+			running = FindEmoteByName( "Running Man" ); dizzy = FindEmoteByName( "Dizzy Walk" ); pickaxe = FindEmoteByName( "Pickaxe Spin" );
 			mp_log( "[AT] Emote : %d emotes in the catalogue.\n", NUM_EMOTES );
 			bool all = true;
 			for ( int s = 0; s < WHEEL_SLOTS; s++ ) all &= g_wheels[0].slot[s] >= 0 && (s >= 6 || g_wheels[1].slot[s] >= 0);
 			Local::Check( "the default wheels' emotes are all in the catalogue", all && NUM_EMOTES > 200 );
-			Local::Check( "Breakdance is a chain", breakdance >= 0 && EMOTES[breakdance].intro != 0 && g_wheels[0].slot[3] == breakdance );
+			Local::Check( "Breakdance is a chain, with an ending", breakdance >= 0 && EMOTES[breakdance].intro != 0 && EMOTES[breakdance].ending[0] && EMOTES[breakdance].ending[1] && g_wheels[0].slot[3] == breakdance );
+			Local::Check( "Jig plays once, Running Man loops", jig >= 0 && !EMOTES[jig].loops && running >= 0 && EMOTES[running].loops );
 			// The ini : saved, changed, loaded back.
 			char ini[MAX_PATH];
 			GetTempPathA( MAX_PATH, ini );
@@ -5082,6 +5228,7 @@ static void AutotestStep( EIHarry* harry )
 			g_wheelCount = 2;
 			DefaultWheel( 2 );
 			g_emoteRequest = victory;
+			watch = true; longestStill = 0;
 			step = 1; phaseStart = now;
 		}
 		else if ( step == 1 ) {
@@ -5098,12 +5245,24 @@ static void AutotestStep( EIHarry* harry )
 			uint32_t clip = GetPlayingClip( harry, &layer, &w );
 			mp_log( "[AT] Emote : after it, Harry shows 0x%.8X (layer %d, %.2f).\n", clip, layer, w );
 			Local::Check( "the game's own animation is back", clip && layer < EMOTE_LAYERS[0] );
+			mp_log( "[AT] Emote : Victory Dance and after, Harry's longest still : %u ms.\n", longestStill );
+			Local::Check( "no freeze in Victory Dance, nor at its end", longestStill < 200 );
 			RequestSnapshot( "emote_2_after" );
 			g_emoteRequest = jig;
+			step = 101; phaseStart = now;
+		}
+		else if ( step == 101 && (!g_emote.active && t > 300 || t > 20000) ) {
+			Local::Check( "Jig plays once", !g_emote.active && strcmp( g_emoteLastEnd, "played" ) == 0 );
+			g_emoteRequest = running;
+			longestStill = 0;
 			step = 3; phaseStart = now;
 		}
-		else if ( step == 3 && t >= 6000 ) {
-			Local::Check( "Jig loops", g_emote.active && g_emote.emote == jig && g_emote.plays >= 2 );
+		else if ( step == 3 && t >= 16000 ) {   // Long enough for one of Harry's idles (it fades every layer out).
+			uint8_t* mine = GetAnimLayer( harry, EMOTE_LAYERS[g_emote.slot] );
+			mp_log( "[AT] Emote : Running Man, %d plays; longest still %u ms.\n", g_emote.plays, longestStill );
+			Local::Check( "Running Man loops on, through Harry's idles", g_emote.active && g_emote.emote == running && g_emote.plays >= 8 && mine && mine[LAYER_TICKED] && longestStill < 200 );
+			RequestSnapshot( "emote_2b_running" );
+			watch = false;
 			SendKey( 'W', true );
 			step = 4; phaseStart = now;
 		}
@@ -5115,6 +5274,7 @@ static void AutotestStep( EIHarry* harry )
 		else if ( step == 5 && t >= 2500 ) {
 			g_emoteRequest = breakdance;
 			mark = 0;
+			watch = true; longestStill = 0;
 			step = 6; phaseStart = now;
 		}
 		else if ( step == 6 ) {
@@ -5122,16 +5282,40 @@ static void AutotestStep( EIHarry* harry )
 			if ( t >= 5000 && t < 5100 ) RequestSnapshot( "emote_3_breakdance" );
 			if ( t >= 7000 ) {
 				Local::Check( "Breakdance : its intro, then its loop", mark && g_emote.active && g_emote.clip == EMOTES[breakdance].clip );
+				mp_log( "[AT] Emote : Breakdance, longest still %u ms.\n", longestStill );
+				Local::Check( "no freeze from its intro to its loop", longestStill < 200 );
+				watch = false;
+				sawEnding[0] = sawEnding[1] = false;
 				memset( g_testPad, 0, sizeof(g_testPad) );
 				for ( int i = 0; i < 4; i++ ) *(DWORD*) (g_testPad + PAD_HAT + 4 * i) = 0xFFFFFFFF;
 				g_testPadOn = true;
 				step = 7; phaseStart = now;
 			}
 		}
-		else if ( step == 7 && t >= 300 ) { g_testPad[PAD_BUTTONS + 2] = 0x80; step = 8; phaseStart = now; }
-		else if ( step == 8 && (!g_emote.active || t > 3000) ) {
-			Local::Check( "a button ends it", !g_emote.active && strcmp( g_emoteLastEnd, "a button" ) == 0 );
+		else if ( step == 7 && t >= 300 ) { g_testPad[PAD_BUTTONS + 2] = 0x80; mark = 0; step = 8; phaseStart = now; }
+		else if ( step == 8 && t >= 300 && !mark ) {
+			mark = 1;
+			RequestSnapshot( "emote_3b_ending" );
+			Local::Check( "a button : Breakdance's ending, the game not getting the button", g_emote.active && g_emote.ending >= 0 && !(((uint8_t*) 0x940B78)[PAD_BUTTONS + 2] & 0x80) );
+		}
+		else if ( step == 8 && (!g_emote.active || t > 8000) ) {
+			mp_log( "[AT] Emote : Breakdance's ending over after %u ms.\n", t );
+			Local::Check( "both its ending clips play, then it's over", !g_emote.active && sawEnding[0] && sawEnding[1] && strcmp( g_emoteLastEnd, "played" ) == 0 );
 			g_testPad[PAD_BUTTONS + 2] = 0;
+			g_emoteRequest = pickaxe;
+			step = 110; phaseStart = now;
+		}
+		// Pickaxe Spin : the left stick (its ending, Harry held), then a button skips it.
+		else if ( step == 110 && t >= 4000 ) { *(LONG*) (g_testPad + 0) = 1000; step = 111; phaseStart = now; }
+		else if ( step == 111 && t >= 300 ) {
+			Local::Check( "the left stick : Pickaxe Spin's ending, Harry held", g_emote.active && g_emote.ending >= 0 && *(LONG*) 0x940B78 != 1000 );
+			g_testPad[PAD_BUTTONS + 3] = 0x80;
+			step = 112; phaseStart = now;
+		}
+		else if ( step == 112 && t >= 300 ) {
+			Local::Check( "a button skips the ending", !g_emote.active && strcmp( g_emoteLastEnd, "a button" ) == 0 );
+			g_testPad[PAD_BUTTONS + 3] = 0;
+			*(LONG*) (g_testPad + 0) = 0;
 			step = 9; phaseStart = now;
 		}
 		// The wheel, by controller : L1, the right stick to the right (Running Man), R1 twice, let go.
@@ -5139,6 +5323,7 @@ static void AutotestStep( EIHarry* harry )
 		else if ( step == 10 && t >= 300 ) { *(LONG*) (g_testPad + 0x0C) = 1000; step = 11; phaseStart = now; }
 		else if ( step == 11 && t >= 400 ) {
 			Local::Check( "L1 + the right stick : the wheel, Running Man picked", WheelShown() && g_wheelUi.byPad && g_wheelUi.hover == 2 );
+			Local::Check( "the game doesn't get the right stick", *(LONG*) (0x940B78 + 0x0C) == 0 );
 			RequestSnapshot( "emote_4_wheel" );
 			step = 12; phaseStart = now;
 		}
@@ -5157,6 +5342,7 @@ static void AutotestStep( EIHarry* harry )
 		}
 		else if ( step == 16 && t >= 300 ) { g_testPad[PAD_BUTTONS + 4] = 0; step = 17; phaseStart = now; }
 		else if ( step == 17 && t >= 300 ) {
+			Local::Check( "nor after, while it's still pushed", *(LONG*) (0x940B78 + 0x0C) == 0 );
 			*(LONG*) (g_testPad + 0x0C) = 0;
 			Local::Check( "letting go of L1 plays it", !g_wheelUi.open && g_emote.active && g_emote.emote == running );
 			step = 18; phaseStart = now;
@@ -5173,6 +5359,12 @@ static void AutotestStep( EIHarry* harry )
 		else if ( step == 21 && t >= 400 ) {
 			Local::Check( "T : the wheel", WheelShown() && !g_wheelUi.byPad );
 			RequestSnapshot( "emote_6_keyboard" );
+			arrowFrames = (uint32_t) g_testArrowFrames;
+			SendKey( VK_RIGHT, true );
+			step = 120; phaseStart = now;
+		}
+		else if ( step == 120 && t >= 300 ) {
+			Local::Check( "Right arrow : the slot on the right, the game not getting it", g_wheelUi.hover == 2 && (uint32_t) g_testArrowFrames == arrowFrames );
 			SendKey( VK_TAB, true );
 			step = 22; phaseStart = now;
 		}
@@ -5184,6 +5376,7 @@ static void AutotestStep( EIHarry* harry )
 		}
 		else if ( step == 23 && t >= 200 ) {
 			SendKey( '2', false );
+			SendKey( VK_RIGHT, false );
 			Local::Check( "2 plays the second slot at once", !WheelShown() && g_emote.active && g_emote.emote == dizzy );
 			SendKey( 'T', false );
 			step = 24; phaseStart = now;
@@ -7110,7 +7303,7 @@ static void DrawMenu( float sw, float sh, float h )
 				"On : the wheel opens only with R1 held as well (L1 + R1), so the button alone does nothing new. "
 				"R1 pressed again while it's open : the next wheel." ) ) SaveSettings();
 			if ( g_menu.Button( "Emote wheel, keyboard : hold", Bound::Key( &g_emoteKey ),
-				"Hold it for the emote wheel, point the mouse at an emote (or press 1 - 8) and let go to play it. Tab : the next wheel. "
+				"Hold it for the emote wheel, point the mouse or the arrows at an emote (or press 1 - 8) and let go to play it. Tab : the next wheel. "
 				"Enter, then press the key to use." ) ) StartBinding( BIND_KEY, &g_emoteKey );
 		}
 		g_menu.Info( "F10", "Animation viewer ( [ ] \\ ' and F11 inside it)" );
@@ -7222,7 +7415,7 @@ static void DrawWheel( float sw, float sh, float h )
 		else sprintf_s( button, "button %d", g_emoteButton + 1 );
 		sprintf_s( hint, "Right stick : choose   Let go of %s : play%s", button, g_wheelCount > 1 ? (g_emoteNeedsR1 ? "   R1 again : next wheel" : "   R1 : next wheel") : "" );
 	}
-	else sprintf_s( hint, "Mouse or 1 - 8 : choose   Let go of %s : play%s", KeyName( g_emoteKey ), g_wheelCount > 1 ? "   Tab : next wheel" : "" );
+	else sprintf_s( hint, "Mouse, arrows or 1 - 8 : choose   Let go of %s : play%s", KeyName( g_emoteKey ), g_wheelCount > 1 ? "   Tab : next wheel" : "" );
 	float hw = OverlayTextWidth( hint ), hy = floorf( cy + outer + h * 2.0F );
 	float pad = h * 0.3F;
 	OverlayRect( floorf( cx - hw * 0.5F ) - pad, hy - pad * 0.5F, hw + 2.0F * pad, h + pad, 0xA0000000 );
