@@ -2260,6 +2260,7 @@ GET_METHOD( 0x542FD0, bool, EIPitMonster_Contact5, EIPitMonster*, OverlapStruct*
 
 static bool IsAnyPuppet( EInstance* beast )
 {
+	if ( !beast ) return false;
 	if ( beast->GetType() != get_etypeinfo<EIEvilHarryP>() ) return false;
 	if ( IsPuppet((EIEvilHarryP*) beast) ) return true;
 	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].beast == beast ) return true;
@@ -2342,6 +2343,12 @@ static void InstallFadeHooks()
 
 static void InstallPitHooks()
 {
+	if ( injector::ReadMemory<uint32_t>(PIT_CONTACT_SLOTS[0]) != (uint32_t) EIPitMonster_Contact4
+	  || injector::ReadMemory<uint32_t>(PIT_CONTACT_SLOTS[1]) != (uint32_t) EIPitMonster_Contact5 ) {
+		mp_log( "[MP] The pitfall's contact handlers aren't the game's : pitfalls may still eat puppets.\n" );
+		return;
+	}
+
 	injector::WriteMemory( PIT_CONTACT_SLOTS[0], PitContact4_Hook );
 	injector::WriteMemory( PIT_CONTACT_SLOTS[1], PitContact5_Hook );
 }
@@ -4374,6 +4381,31 @@ static void PollKeyboard_Hook()
 		RoleSwapKeys( (uint8_t*) KEYS_NOW );
 	}
 	if ( ((uint8_t*) KEYS_NOW)[0xCD] & 0x80 ) InterlockedIncrement( &g_testArrowFrames );
+}
+
+// Background autotest : the game window shows up without being activated or brought
+// forward. Its startup SetFocus and SetForegroundWindow calls drop their argument,
+// SetWindowPos gets SWP_NOACTIVATE and ShowWindow SW_SHOWNOACTIVATE (same for the
+// SetFocus + ShowWindow pair at 0x698383). Its SetWindowPos( HWND_TOPMOST ) call
+// (0x60D68F) puts it at the bottom of the window stack instead.
+static BOOL __stdcall SetWindowPos_Bottom( HWND wnd, HWND, int x, int y, int cx, int cy, UINT flags )
+{
+	return SetWindowPos( wnd, HWND_BOTTOM, x, y, cx, cy, flags | SWP_NOACTIVATE );
+}
+
+static void PatchWindowNoActivate()
+{
+	static const uint8_t POP_ARG[6] = { 0x83, 0xC4, 0x04, 0x90, 0x90, 0x90 };   // add esp, 4
+
+	injector::MakeCALL( 0x60D68F, &SetWindowPos_Bottom );
+	injector::MakeNOP( 0x60D694, 1 );
+	injector::WriteMemoryRaw( 0x60D660, POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
+	injector::WriteMemoryRaw( 0x60D66D, POP_ARG, sizeof(POP_ARG), true );   // SetForegroundWindow.
+	injector::WriteMemory<uint8_t>( 0x60D674, SWP_NOACTIVATE );
+	injector::WriteMemory<uint8_t>( 0x60D6AA, SW_SHOWNOACTIVATE );
+	injector::WriteMemory<uint8_t>( 0x60D180, SW_SHOWNOACTIVATE );
+	injector::WriteMemoryRaw( 0x698383, POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
+	injector::WriteMemory<uint8_t>( 0x69838A, SW_SHOWNOACTIVATE );
 }
 
 
@@ -7688,6 +7720,15 @@ public:
 
 		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
 
+		// Several games at once (PTLE_MP_INSTANCE, multiplayer tests on one computer) : the
+		// game's "already running" check (GetLastError() == ERROR_ALREADY_EXISTS after its
+		// CreateMutexA) always says no.
+		char instance[32];
+		if ( GetEnvironmentVariableA( "PTLE_MP_INSTANCE", instance, sizeof(instance) ) ) {
+			injector::WriteMemory<uint8_t>( 0x60D46A, 0xEB );   // jne -> jmp.
+			mp_log( "[MP] Instance \"%s\" : more than one copy of the game allowed.\n", instance );
+		}
+
 		g_netLog = mp_log;
 		NetConfig config;
 		ReadNetConfig( &config );
@@ -7738,6 +7779,7 @@ public:
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
 			g_autotest = true;
 			g_background = !(GetEnvironmentVariableA( "PTLE_MP_FOREGROUND", env, sizeof(env) ) && env[0] == '1');
+			if ( g_background ) PatchWindowNoActivate();
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
