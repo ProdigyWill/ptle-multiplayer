@@ -5,6 +5,18 @@ title; players with another version are marked on its Players page.
 
 ## Unreleased (0.3.0)
 
+### Changed
+
+- The logs of your last 3 games are kept (multiplayer-1.log is the one before,
+  then -2 and -3), so a crash's log isn't lost when you start the game again.
+  After a crash, send multiplayer.log and multiplayer-1.log.
+
+### Fixed
+
+- When someone pauses, their Harry now stops where they paused and stays there,
+  still, until they go on. Before, he replayed his last moment over and over,
+  then vanished after 5 s. (Both players need this version.)
+
 ## 0.2.0 (2026-11-17)
 
 ### New
