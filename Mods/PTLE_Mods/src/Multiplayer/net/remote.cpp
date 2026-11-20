@@ -110,11 +110,23 @@ const PlayerSnapshot* RemotePlayer::Update( uint32_t nowMs, int delayMs )
 		m_playTime = target;
 	}
 	else {
+		double was = m_playTime;
 		m_playTime += (double) (int32_t) (nowMs - m_lastNow);
 		double drift = target - m_playTime;
-		if ( fabs( drift ) > SNAP_DRIFT_MS ) m_playTime = target;
-		else m_playTime += drift * DRIFT_PULL;
+		// Behind : jump ahead. Ahead (by up to the delay) only means nothing newer came :
+		// see below; only further than that (their clock went back) jumps back.
+		if ( drift > SNAP_DRIFT_MS || drift < -(SNAP_DRIFT_MS + delayMs) ) m_playTime = target;
+		else {
+			// Pulled towards the target, but never back : held on the newest snapshot,
+			// two updates close together let the pull win, and they twitched back a few ms.
+			m_playTime += drift * DRIFT_PULL;
+			if ( m_playTime < was ) m_playTime = was;
+		}
 	}
+	// Nothing newer (their game is paused, or packets are late) : stay on the newest
+	// one. Running on past it, the clock fell more than SNAP_DRIFT_MS ahead of the
+	// target and jumped back by the delay : their last quarter second, again and again.
+	if ( (int32_t) ((uint32_t) (int64_t) m_playTime - m_newestTime) > 0 ) m_playTime = (double) m_newestTime;
 	m_lastNow = nowMs;
 
 	// The newest snapshot recorded at or before the playback time, and the first
