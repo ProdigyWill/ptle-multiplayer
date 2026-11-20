@@ -2918,6 +2918,11 @@ static const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (h
 static const uint32_t LAYER_TARGET = 0x60;          // float : the weight the game set it to (or is fading it to).
 
 static const uint32_t CLIP_FRAMES = 0x14;           // int, in the clip (layer +0x78) : its frames (the last is this - 1).
+
+// Not named in AnimLayer / ERAnim yet. The frames are the ones the game's layer update
+// counts (0x619396 reads the clip's +0x14), not ERAnim::m_framesCount (+0x20).
+static inline float& LayerTarget( AnimLayer* layer ) { return FIELD(layer, float, LAYER_TARGET); }
+static inline int ClipFrames( const ERAnim* clip ) { return FIELD(clip, int, CLIP_FRAMES); }
 GET_METHOD( 0x61E4F0, void, AnimCtrl_SetTicked, EAnimController*, void*, bool );
 static const float EMOTE_MOVE = 0.5F;               // Harry got moved this far from where he started : over.
 static const uint32_t EMOTE_FADE_MS = 200;          // Over : blended back into the game's own animation this long.
@@ -2966,7 +2971,7 @@ static float ClipSecondsLeft( AnimLayer* layer )
 	float rate = layer->m_fps * layer->m_speed;
 	if ( !clip ) return 0.0F;
 	if ( rate <= 0.0F ) return 1e6F;   // Stopped : not getting to its end.
-	return ((float) (clip->m_framesCount - 1) - layer->m_frame) / rate;
+	return ((float) (ClipFrames(clip) - 1) - layer->m_frame) / rate;
 }
 
 // Ours, whatever the game does : starting one of Harry's idles, it fades every other
@@ -2974,7 +2979,7 @@ static float ClipSecondsLeft( AnimLayer* layer )
 static void KeepLayer( EAnimController* ctrl, AnimLayer* layer )
 {
 	layer->m_fading = 0;
-	*(float*) (layer + LAYER_TARGET) = 1.0F;
+	LayerTarget( layer ) = 1.0F;
 	if ( !layer->m_ticked ) AnimCtrl_SetTicked( ctrl, layer, true );
 }
 
@@ -2983,7 +2988,7 @@ static void DropLayer( EIHarry* harry, int key )
 	AnimLayer* layer = GetAnimLayer( harry, key );
 	if ( !layer ) return;
 	layer->m_weight = 0.0F;
-	*(float*) (layer + LAYER_TARGET) = 0.0F;
+	LayerTarget( layer ) = 0.0F;
 	layer->m_fading = 0;
 	AnimCtrl_SetTicked( &harry->m_animController, layer, false );
 }
@@ -2998,7 +3003,7 @@ static void SetEmoteWeights( EIHarry* harry, int key, float w, int key2 = -1, fl
 		if ( i == key ) layer->m_weight = w;
 		else if ( i == key2 ) layer->m_weight = w2;
 		else if ( i == EMOTE_LAYERS[0] || i == EMOTE_LAYERS[1] ) layer->m_weight = 0.0F;
-		else layer->m_weight = *(float*) (layer + LAYER_TARGET) * (1.0F - w - w2);
+		else layer->m_weight = LayerTarget(layer) * (1.0F - w - w2);
 	}
 }
 
@@ -3149,7 +3154,7 @@ static void EmoteTick( EIHarry* harry )
 			if ( HasHold( d ) && g_emote.clip == d.clip && g_emote.ending < 0 && !g_emote.finishing ) {
 				// Its hold : from its first frame on, it stays (between the two frames, again and again).
 				ERAnim* clip = mine->m_anim;
-				float last = clip ? (float) (*(int*) (clip + CLIP_FRAMES) - 1) : 0.0F;
+				float last = clip ? (float) (ClipFrames(clip) - 1) : 0.0F;
 				float a = d.hold[0] < 0.0F ? last : d.hold[0], b = d.hold[1] < 0.0F ? last : d.hold[1];
 				if ( frame >= a ) {
 					if ( !g_emote.holding ) { g_emote.holding = true; g_emote.holdSince = now; mp_log( "[EM] %s : held (frame %.0f).\n", d.name, frame ); }
