@@ -6489,6 +6489,13 @@ static void AutotestStep( EIHarry* harry )
 }
 
 
+// The game's ticks don't always keep EDI, which compiled code expects to survive a call.
+// MAKE_THISCALL_WRAPPER pops its return address into EDI : with CheatLab installed, its
+// EIPlayer tick hook (0x4B2DE1, inside Harry's tick) leaves 0x4B2DE6 there when Harry's
+// tick returns. So "self" is kept in memory across the game's tick and read back after it.
+static EIHarry* volatile g_harryTickSelf = 0;
+static EIEvilHarryP* volatile g_evilTickSelf = 0;
+
 #pragma optimize( "", off )
 static int CrashTestRecurse( int depth )
 {
@@ -6553,7 +6560,9 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 {
 	if ( g_crashTest && g_harryTicks == 300 ) RunCrashTest();
 
+	g_harryTickSelf = self;
 	EIHarry_Tick( self );
+	self = g_harryTickSelf;
 
 	if ( InterlockedIncrement(&g_harryTicks) == 1 ) {
 		mp_log( "[MP] Harry tick hook is running (this 0x%.8X, global Harry 0x%.8X).\n", self, Gizmod::getHarry() );
@@ -6754,7 +6763,9 @@ static void __stdcall _EIEvilHarryP_Tick_Hook( EIEvilHarryP* self )
 
 	PrePositionPuppet( self );
 
-	EIBeast_Tick( self );
+	g_evilTickSelf = self;
+	EIBeast_Tick( self );   // Animations, state machine.
+	self = g_evilTickSelf;  // See g_harryTickSelf.
 
 	if ( g_autoLocomotion ) ApplyLocomotionAnim( self );
 
