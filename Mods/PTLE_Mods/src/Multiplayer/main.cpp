@@ -79,7 +79,7 @@
 GET_METHOD( 0x626670, void, AddToWorld, ERLevel*, EInstance* );
 GET_METHOD( 0x6268D0, void, ERLevel_SetupEntity, ERLevel*, EInstance*, EInstance* );
 GET_METHOD( 0x412850, void, EIBeast_LoadBeastAsset, EIBeast* );
-GET_FUNC(   0x6F8EC0, uint32_t, HashPath, char* );
+GET_FUNC(   0x6F8EC0, uint32_t, HashPath, const char* );
 
 
 static const uint32_t VTABLE_SLOT_TICK   = 0x2C;     // EInstance::Tick().
@@ -87,16 +87,13 @@ static const uint32_t VTABLE_SLOT_RENDER = 0x34;     // EInstance::Render( conte
 
 static const uint32_t HWND_GAME_WINDOW   = 0x93ED60;
 
-// Offset the EIBeast destructor frees (0x412A20 : "add ecx, 30Ch"). We expect it to be
-// m_beastTypeName, which must therefore not point to static memory when the level unloads.
-static const size_t EXPECTED_BEASTNAME_OFFSET = 0x30C;
-
 
 typedef void (__thiscall *TickFunc)( EInstance* );
 typedef void (__thiscall *RenderFunc)( EInstance* self, void* context, void* arg );
-static TickFunc g_origHarryTick = 0;
-static TickFunc g_origEvilHarryTick = 0;
-static RenderFunc g_origEvilHarryRender = 0;
+
+GET_METHOD( 0x4B2CD0, void, EIHarry_Tick, EIHarry* );
+GET_METHOD( 0x414F80, void, EIBeast_Tick, EIBeast* );
+GET_METHOD( 0x41C6A0, void, EIBeast_Render, EIBeast*, void*, void* );
 
 // Shortcut.
 static inline Logger* logger() { return Gizmod::getInstance()->getLogger(); }
@@ -345,7 +342,7 @@ static uint32_t g_tickLevel = 0;   // The level's CRC at Harry's last tick (the 
 // Monument : Harry running in the middle of the level, nowhere near the loadzone);
 // saying we were still in the old one showed the game pulling Harry about in the
 // loadzone (rubber-banding). So none : we're hidden until we're in the new one.
-static uint32_t ShownLevel()
+static inline uint32_t ShownLevel()
 {
 	return g_levelLeaving ? 0 : Gizmod::getCurrentLevelCRC();
 }
@@ -371,7 +368,6 @@ static bool g_haveLocal = false;
 // One per player id the relay hands out (its rooms hold 8). Each other player in
 // the room gets their own puppet; with echo (or the loopback), our own id gets one
 // too and replays us.
-class EIEvilHarryP;
 static const int MAX_PEERS = 8;
 struct Peer
 {
@@ -416,7 +412,7 @@ struct Peer
 	float tagX, tagY, tagDepth;
 	uint32_t tagFrame;                 // g_presentCount then.
 };
-static Peer g_peers[MAX_PEERS];        // Static : big, and 16-byte aligned.
+static Peer g_peers[MAX_PEERS];
 
 // Who is in the room (from their PACKET_INFO), kept across levels. Presence goes by
 // those packets (sent even while a player's game is loading or paused), not by
@@ -955,7 +951,7 @@ static void NetUpdate()
 // 0x61CAD0( layer, clipCRC ) loads a clip into a layer (creating the layer).
 // --------------------------------------------------------------------------------
 GET_METHOD( 0x6F3A50, int,  AnimMap_Find,     void*, int, AnimLayer** );
-GET_METHOD( 0x61CAD0, void, AnimCtrl_SetClip, EAnimController*, int, uint32_t );
+GET_METHOD( 0x61CAD0, void, EAnimController_SetClip, EAnimController*, int, uint32_t );
 
 static const int      MAX_LAYER_SCAN  = 256;
 
@@ -1005,30 +1001,23 @@ static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight 
 	return best;
 }
 
-// --------------------------------------------------------------------------------
-// Items. Harry+0x93C (EIPlayer::m_itemHotbar) is really his item manager : its
-// first four pointers are the wheel's items, +0x10 is the item being taken out or
-// put away and +0x14 the item in his hand (0 when empty-handed; cleared as soon as
-// he starts putting it away). The game's item table (0x8EEB90, 9 entries of 0x1C
-// bytes) has each item's object at +4.
-// --------------------------------------------------------------------------------
+
 static ItemStruct* ITEM_TABLE = (ItemStruct*) 0x8EEB90;
 static const int NUM_ITEMS = 9;
 static const int ITEM_SLING = 0, ITEM_TORCH = 1, ITEM_PICKAXES = 2, ITEM_TNT = 3, ITEM_SHIELD = 4, ITEM_RAFT = 5,
                  ITEM_GAS_MASK = 6, ITEM_CANTEEN = 7, ITEM_STINK_BOMB = 8;
 
 #include "ptle/EItemBase.h"
-static inline EItemBase* GetItemObject( int index )
-{
-	return ITEM_TABLE[index].m_object;
-}
+static inline EItemBase* GetItemObject( int index ) { return ITEM_TABLE[index].m_object; }
 
 static int GetHeldItem( EIHarry* harry )
 {
 	EInventory* inv = harry->m_inventory;
 	if ( !inv ) return -1;
+
 	EItemBase* held = inv->m_itemInHandNext;
 	if ( !held ) return -1;
+
 	for ( int i = 0; i < NUM_ITEMS; i++ )
 		if ( GetItemObject(i) == held ) return i;
 	return -1;
@@ -1104,7 +1093,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 
 static const PlayerSnapshot* GetPuppetTarget()
 {
-	if ( !g_cur->target && IsViewerPeer( g_cur ) && g_haveLocal ) return &g_local;
+	if ( !g_cur->target && IsViewerPeer(g_cur) && g_haveLocal ) return &g_local;
 	return g_cur->target;
 }
 
@@ -1119,29 +1108,18 @@ static int FindStateIndex( EIBeast* beast, const char* shortName )
 {
 	EBeastStateMachine* sm = beast->GetStateMachine();
 	if ( !sm || !sm->m_states ) return -1;
+
 	for ( int i = 0; i < (int) sm->m_numStates; i++ ) {
 		const char* name = sm->m_states[i].m_name;
-		const char* dot = name ? strchr( name, '.' ) : 0;
-		if ( dot && strcmp( dot + 1, shortName ) == 0 ) return i;
+		const char* dot = name ? strchr(name, '.') : 0;
+
+		if ( dot && strcmp(dot + 1, shortName) == 0 ) return i;
 	}
 	return -1;
 }
 static char g_puppetName[] = "evil harry";
 static char* const GAME_EMPTY_STRING = (char*) 0x9410B0;   // The game strings' "" (0x6F047A).
 
-static void LogStateMachine( EIBeast* beast )
-{
-	EBeastStateMachine* sm = beast->GetStateMachine();
-	if ( !sm || !sm->m_states ) {
-		mp_log( "[MP] Puppet has no state machine.\n" );
-		return;
-	}
-
-	mp_log( "[MP] Puppet state machine \"%s\", %d states :\n", sm->m_beastTypeName, sm->m_numStates );
-	for ( int i = 0; i < sm->m_numStates; i++ ) {
-		mp_log( "[MP]   %d : %s\n", i, sm->m_states[i].m_name );
-	}
-}
 
 static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry );
 static int g_puppetsSpawned = 0;   // For the autotest.
@@ -1169,7 +1147,7 @@ static void SpawnPuppet( EIHarry* harry )
 	p->m_rotation.z = 0.0F;
 	p->m_rotation.w = 1.0F;
 
-	p->m_beastTypeCRC = HashPath( (char*) "BEvilHarryP" );
+	p->m_beastTypeCRC = HashPath( "BEvilHarryP" );
 	p->m_beastTypeName = g_puppetName;
 	EIBeast_LoadBeastAsset( p );
 	p->DeserializePart2();
@@ -1200,13 +1178,6 @@ static void SpawnPuppet( EIHarry* harry )
 	mp_log( "[MP] Puppet starts in state %d (idle left).\n", g_cur->forcedState );
 	InitLocomotion( p, harry );
 
-	mp_log( "[MP] Puppet spawned at 0x%.8X (m_beastTypeName offset 0x%X, expected 0x%X).\n",
-		p, (unsigned) offsetof(EIBeast, m_beastTypeName), (unsigned) EXPECTED_BEASTNAME_OFFSET );
-	mp_log( "[MP] Harry at (%.2f, %.2f, %.2f). header offsets : EICharacter::m_position 0x%X, m_transformMatrix 0x%X, EIBeast::m_position 0x%X, m_rotation 0x%X\n",
-		harry->m_position.x, harry->m_position.y, harry->m_position.z,
-		(unsigned) offsetof(EICharacter, m_position), (unsigned) offsetof(EICharacter, m_transformMatrix),
-		(unsigned) offsetof(EIBeast, m_position), (unsigned) offsetof(EIBeast, m_rotation) );
-
 	if ( count > 1 ) return;
 	// Raw dump of the transform-related area, before we touch anything.
 	const uint32_t ranges[][2] = { { 0x120, 0x1B0 }, { 0x2F0, 0x350 } };
@@ -1216,7 +1187,6 @@ static void SpawnPuppet( EIHarry* harry )
 			mp_log( "[MP]   +0x%03X : %10.3f %10.3f %10.3f %10.3f\n", o, f[0], f[1], f[2], f[3] );
 		}
 	}
-	LogStateMachine( p );
 }
 
 // Called when Harry's world or the level changes. The old level's puppets usually
@@ -1390,8 +1360,8 @@ static bool GetPuppetTargetPosition( Vector3f* out )
 {
 	const PlayerSnapshot* t = GetPuppetTarget();
 	if ( !t ) return false;
-	if ( IsParkedPeer( g_cur ) ) { *out = g_parkedPin; return true; }
-	if ( IsViewerPeer( g_cur ) ) { *out = g_viewerPin; return true; }
+	if ( IsParkedPeer(g_cur) ) { *out = g_parkedPin; return true; }
+	if ( IsViewerPeer(g_cur) ) { *out = g_viewerPin; return true; }
 	if ( g_puppetPinned ) {
 		*out = g_puppetPin;
 		if ( g_puppetStaysHere ) out->z += t->lift;   // F8 : still jumps and climbs, in place.
@@ -1440,7 +1410,7 @@ static void ResetLocomotion()
 static void UpdateLocomotion( EIEvilHarryP* p )
 {
 	Vector3f pos;
-	if ( !GetPuppetTargetPosition( &pos ) ) return;
+	if ( !GetPuppetTargetPosition(&pos) ) return;
 
 	if ( g_cur->haveLastTarget ) {
 		float dx = pos.x - g_cur->lastTarget.x;
@@ -1517,8 +1487,8 @@ static void UpdateLocomotion( EIEvilHarryP* p )
 // set to the state's index), then the "locomotion" layers from the beast's
 // quickdata at [+0x52C] : +0 move (CRC at +0x494), +1 idle (CRC at +0x498),
 // +2 turn left, +3 turn right. [+0x530] is the layer currently playing.
-GET_METHOD( 0x61D0D0, void, AnimCtrl_FadeTo,  EAnimController*, int, float );
-GET_METHOD( 0x61D8A0, void, AnimCtrl_Restart, EAnimController*, int );
+GET_METHOD( 0x61D0D0, void, EAnimController_FadeTo,  EAnimController*, int, float );
+GET_METHOD( 0x61D8A0, void, EAnimController_Restart, EAnimController*, int );
 
 static int GetStateAnimLayer( EIBeast* p, int state )
 {
@@ -1534,9 +1504,9 @@ static void PlayAnimLayer( EIEvilHarryP* p, int layer )
 	int current = p->m_animIndex;
 	if ( layer < 0 || layer == current ) return;
 
-	if ( current >= 0 ) AnimCtrl_FadeTo( ctrl, current, 0.0F );
-	AnimCtrl_Restart( ctrl, layer );
-	AnimCtrl_FadeTo( ctrl, layer, 1.0F );
+	if ( current >= 0 ) EAnimController_FadeTo( ctrl, current, 0.0F );
+	EAnimController_Restart( ctrl, layer );
+	EAnimController_FadeTo( ctrl, layer, 1.0F );
 	p->m_animIndex = layer;
 }
 
@@ -1558,7 +1528,7 @@ static bool ApplyMirroredClip( EIEvilHarryP* p )
 
 	EAnimController* ctrl = &p->m_animController;
 	int next = (current == MIRROR_LAYERS[g_cur->mirrorSlot]) ? 1 - g_cur->mirrorSlot : g_cur->mirrorSlot;
-	AnimCtrl_SetClip( ctrl, MIRROR_LAYERS[next], clip );
+	EAnimController_SetClip( ctrl, MIRROR_LAYERS[next], clip );
 	PlayAnimLayer( p, MIRROR_LAYERS[next] );
 	g_cur->mirrorSlot = next;
 	g_cur->mirrorClip = clip;
@@ -1568,7 +1538,7 @@ static bool ApplyMirroredClip( EIEvilHarryP* p )
 static void ApplyLocomotionAnim( EIEvilHarryP* p )
 {
 	static int overridden = 0;
-	if ( ApplyMirroredClip( p ) ) return;
+	if ( ApplyMirroredClip(p) ) return;
 
 	int wanted = g_cur->idleLayer;
 	if ( g_cur->airborne && g_cur->airLayer >= 0 ) wanted = g_cur->airLayer;
@@ -2209,9 +2179,13 @@ static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, flo
 	return true;
 }
 
-static bool IsPuppet( const void* beast );
+static bool IsPuppet( EIEvilHarryP* beast )
+{
+	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].beast == beast || g_peers[i].limbo == beast ) return true;
+	return false;
+}
 
-static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* context, void* arg )
+static void __stdcall _EIEvilHarryP_Render_Hook( EIEvilHarryP* self, void* context, void* arg )
 {
 	Peer* peer = FindPeer( self );
 	if ( !peer ) {
@@ -2220,9 +2194,10 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 		// (Only this world's and the last one's : the game's own Evil Harry may reuse
 		// an old puppet's address in a level long gone.)
 		int spawned = -1;
-		EIHarry* me = Gizmod::getHarry();
+		EIHarry* harry = Gizmod::getHarry();
 		for ( int i = 0; i < g_spawnedCount; i++ )
-			if ( g_spawned[i].beast == self && me && (g_spawned[i].world == me->m_world || g_spawned[i].world == g_prevWorld) ) spawned = i;
+			if ( g_spawned[i].beast == self && (g_spawned[i].world == harry->m_world || g_spawned[i].world == g_prevWorld) ) spawned = i;
+
 		bool setAside = IsPuppet( self );
 		if ( spawned >= 0 || setAside ) {
 			static void* logged[8];
@@ -2232,78 +2207,85 @@ static void __fastcall EvilHarryRender_Hook( EIEvilHarryP* self, void*, void* co
 			if ( !seen ) {
 				logged[numLogged++ % 8] = self;
 				if ( numLogged > 8 ) numLogged = 8;
-				EIHarry* harry = Gizmod::getHarry();
 				mp_log( "[MP] Puppet 0x%.8X (%s, player %d) drawn with nobody driving it, at (%.1f, %.1f, %.1f) : hidden.\n", self,
-					setAside ? "set aside" : (harry && g_spawned[spawned].world == harry->m_world ? "left over, this world" : "left over, another world"),
+					setAside ? "set aside" : (g_spawned[spawned].world == harry->m_world ? "left over, this world" : "left over, another world"),
 					spawned >= 0 ? g_spawned[spawned].owner : -1, self->EIBeast::m_position.x, self->EIBeast::m_position.y, self->EIBeast::m_position.z );
 			}
 			return;
 		}
-		g_origEvilHarryRender( self, context, arg );   // The game's own Evil Harry.
+
+		EIBeast_Render( self, context, arg );
 		return;
 	}
+
 	CurrentPeer current( peer );
-	if ( IsParkedPeer( peer ) ) return;   // The emote preview's, between previews.
+	if ( IsParkedPeer(peer) ) return;   // The emote preview's, between previews.
+
 	const PlayerSnapshot* t = GetPuppetTarget();
 	// Online with nobody to show here (they left, or are in another level) : not drawn.
 	if ( g_networked && !t ) return;
 	if ( g_levelLeaving ) return;   // The old level, still shown (NoteLevelLeaving).
 	bool viewer = IsViewerPeer( peer );   // No pose copy, name tag or items : just the clip.
 	if ( t && !ForcedClip() ) ApplyPuppetPose( self, t );
-	g_origEvilHarryRender( self, context, arg );
+
+	EIBeast_Render( self, context, arg );
+
 	if ( t && !viewer ) NoteNameTag( peer, self );
 	if ( t && !viewer && t->drawnSlot >= 0 ) DrawPuppetItem( t->drawnSlot, context, arg );
 }
+MAKE_THISCALL_WRAPPER( EIEvilHarryP_Render_Hook, _EIEvilHarryP_Render_Hook );
+
 
 static void InstallItemDrawHooks()
 {
 	for ( int i = 0; i < NUM_DRAWN_ITEMS; i++ ) {
 		const uint32_t slot = DRAWN_ITEMS[i].vtable + ITEM_SLOT_DRAW;
-		g_origItemDraw[i] = injector::ReadMemory<ItemDrawFunc>( slot, true );
-		injector::WriteMemory( slot, ITEM_DRAW_HOOKS[i], true );
+		g_origItemDraw[i] = injector::ReadMemory<ItemDrawFunc>( slot );
+		injector::WriteMemory( slot, ITEM_DRAW_HOOKS[i] );
 	}
 	const uint32_t render = EIEvilHarryP::VTABLE + VTABLE_SLOT_RENDER;
-	g_origEvilHarryRender = injector::ReadMemory<RenderFunc>( render, true );
-	injector::WriteMemory( render, &EvilHarryRender_Hook, true );
+	injector::WriteMemory( render, &EIEvilHarryP_Render_Hook );
 }
 
-// Pitfalls (EIPitMonster) eat any beast that touches their mouth : the beast is put
-// to sleep and the pit stays shut on it, as for an enemy knocked in. A puppet
-// caught there (spat out, or crossing the mouth) kept the pit shut on the other
-// players' screens : the pit's two contact handlers now let puppets through.
+// Pitfalls (EIPitMonster) eat any beast that touches their mouth : the beast is put to sleep and the pit
+// stays shut on it. A puppet caught there kept the pit shut on the other players' screens.
+// The pit's two contact handlers now let puppets through.
+#include "ptle/EIPitMonster.h"
 static const uint32_t PIT_CONTACT_SLOTS[2] = { 0x890444, 0x890448 };
-static const uint32_t PIT_CONTACT_FUNCS[2] = { 0x542DD0, 0x542FD0 };
-struct PitContact { uint32_t flags; uint32_t pad[2]; void* other; };
-typedef bool (__thiscall *PitContact4)( void* self, PitContact* c, int a, int b, int d );
-typedef bool (__thiscall *PitContact5)( void* self, PitContact* c, int a, int b, int d, int e );
+
 static volatile LONG g_pitSkips = 0;
 
-static bool IsAnyPuppet( const void* beast )
+GET_METHOD( 0x542DD0, bool, EIPitMonster_Contact4, EIPitMonster*, OverlapStruct* c, int a, int b, int d );
+GET_METHOD( 0x542FD0, bool, EIPitMonster_Contact5, EIPitMonster*, OverlapStruct* c, int a, int b, int d, int e );
+
+static bool IsAnyPuppet( EInstance* beast )
 {
-	if ( !beast ) return false;
-	if ( IsPuppet( beast ) ) return true;
+	if ( beast->GetType() != get_etypeinfo<EIEvilHarryP>() ) return false;
+	if ( IsPuppet((EIEvilHarryP*) beast) ) return true;
 	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].beast == beast ) return true;
 	return false;
 }
 
-static bool PitSkips( PitContact* c )
+static bool PitSkips( OverlapStruct* c )
 {
-	if ( !c || !IsAnyPuppet( c->other ) ) return false;
-	if ( InterlockedIncrement( &g_pitSkips ) <= 3 ) mp_log( "[MP] A pitfall touched a puppet (0x%.8X) : not eaten.\n", c->other );
+	if ( !c || !IsAnyPuppet(c->m_other) ) return false;
+	if ( InterlockedIncrement(&g_pitSkips) <= 3 ) mp_log( "[MP] A pitfall touched a puppet (0x%.8X) : not eaten.\n", c->m_other );
 	return true;
 }
 
-static bool __fastcall PitContact4_Hook( void* self, void*, PitContact* c, int a, int b, int d )
+static bool __stdcall _PitContact4_Hook( EIPitMonster* self, OverlapStruct* c, int a, int b, int d )
 {
-	if ( PitSkips( c ) ) return false;
-	return ((PitContact4) PIT_CONTACT_FUNCS[0])( self, c, a, b, d );
+	if ( PitSkips(c) ) return false;
+	return EIPitMonster_Contact4( self, c, a, b, d );
 }
+MAKE_THISCALL_WRAPPER( PitContact4_Hook, _PitContact4_Hook );
 
-static bool __fastcall PitContact5_Hook( void* self, void*, PitContact* c, int a, int b, int d, int e )
+static bool __stdcall _PitContact5_Hook( EIPitMonster* self, OverlapStruct* c, int a, int b, int d, int e )
 {
-	if ( PitSkips( c ) ) return false;
-	return ((PitContact5) PIT_CONTACT_FUNCS[1])( self, c, a, b, d, e );
+	if ( PitSkips(c) ) return false;
+	return EIPitMonster_Contact5( self, c, a, b, d, e );
 }
+MAKE_THISCALL_WRAPPER( PitContact5_Hook, _PitContact5_Hook );
 
 // Creatures fade out with their distance to the camera (vtable +0x108, 0x41ED70,
 // shared by every kind : sets the fade at +0x24 from 1 to 0, about 150 away, and
@@ -2312,7 +2294,6 @@ static bool __fastcall PitContact5_Hook( void* self, void*, PitContact* c, int a
 // to the game's own cut-off, a few hundred away); the name tags still fade
 // (TAG_FADE_STARTS).
 static const uint32_t VTABLE_SLOT_DISTANCE_FADE = 0x108;
-static const uint32_t DISTANCE_FADE_FUNC = 0x41ED70;
 static const uint32_t DISTANCE_FADE_VTABLES[] = {   // Every vtable with it in that slot.
 	0x869440, 0x869AD0, 0x86B3C8, 0x86C3D0, 0x86D1D8, 0x86D7A0, 0x86FD18, 0x873B68,
 	0x874688, 0x875240, 0x875B30, 0x876400, 0x876800, 0x876D28, 0x877E78, 0x878310,
@@ -2322,14 +2303,15 @@ static const uint32_t DISTANCE_FADE_VTABLES[] = {   // Every vtable with it in t
 	0x897ED0, 0x898660, 0x898C20, 0x899130, 0x8999C8, 0x899DE0, 0x89A6D8, 0x8A18A0,
 	0x8A1CF0, 0x8A2C70,
 };
-typedef bool (__thiscall *DistanceFadeFunc)( EInstance* self, float distance );
+
 static volatile LONG g_fadesStopped = 0;
 static float g_lastPuppetFade = 1.0F;   // What the game wanted for a puppet (tests).
 static volatile LONG g_puppetFadeCalls = 0;
 
-static bool __fastcall DistanceFade_Hook( EInstance* self, void*, float distance )
+GET_METHOD( 0x41ED70, bool, EIBeast_DistanceFade, EIBeast*, float );
+static bool __stdcall _DistanceFade_Hook( EIBeast* self, float distance )
 {
-	const bool gone = ((DistanceFadeFunc) DISTANCE_FADE_FUNC)( self, distance );
+	const bool gone = EIBeast_DistanceFade( self, distance );
 	float fade = self->m_opacity3;
 	bool puppet = IsAnyPuppet( self );
 	if ( puppet ) {
@@ -2343,14 +2325,16 @@ static bool __fastcall DistanceFade_Hook( EInstance* self, void*, float distance
 	self->m_opacityFinal = self->m_opacity2 * self->m_alphaUser;
 	return false;
 }
+MAKE_THISCALL_WRAPPER( DistanceFade_Hook, _DistanceFade_Hook );
 
 static void InstallFadeHooks()
 {
 	int hooked = 0, n = sizeof(DISTANCE_FADE_VTABLES) / sizeof(DISTANCE_FADE_VTABLES[0]);
 	for ( int i = 0; i < n; i++ ) {
-		uint32_t slot = DISTANCE_FADE_VTABLES[i] + VTABLE_SLOT_DISTANCE_FADE;
-		if ( injector::ReadMemory<uint32_t>( slot, true ) != DISTANCE_FADE_FUNC ) continue;
-		injector::WriteMemory( slot, &DistanceFade_Hook, true );
+		const uint32_t slot = DISTANCE_FADE_VTABLES[i] + VTABLE_SLOT_DISTANCE_FADE;
+		if ( injector::ReadMemory<uint32_t>(slot) != (uint32_t) EIBeast_DistanceFade ) continue;
+
+		injector::WriteMemory( slot, &DistanceFade_Hook );
 		hooked++;
 	}
 	if ( hooked != n ) mp_log( "[MP] Distance fade : %d of %d kinds of creature hooked; the others may still fade out.\n", hooked, n );
@@ -2358,15 +2342,8 @@ static void InstallFadeHooks()
 
 static void InstallPitHooks()
 {
-
-	void* hooks[2] = { (void*) &PitContact4_Hook, (void*) &PitContact5_Hook };
-	for ( int i = 0; i < 2; i++ ) {
-		if ( injector::ReadMemory<uint32_t>( PIT_CONTACT_SLOTS[i], true ) != PIT_CONTACT_FUNCS[i] ) {
-			mp_log( "[MP] The pitfall's contact handler isn't where we expect : pitfalls may still eat puppets.\n" );
-			continue;
-		}
-		injector::WriteMemory( PIT_CONTACT_SLOTS[i], hooks[i], true );
-	}
+	injector::WriteMemory( PIT_CONTACT_SLOTS[0], PitContact4_Hook );
+	injector::WriteMemory( PIT_CONTACT_SLOTS[1], PitContact5_Hook );
 }
 
 static void DrivePuppet( EIEvilHarryP* p )
@@ -3093,7 +3070,7 @@ static void StopEmote( EIHarry* harry, const char* why, uint32_t fadeMs = EMOTE_
 static const char* WhyNoEmote( EIHarry* harry )
 {
 	if ( harry->m_healthValue <= 0 ) return "You can't emote now";
-	if ( GetHeldItem( harry ) >= 0 ) return "Put your item away to emote";
+	if ( GetHeldItem(harry) >= 0 ) return "Put your item away to emote";
 	if ( !harry->m_onGround ) return "Land first to emote";
 	if ( NetNowMs() - g_stillSince < 150 ) return "Stand still to emote";
 	return 0;
@@ -3210,8 +3187,8 @@ static void EmoteTick( EIHarry* harry )
 	}
 	int key = EMOTE_LAYERS[g_emote.slot];
 	if ( !g_emote.started ) {
-		AnimCtrl_SetClip( ctrl, key, g_emote.clip );
-		AnimCtrl_Restart( ctrl, key );
+		EAnimController_SetClip( ctrl, key, g_emote.clip );
+		EAnimController_Restart( ctrl, key );
 		AnimLayer* layer = GetAnimLayer( harry, key );
 		if ( layer ) {
 			layer->m_atEnd = !g_emote.loop;
@@ -4394,30 +4371,6 @@ static void PollKeyboard_Hook()
 	if ( ((uint8_t*) KEYS_NOW)[0xCD] & 0x80 ) InterlockedIncrement( &g_testArrowFrames );
 }
 
-// The game window shows up without being activated or brought forward : its
-// startup SetFocus and SetForegroundWindow calls just drop their argument,
-// SetWindowPos gets SWP_NOACTIVATE and ShowWindow SW_SHOWNOACTIVATE (same for the
-// SetFocus + ShowWindow pair at 0x698383). Its SetWindowPos( HWND_TOPMOST ) call
-// (0x60D68F) puts it at the bottom of the window stack instead, so it never even
-// shows in front of other windows.
-static BOOL __stdcall SetWindowPos_Bottom( HWND wnd, HWND, int x, int y, int cx, int cy, UINT flags )
-{
-	return SetWindowPos( wnd, HWND_BOTTOM, x, y, cx, cy, flags | SWP_NOACTIVATE );
-}
-
-static void PatchWindowNoActivate()
-{
-	injector::MakeCALL( 0x60D68F, &SetWindowPos_Bottom, true );
-	injector::MakeNOP( 0x60D694, 1, true );
-	static const uint8_t POP_ARG[6] = { 0x83, 0xC4, 0x04, 0x90, 0x90, 0x90 };   // add esp, 4
-	injector::WriteMemoryRaw( 0x60D660, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
-	injector::WriteMemoryRaw( 0x60D66D, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetForegroundWindow.
-	injector::WriteMemory<uint8_t>( 0x60D674, SWP_NOACTIVATE, true );
-	injector::WriteMemory<uint8_t>( 0x60D6AA, SW_SHOWNOACTIVATE, true );
-	injector::WriteMemory<uint8_t>( 0x60D180, SW_SHOWNOACTIVATE, true );
-	injector::WriteMemoryRaw( 0x698383, (void*) POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
-	injector::WriteMemory<uint8_t>( 0x69838A, SW_SHOWNOACTIVATE, true );
-}
 
 static void SendKey( WORD vk, bool down )
 {
@@ -6499,18 +6452,6 @@ static void AutotestStep( EIHarry* harry )
 }
 
 
-
-// --------------------------------------------------------------------------------
-// Tick hooks. __fastcall receives "this" in ECX like __thiscall (EDX is unused),
-// so these can replace the vtable entries directly.
-// --------------------------------------------------------------------------------
-// The game's tick code doesn't preserve every register it should : Harry's tick
-// returns with EDI holding a return address (0x4B2DE6, after "call 0x547180").
-// Game code never relies on EDI, but our compiled hooks may keep "self" in it, so
-// "self" is kept in memory across the original call and read back afterwards.
-static EIHarry* volatile g_harryTickSelf = 0;
-static EIEvilHarryP* volatile g_evilTickSelf = 0;
-
 #pragma optimize( "", off )
 static int CrashTestRecurse( int depth )
 {
@@ -6540,6 +6481,7 @@ static void CheckCaught( EIHarry* harry )
 		for ( int i = 0; i < MAX_PEERS && now - lastReport >= 1000; i++ ) {
 			const Peer& p = g_peers[i];
 			if ( i == me || !p.beast ) continue;
+
 			const Vector3f& s = p.beast->EIBeast::m_position;
 			mp_log( "[AT] HS : player %d's puppet is (%.2f, %.2f, %.2f) from Harry.\n", i, s.x - harry->m_position.x, s.y - harry->m_position.y, s.z - harry->m_position.z );
 			lastReport = now;
@@ -6550,11 +6492,13 @@ static void CheckCaught( EIHarry* harry )
 		const PlayerInfo& info = g_players[i];
 		const Peer& p = g_peers[i];
 		if ( i == me || !info.present || !info.playsHs || info.role != ROLE_SEEKER || !p.beast || !p.target ) continue;
+
 		const Vector3f& s = p.beast->EIBeast::m_position;
-		float dx = s.x - harry->m_position.x, dy = s.y - harry->m_position.y, dz = s.z - harry->m_position.z;
-		float d = sqrtf( dx * dx + dy * dy + dz * dz );
+		const float dx = s.x - harry->m_position.x, dy = s.y - harry->m_position.y, dz = s.z - harry->m_position.z;
+		const float d = sqrtf( dx * dx + dy * dy + dz * dz );
 		if ( g_testNearestSeeker < 0.0F || d < g_testNearestSeeker ) g_testNearestSeeker = d;
 		if ( d >= CATCH_DISTANCE ) continue;
+
 		mp_log( "[HS] Caught by player %d (\"%s\"), %.2f away : Harry dies.\n", i, info.name, d );
 		Toast( "%s caught you!", info.name );
 		if ( !g_catchNumber ) g_catchNumber = GetTickCount() | 1;
@@ -6568,14 +6512,13 @@ static void CheckCaught( EIHarry* harry )
 	}
 }
 
-static void __fastcall HarryTick_Hook( EIHarry* self, void* )
+static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 {
 	if ( g_crashTest && g_harryTicks == 300 ) RunCrashTest();
-	g_harryTickSelf = self;
-	g_origHarryTick( self );
-	self = g_harryTickSelf;
 
-	if ( InterlockedIncrement( &g_harryTicks ) == 1 ) {
+	EIHarry_Tick( self );
+
+	if ( InterlockedIncrement(&g_harryTicks) == 1 ) {
 		mp_log( "[MP] Harry tick hook is running (this 0x%.8X, global Harry 0x%.8X).\n", self, Gizmod::getHarry() );
 		if ( !g_autotest ) Toast( "F1 : multiplayer menu" );
 	}
@@ -6622,20 +6565,25 @@ static void __fastcall HarryTick_Hook( EIHarry* self, void* )
 	if ( g_autotest ) AutotestStep( self );
 	HandleHotkeys( self );
 }
+MAKE_THISCALL_WRAPPER( EIHarry_Tick_Hook, _EIHarry_Tick_Hook );
 
 // The puppet wears its player's outfit (ours, when it replays us).
+GET_METHOD( 0x60F770, void, EICharacter_SetModel, EICharacter*, uint32_t );
 static void ApplyPuppetOutfit( EIEvilHarryP* p )
 {
 	int me = g_transport ? g_transport->PlayerId() : -1;
 	bool ours = g_cur->id == me || !g_networked;   // It replays us (echo, the loopback).
 	if ( !ours && !g_players[g_cur->id].present && g_testOutfit < 0 ) return;   // They left : as it is.
+
 	int outfit = ours ? g_myWornOutfit : g_players[g_cur->id].outfit;
 	if ( g_testOutfit >= 0 ) outfit = g_testOutfit;
 	if ( outfit == g_cur->shownOutfit ) return;
+
 	uint32_t model = OUTFITS[outfit].model;
 	p->m_modelCRC = model;
 	p->m_characterCRC = model;
-	((void (__thiscall *)( void*, uint32_t )) 0x60F770)( p, model );
+	EICharacter_SetModel( p, model );
+
 	mp_log( "[MP] Player %d's puppet wears the %s outfit.\n", g_cur->id, OUTFITS[outfit].name );
 	g_cur->shownOutfit = outfit;
 }
@@ -6651,20 +6599,15 @@ static void ApplyPuppetOutfit( EIEvilHarryP* p )
 typedef void (__thiscall *StateCallback)( EIEvilHarryP* self );
 static StateCallback g_origThrownFromWater = 0;
 
-static bool IsPuppet( const void* beast )
+static void __stdcall _ThrownFromWater_Hook( EIEvilHarryP* self )
 {
-	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].beast == beast || g_peers[i].limbo == beast ) return true;
-	return false;
-}
-
-static void __fastcall ThrownFromWater_Hook( EIEvilHarryP* self, void* )
-{
-	if ( IsPuppet( self ) && !g_allowPuppetFreeze ) {
-		if ( InterlockedIncrement( &g_puppetFreezesStopped ) <= 3 ) mp_log( "[MP] A puppet was about to be frozen (Evil Harry's \"thrown from water\") : skipped.\n" );
+	if ( IsPuppet(self) && !g_allowPuppetFreeze ) {
+		if ( InterlockedIncrement(&g_puppetFreezesStopped) <= 3 ) mp_log( "[MP] A puppet was about to be frozen (Evil Harry's \"thrown from water\") : skipped.\n" );
 		return;
 	}
 	g_origThrownFromWater( self );
 }
+MAKE_THISCALL_WRAPPER( ThrownFromWater_Hook, _ThrownFromWater_Hook );
 
 // Each state of the state machine keeps its own copy of its callbacks (enter,
 // update, leave), and every Evil Harry shares the one state machine : the hooks go
@@ -6723,7 +6666,7 @@ static bool HandleOrphan( EIEvilHarryP* self )
 	return false;
 }
 
-static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
+static void __stdcall _EIEvilHarryP_Tick_Hook( EIEvilHarryP* self )
 {
 	if ( g_testStallPuppet && self == g_testStalled ) return;   // Autotest : as if a pitfall caught it.
 	HookThrownFromWater( self );
@@ -6732,7 +6675,7 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 	if ( !peer && HandleOrphan( self ) ) return;
 	if ( !peer ) peer = FindPeer( self );   // Given back to its player.
 	if ( !peer ) {   // The game's own Evil Harry.
-		g_origEvilHarryTick( self );
+		EIBeast_Tick( self );
 		return;
 	}
 	peer->lastTick = GetTickCount();
@@ -6773,9 +6716,9 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 	}
 
 	PrePositionPuppet( self );
-	g_evilTickSelf = self;
-	g_origEvilHarryTick( self );   // Animations, state machine.
-	self = g_evilTickSelf;         // See g_harryTickSelf.
+
+	EIBeast_Tick( self );
+
 	if ( g_autoLocomotion ) ApplyLocomotionAnim( self );
 
 	if ( self->m_stateIndexCurrent != g_cur->lastLoggedState ) {
@@ -6785,6 +6728,7 @@ static void __fastcall EvilHarryTick_Hook( EIEvilHarryP* self, void* )
 
 	DrivePuppet( self );           // Then override where it is.
 }
+MAKE_THISCALL_WRAPPER( EIEvilHarryP_Tick_Hook, _EIEvilHarryP_Tick_Hook );
 
 
 
@@ -7694,7 +7638,12 @@ static bool HookGameExitProcess()
 	return false;
 }
 
-class MultiplayerPlugin : public GizmodPlugin, public ILoadLevelListener, public ILevelLoadedListener
+#include "gizmod/event/HarryDeathEvent.h"
+
+class MultiplayerPlugin : public GizmodPlugin
+	, public ILoadLevelListener
+	, public ILevelLoadedListener
+	, public IHarryDeathListener
 {
 public:
 
@@ -7720,10 +7669,8 @@ public:
 		// Replace Harry and Evil Harry tick functions with our own.
 		const uint32_t harrySlot = EIHarry::VTABLE + VTABLE_SLOT_TICK;
 		const uint32_t evilSlot  = EIEvilHarryP::VTABLE + VTABLE_SLOT_TICK;
-		g_origHarryTick = injector::ReadMemory<TickFunc>( harrySlot, true );
-		g_origEvilHarryTick = injector::ReadMemory<TickFunc>( evilSlot, true );
-		injector::WriteMemory( harrySlot, &HarryTick_Hook, true );
-		injector::WriteMemory( evilSlot, &EvilHarryTick_Hook, true );
+		injector::WriteMemory( harrySlot, &EIHarry_Tick_Hook );
+		injector::WriteMemory( evilSlot, &EIEvilHarryP_Tick_Hook );
 
 		InstallItemDrawHooks();
 		InstallPitHooks();
@@ -7732,17 +7679,9 @@ public:
 
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
 		Gizmod::getInstance()->getEventListener()->registerEvent<LevelLoadedEvent>( this );
+		Gizmod::getInstance()->getEventListener()->registerEvent<HarryDeathEvent>( this );
 
 		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
-
-		// Several games at once (PTLE_MP_INSTANCE, multiplayer tests on one computer) :
-		// the game allows one copy only (CreateMutex at 0x60D456; if it already exists
-		// the new copy brings the old one's window up and quits). Always "doesn't exist".
-		char instance[32];
-		if ( GetEnvironmentVariableA( "PTLE_MP_INSTANCE", instance, sizeof(instance) ) ) {
-			injector::WriteMemory<uint8_t>( 0x60D46A, 0xEB, true );   // jne -> jmp.
-			mp_log( "[MP] Instance \"%s\" : more than one copy of the game allowed.\n", instance );
-		}
 
 		g_netLog = mp_log;
 		NetConfig config;
@@ -7794,7 +7733,6 @@ public:
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
 			g_autotest = true;
 			g_background = !(GetEnvironmentVariableA( "PTLE_MP_FOREGROUND", env, sizeof(env) ) && env[0] == '1');
-			if ( g_background ) PatchWindowNoActivate();
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
@@ -7873,8 +7811,12 @@ public:
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
 		}
 
-		mp_log( "[MP] Hooked ticks (Harry 0x%.8X, Evil Harry 0x%.8X). F1 menu, F5 spawn, F6 state, F7 delay, F8 stay here.\n",
-			(uint32_t) g_origHarryTick, (uint32_t) g_origEvilHarryTick );
+		mp_log( "[MP] Hooked ticks. F1 menu, F5 spawn, F6 state, F7 delay, F8 stay here.\n" );
+	}
+
+	virtual void onHarryDeath( HarryDeathEvent& e )
+	{
+
 	}
 
 	virtual void onLoadLevel( LoadLevelEvent& e )
