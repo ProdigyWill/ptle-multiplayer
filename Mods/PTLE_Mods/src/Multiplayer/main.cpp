@@ -811,7 +811,7 @@ static void NetUpdate()
 	int me = g_transport->PlayerId();
 	bool echo = g_transport->Echoes();
 	while ( (length = g_transport->Receive(packet, sizeof(packet))) > 0 ) {
-		MemoryReader r( packet, sizeof(packet) );
+		MemoryReader r( packet, length );   // Only what was received : reads past it fail.
 		PacketHeader h;
 		if ( !DecodeHeader(packet, length, &h) ) { g_netStats.badPackets++; continue; }
 		r.seek( PACKET_HEADER_SIZE );
@@ -871,7 +871,8 @@ static void NetUpdate()
 
 			// Version string.
 			char version[MAX_VERSION + 1] = "";
-			int versionLength; r.read<uint8_t>( versionLength );
+			int versionLength = 0; r.read<uint8_t>( versionLength );
+			if ( versionLength > MAX_VERSION || (int) r.getPtr() + versionLength > length ) { g_netStats.badPackets++; break; }
 			CleanName( (const char*) r.getDataPtr(), versionLength, version );
 			r.seek( versionLength );
 
@@ -889,7 +890,7 @@ static void NetUpdate()
 			}
 
 			// Flags (paused, ...).
-			uint8_t flags; r.read<uint8_t>( flags );
+			uint8_t flags = 0; r.read<uint8_t>( flags );
 			info.paused = (flags & INFO_PAUSED);
 
 			info.lastInfo = now;
