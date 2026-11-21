@@ -41,7 +41,9 @@ $changelog = Join-Path $PSScriptRoot 'CHANGELOG.md'
 $msbuild   = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe'
 
 function RunGit { & git.exe -C $PSScriptRoot @args; if ($LASTEXITCODE -ne 0) { throw "git $args failed." } }
-function CodeVersion { if ((Get-Content $versionH -Raw) -match '#define MP_VERSION "([^"]+)"') { $Matches[1] } else { throw 'No MP_VERSION in version.h.' } }
+# Windows PowerShell reads files without a BOM as ANSI : the changelog's UTF-8 came out garbled.
+function ReadText($path) { [IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding $false)) }
+function CodeVersion { if ((ReadText $versionH) -match '#define MP_VERSION "([^"]+)"') { $Matches[1] } else { throw 'No MP_VERSION in version.h.' } }
 function WriteText($path, $text) { [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false)) }
 
 if ($Version) {
@@ -51,12 +53,12 @@ if ($Version) {
 	$tagged = & git -C $PSScriptRoot rev-parse -q --verify "refs/tags/$tag"
 	if (-not $tagged) {
 		# A new release.
-		$log = Get-Content $changelog -Raw
+		$log = ReadText $changelog
 		if ($log -notmatch '(?m)^## Unreleased.*$') { throw 'CHANGELOG.md has no "## Unreleased" section to release.' }
 		Write-Host "== Releasing $Version"
 		$date = Get-Date -Format 'yyyy-MM-dd'
 		WriteText $changelog ([regex]::Replace($log, '(?m)^## Unreleased.*$', "## $Version ($date)", 1))
-		WriteText $versionH ([regex]::Replace((Get-Content $versionH -Raw), '#define MP_VERSION "[^"]+"', "#define MP_VERSION `"$Version`""))
+		WriteText $versionH ([regex]::Replace((ReadText $versionH), '#define MP_VERSION "[^"]+"', "#define MP_VERSION `"$Version`""))
 		$logFile = Join-Path $env:LOCALAPPDATA 'PTLE Multiplayer\logs\multiplayer.log'
 		$started = Get-Date
 		try {
@@ -93,7 +95,9 @@ New-Item -ItemType Directory -Force (Join-Path $stage 'mods') | Out-Null
 foreach ($mod in 'Multiplayer', 'WindowedMode', 'CheatLab') {
 	Copy-Item (Join-Path $bin "$mod.asi") (Join-Path $stage 'mods')
 }
-(Get-Content $changelog -Raw) -replace "`r?`n", "`r`n" | Set-Content -Encoding utf8 -NoNewline (Join-Path $stage 'CHANGELOG.txt')
+# For Notepad : no Markdown bold, no empty "Unreleased" section, Windows line ends, a BOM.
+$text = (ReadText $changelog) -replace '\*\*', '' -replace '(?m)^## Unreleased.*\r?\n(\r?\n)*(?=## )', ''
+[IO.File]::WriteAllText((Join-Path $stage 'CHANGELOG.txt'), ($text -replace "`r?`n", "`r`n"), (New-Object Text.UTF8Encoding $true))
 
 if ($Full) {
 	New-Item -ItemType Directory -Force (Join-Path $stage 'config\Multiplayer') | Out-Null
