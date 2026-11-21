@@ -281,9 +281,6 @@ static void LogModLoader()
 
 
 
-// --------------------------------------------------------------------------------
-// Snapshots of the local player, and the remote player's.
-// --------------------------------------------------------------------------------
 // Row-vector matrices (translation in row 3) : world = local * parent.
 static void MatMul( const Matrix4f& a, const Matrix4f& b, Matrix4f* out )
 {
@@ -291,7 +288,7 @@ static void MatMul( const Matrix4f& a, const Matrix4f& b, Matrix4f* out )
 	for ( int i = 0; i < 4; i++ )
 		for ( int j = 0; j < 4; j++ )
 			r.data[i][j] = a.data[i][0] * b.data[0][j] + a.data[i][1] * b.data[1][j]
-			             + a.data[i][2] * b.data[2][j] + a.data[i][3] * b.data[3][j];
+						 + a.data[i][2] * b.data[2][j] + a.data[i][3] * b.data[3][j];
 	*out = r;
 }
 
@@ -368,7 +365,7 @@ static inline uint32_t ShownLevel()
 static int g_pauseTest = 0;   // PTLE_MP_PAUSETEST=1 : (two games) Harry runs, the game is paused mid-run for 8 s, then goes on; 2 : watches the other.
 static int g_raftTest = 0;   // PTLE_MP_RAFTTEST=1 : Spinja Lair's wading water, the raft out, Harry turns paddling one side : the puppet must face as he does.
 static int g_aimTest = 0;   // 2 : with the raft out instead (Down looks from Harry's head, the raft isn't drawn).
-                   // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
+				   // PTLE_MP_AIMTEST=1 : the autotest holds Down (first-person look) with the puppet ahead, to check its tag.
 static int g_distTest = 0;                        // PTLE_MP_DISTTEST=1 : the autotest moves the puppet away, to see how far it's drawn; two games : 2 runs away, 3 watches. PTLE_MP_FADEALLOW=1 : puppets fade as before.
 static bool g_allowPuppetFade = false;
 static int g_emoteTest = 0;                      // PTLE_MP_EMOTETEST=1 : emotes, one game.
@@ -396,7 +393,7 @@ struct Peer
 	uint32_t lastLevel;                // Their last snapshot's level.
 	bool keptPaused;                   // Silent, but paused : kept where they are.
 	uint32_t pausedSeen;               // When they last said they were paused (kept a moment after : their
-	                                   // presence saying they go on can come before their first snapshot).
+									   // presence saying they go on can come before their first snapshot).
 	RemotePlayer remote;
 	const PlayerSnapshot* target;      // What their puppet shows this tick (see NetUpdate).
 
@@ -1054,7 +1051,7 @@ static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight 
 static ItemStruct* ITEM_TABLE = (ItemStruct*) 0x8EEB90;
 static const int NUM_ITEMS = 9;
 static const int ITEM_SLING = 0, ITEM_TORCH = 1, ITEM_PICKAXES = 2, ITEM_TNT = 3, ITEM_SHIELD = 4, ITEM_RAFT = 5,
-                 ITEM_GAS_MASK = 6, ITEM_CANTEEN = 7, ITEM_STINK_BOMB = 8;
+				 ITEM_GAS_MASK = 6, ITEM_CANTEEN = 7, ITEM_STINK_BOMB = 8;
 
 #include "ptle/EItemBase.h"
 static inline EItemBase* GetItemObject( int index ) { return ITEM_TABLE[index].m_object; }
@@ -2309,7 +2306,6 @@ GET_METHOD( 0x542FD0, bool, EIPitMonster_Contact5, EIPitMonster*, OverlapStruct*
 
 static bool IsAnyPuppet( EInstance* beast )
 {
-	if ( !beast ) return false;
 	if ( beast->GetType() != get_etypeinfo<EIEvilHarryP>() ) return false;
 	if ( IsPuppet((EIEvilHarryP*) beast) ) return true;
 	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].beast == beast ) return true;
@@ -2392,12 +2388,6 @@ static void InstallFadeHooks()
 
 static void InstallPitHooks()
 {
-	if ( injector::ReadMemory<uint32_t>(PIT_CONTACT_SLOTS[0]) != (uint32_t) EIPitMonster_Contact4
-	  || injector::ReadMemory<uint32_t>(PIT_CONTACT_SLOTS[1]) != (uint32_t) EIPitMonster_Contact5 ) {
-		mp_log( "[MP] The pitfall's contact handlers aren't the game's : pitfalls may still eat puppets.\n" );
-		return;
-	}
-
 	injector::WriteMemory( PIT_CONTACT_SLOTS[0], PitContact4_Hook );
 	injector::WriteMemory( PIT_CONTACT_SLOTS[1], PitContact5_Hook );
 }
@@ -2553,7 +2543,7 @@ static bool MenuBlocksInput()
 	return g_menuOpen || (int) (g_menuBlockUntil - GetTickCount()) > 0;
 }
 static volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
-                     g_reqReplay = 0, g_reqStarredOnly = 0;
+					 g_reqReplay = 0, g_reqStarredOnly = 0;
 static volatile LONG g_harryTicks = 0;
 
 static bool GameHasFocus()
@@ -2814,7 +2804,7 @@ static void HandleAnimViewer( EIHarry* harry )
 	bool open    = InterlockedExchange( &g_reqViewer, 0 ) != 0;
 	bool star    = InterlockedExchange( &g_reqStar, 0 ) != 0;
 	int  by      = InterlockedExchange( &g_reqNext, 0 ) - InterlockedExchange( &g_reqPrev, 0 )
-	             + 10 * (InterlockedExchange( &g_reqNext10, 0 ) - InterlockedExchange( &g_reqPrev10, 0 ));
+				 + 10 * (InterlockedExchange( &g_reqNext10, 0 ) - InterlockedExchange( &g_reqPrev10, 0 ));
 	bool replay  = InterlockedExchange( &g_reqReplay, 0 ) != 0;
 	bool starred = InterlockedExchange( &g_reqStarredOnly, 0 ) != 0;
 
@@ -2869,7 +2859,7 @@ struct EmoteDef
 	uint32_t clip;
 	uint32_t ending[2];    // Played (one, then the other) when you move : a chain's, or getting up from a hold.
 	float hold[2];         // Harry stays between these frames of the clip (there and back, slowing at each end; the
-	                       // same : on that frame; -1 : the last) until you move. 0, 0 : no hold.
+						   // same : on that frame; -1 : the last) until you move. 0, 0 : no hold.
 	float endingFrom;      // The ending's first frame.
 };
 #include "emotes_data.h"
@@ -2970,16 +2960,8 @@ static void SaveWheels( const char* ini )
 }
 
 static const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (his own go up to 253), taking turns.
-// More of a layer (EAnimController, 0x619300 moves them on) :
-static const uint32_t LAYER_TARGET = 0x60;          // float : the weight the game set it to (or is fading it to).
 
-static const uint32_t CLIP_FRAMES = 0x14;           // int, in the clip (layer +0x78) : its frames (the last is this - 1).
-
-// Not named in AnimLayer / ERAnim yet. The frames are the ones the game's layer update
-// counts (0x619396 reads the clip's +0x14), not ERAnim::m_framesCount (+0x20).
-static inline float& LayerTarget( AnimLayer* layer ) { return FIELD(layer, float, LAYER_TARGET); }
-static inline int ClipFrames( const ERAnim* clip ) { return FIELD(clip, int, CLIP_FRAMES); }
-GET_METHOD( 0x61E4F0, void, AnimCtrl_SetTicked, EAnimController*, void*, bool );
+GET_METHOD( 0x61E4F0, void, EAnimController_SetTicked, EAnimController*, void*, bool );
 static const float EMOTE_MOVE = 0.5F;               // Harry got moved this far from where he started : over.
 static const uint32_t EMOTE_FADE_MS = 200;          // Over : blended back into the game's own animation this long.
 static const uint32_t EMOTE_SKIP_FADE_MS = 120;     // A chain's ending skipped.
@@ -3027,7 +3009,7 @@ static float ClipSecondsLeft( AnimLayer* layer )
 	float rate = layer->m_fps * layer->m_speed;
 	if ( !clip ) return 0.0F;
 	if ( rate <= 0.0F ) return 1e6F;   // Stopped : not getting to its end.
-	return ((float) (ClipFrames(clip) - 1) - layer->m_frame) / rate;
+	return ((float) (clip->m_frames - 1) - layer->m_frame) / rate;
 }
 
 // Ours, whatever the game does : starting one of Harry's idles, it fades every other
@@ -3035,8 +3017,8 @@ static float ClipSecondsLeft( AnimLayer* layer )
 static void KeepLayer( EAnimController* ctrl, AnimLayer* layer )
 {
 	layer->m_fading = 0;
-	LayerTarget( layer ) = 1.0F;
-	if ( !layer->m_ticked ) AnimCtrl_SetTicked( ctrl, layer, true );
+	layer->m_targetWeight = 1.0F;
+	if ( !layer->m_ticked ) EAnimController_SetTicked( ctrl, layer, true );
 }
 
 static void DropLayer( EIHarry* harry, int key )
@@ -3044,9 +3026,9 @@ static void DropLayer( EIHarry* harry, int key )
 	AnimLayer* layer = GetAnimLayer( harry, key );
 	if ( !layer ) return;
 	layer->m_weight = 0.0F;
-	LayerTarget( layer ) = 0.0F;
+	layer->m_targetWeight = 0.0F;
 	layer->m_fading = 0;
-	AnimCtrl_SetTicked( &harry->m_animController, layer, false );
+	EAnimController_SetTicked( &harry->m_animController, layer, false );
 }
 
 // Ours (layer key) at w (and key2 at w2); the game's own at the weights it wants (it only
@@ -3059,7 +3041,7 @@ static void SetEmoteWeights( EIHarry* harry, int key, float w, int key2 = -1, fl
 		if ( i == key ) layer->m_weight = w;
 		else if ( i == key2 ) layer->m_weight = w2;
 		else if ( i == EMOTE_LAYERS[0] || i == EMOTE_LAYERS[1] ) layer->m_weight = 0.0F;
-		else layer->m_weight = LayerTarget(layer) * (1.0F - w - w2);
+		else layer->m_weight = layer->m_targetWeight * (1.0F - w - w2);
 	}
 }
 
@@ -3210,7 +3192,7 @@ static void EmoteTick( EIHarry* harry )
 			if ( HasHold( d ) && g_emote.clip == d.clip && g_emote.ending < 0 && !g_emote.finishing ) {
 				// Its hold : from its first frame on, it stays (between the two frames, again and again).
 				ERAnim* clip = mine->m_anim;
-				float last = clip ? (float) (ClipFrames(clip) - 1) : 0.0F;
+				float last = clip ? (float) (clip->m_frames - 1) : 0.0F;
 				float a = d.hold[0] < 0.0F ? last : d.hold[0], b = d.hold[1] < 0.0F ? last : d.hold[1];
 				if ( frame >= a ) {
 					if ( !g_emote.holding ) { g_emote.holding = true; g_emote.holdSince = now; mp_log( "[EM] %s : held (frame %.0f).\n", d.name, frame ); }
@@ -4432,31 +4414,6 @@ static void PollKeyboard_Hook()
 		RoleSwapKeys( (uint8_t*) KEYS_NOW );
 	}
 	if ( ((uint8_t*) KEYS_NOW)[0xCD] & 0x80 ) InterlockedIncrement( &g_testArrowFrames );
-}
-
-// Background autotest : the game window shows up without being activated or brought
-// forward. Its startup SetFocus and SetForegroundWindow calls drop their argument,
-// SetWindowPos gets SWP_NOACTIVATE and ShowWindow SW_SHOWNOACTIVATE (same for the
-// SetFocus + ShowWindow pair at 0x698383). Its SetWindowPos( HWND_TOPMOST ) call
-// (0x60D68F) puts it at the bottom of the window stack instead.
-static BOOL __stdcall SetWindowPos_Bottom( HWND wnd, HWND, int x, int y, int cx, int cy, UINT flags )
-{
-	return SetWindowPos( wnd, HWND_BOTTOM, x, y, cx, cy, flags | SWP_NOACTIVATE );
-}
-
-static void PatchWindowNoActivate()
-{
-	static const uint8_t POP_ARG[6] = { 0x83, 0xC4, 0x04, 0x90, 0x90, 0x90 };   // add esp, 4
-
-	injector::MakeCALL( 0x60D68F, &SetWindowPos_Bottom );
-	injector::MakeNOP( 0x60D694, 1 );
-	injector::WriteMemoryRaw( 0x60D660, POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
-	injector::WriteMemoryRaw( 0x60D66D, POP_ARG, sizeof(POP_ARG), true );   // SetForegroundWindow.
-	injector::WriteMemory<uint8_t>( 0x60D674, SWP_NOACTIVATE );
-	injector::WriteMemory<uint8_t>( 0x60D6AA, SW_SHOWNOACTIVATE );
-	injector::WriteMemory<uint8_t>( 0x60D180, SW_SHOWNOACTIVATE );
-	injector::WriteMemoryRaw( 0x698383, POP_ARG, sizeof(POP_ARG), true );   // SetFocus.
-	injector::WriteMemory<uint8_t>( 0x69838A, SW_SHOWNOACTIVATE );
 }
 
 
@@ -6446,7 +6403,7 @@ static void AutotestStep( EIHarry* harry )
 			InterlockedExchange( &g_tapKey, STEPS[step - 1].key );   // ...while the arrow is tapped.
 		}
 		else if ( t >= 1300 && t < 1400 && !snapped && step >= 2 && STEPS[step - 1].expect < 0 && STEPS[step - 2].expect >= 0
-		          && STEPS[step - 1].upItem == KEEP ) {
+				  && STEPS[step - 1].upItem == KEEP ) {
 			// Harry has put it away; Evil Harry, a second behind, still holds it.
 			char name[48];
 			sprintf_s( name, "09_item_%02d_%s_lag", step - 1, STEPS[step - 1].name );
@@ -6613,13 +6570,6 @@ static void AutotestStep( EIHarry* harry )
 }
 
 
-// The game's ticks don't always keep EDI, which compiled code expects to survive a call.
-// MAKE_THISCALL_WRAPPER pops its return address into EDI : with CheatLab installed, its
-// EIPlayer tick hook (0x4B2DE1, inside Harry's tick) leaves 0x4B2DE6 there when Harry's
-// tick returns. So "self" is kept in memory across the game's tick and read back after it.
-static EIHarry* volatile g_harryTickSelf = 0;
-static EIEvilHarryP* volatile g_evilTickSelf = 0;
-
 #pragma optimize( "", off )
 static int CrashTestRecurse( int depth )
 {
@@ -6684,9 +6634,7 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 {
 	if ( g_crashTest && g_harryTicks == 300 ) RunCrashTest();
 
-	g_harryTickSelf = self;
 	EIHarry_Tick( self );
-	self = g_harryTickSelf;
 
 	g_harryTickAt = GetTickCount();
 	if ( InterlockedIncrement(&g_harryTicks) == 1 ) {
@@ -6888,9 +6836,7 @@ static void __stdcall _EIEvilHarryP_Tick_Hook( EIEvilHarryP* self )
 
 	PrePositionPuppet( self );
 
-	g_evilTickSelf = self;
-	EIBeast_Tick( self );   // Animations, state machine.
-	self = g_evilTickSelf;  // See g_harryTickSelf.
+	EIBeast_Tick( self );
 
 	if ( g_autoLocomotion ) ApplyLocomotionAnim( self );
 
@@ -7856,15 +7802,6 @@ public:
 
 		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
 
-		// Several games at once (PTLE_MP_INSTANCE, multiplayer tests on one computer) : the
-		// game's "already running" check (GetLastError() == ERROR_ALREADY_EXISTS after its
-		// CreateMutexA) always says no.
-		char instance[32];
-		if ( GetEnvironmentVariableA( "PTLE_MP_INSTANCE", instance, sizeof(instance) ) ) {
-			injector::WriteMemory<uint8_t>( 0x60D46A, 0xEB );   // jne -> jmp.
-			mp_log( "[MP] Instance \"%s\" : more than one copy of the game allowed.\n", instance );
-		}
-
 		g_netLog = mp_log;
 		NetConfig config;
 		ReadNetConfig( &config );
@@ -7915,7 +7852,6 @@ public:
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
 			g_autotest = true;
 			g_background = !(GetEnvironmentVariableA( "PTLE_MP_FOREGROUND", env, sizeof(env) ) && env[0] == '1');
-			if ( g_background ) PatchWindowNoActivate();
 			g_puppetOffset.x = 6.0F;   // Stand beside Harry, so screenshots show whether it follows.
 			g_showList = true;         // Screenshots show the player list.
 			EnableAutoSkipCutscenes();
