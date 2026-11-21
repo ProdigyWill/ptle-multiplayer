@@ -27,7 +27,7 @@ extern "C" { extern Gizmod* gizmodInstance; }
 
 Gizmod::Gizmod()
 {
-	for ( int i = 0; i < 8; i++ ) {
+	for ( int i = 0; i < 9; i++ ) {
 		m_inventoryItems[i].m_itemType = (InventoryItem::Item) i;
 		m_inventoryItems[i].m_itemStruct = reinterpret_cast<ItemStruct*>(0x8EEB90) + i;
 	}
@@ -58,26 +58,4 @@ void Gizmod::showConsole()
 	char env[4] = { 0, };
 	if ( GetEnvironmentVariableA( "GIZMOD_NO_CONSOLE", env, sizeof(env) ) && env[0] == '1' ) return;
 	AllocConsole();
-}
-
-
-EIHarry* Gizmod::getHarry()
-{
-	return *((EIHarry**) 0x917034);
-}
-
-ERLevel* Gizmod::getLevel()
-{
-	ERLevel** levelPtr = *((ERLevel***) 0x91702C);
-	return levelPtr ? (*levelPtr) : 0;
-}
-
-EUIHud* Gizmod::getHUD()
-{
-	return *((EUIHud**) (0x917028 + 0x8C));
-}
-
-uint32_t Gizmod::getCurrentLevelCRC()
-{
-	return *((uint32_t*) 0x917088);
 }
