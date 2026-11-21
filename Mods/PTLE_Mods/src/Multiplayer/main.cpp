@@ -73,6 +73,10 @@
 #include "menu.h"
 #include "ptle/levels/level_info.h"
 
+#include "matrixutil.h"
+#include "util/MemoryWriter.h"
+#include "util/MemoryReader.h"
+
 
 #define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
 
@@ -281,57 +285,6 @@ static void LogModLoader()
 
 
 
-// Row-vector matrices (translation in row 3) : world = local * parent.
-static void MatMul( const Matrix4f& a, const Matrix4f& b, Matrix4f* out )
-{
-	Matrix4f r;
-	for ( int i = 0; i < 4; i++ )
-		for ( int j = 0; j < 4; j++ )
-			r.data[i][j] = a.data[i][0] * b.data[0][j] + a.data[i][1] * b.data[1][j]
-						 + a.data[i][2] * b.data[2][j] + a.data[i][3] * b.data[3][j];
-	*out = r;
-}
-
-// Inverse of an affine matrix (3x3 part may be scaled; last column 0,0,0,1).
-static bool MatInverseAffine( const Matrix4f& m, Matrix4f* out )
-{
-	const float (*a)[4] = m.data;
-	float c00 = a[1][1] * a[2][2] - a[1][2] * a[2][1];
-	float c01 = a[1][2] * a[2][0] - a[1][0] * a[2][2];
-	float c02 = a[1][0] * a[2][1] - a[1][1] * a[2][0];
-	float det = a[0][0] * c00 + a[0][1] * c01 + a[0][2] * c02;
-	if ( fabsf( det ) < 1e-8F ) return false;
-	float k = 1.0F / det;
-	Matrix4f r;
-	r.data[0][0] = c00 * k;
-	r.data[0][1] = (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * k;
-	r.data[0][2] = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * k;
-	r.data[1][0] = c01 * k;
-	r.data[1][1] = (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * k;
-	r.data[1][2] = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * k;
-	r.data[2][0] = c02 * k;
-	r.data[2][1] = (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * k;
-	r.data[2][2] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * k;
-	for ( int j = 0; j < 3; j++ ) {
-		r.data[3][j] = -(a[3][0] * r.data[0][j] + a[3][1] * r.data[1][j] + a[3][2] * r.data[2][j]);
-		r.data[j][3] = 0.0F;
-	}
-	r.data[3][3] = 1.0F;
-	*out = r;
-	return true;
-}
-
-// out[i] = m[i] * b (b : a parent to place on, or an inverse to make relative).
-static void MatsMul( const Matrix4f* m, int count, const Matrix4f& b, Matrix4f* out )
-{
-	for ( int i = 0; i < count; i++ ) MatMul( m[i], b, &out[i] );
-}
-
-static inline void CopyMatrix( Matrix4f& to, const Matrix4f& from )
-{
-	memcpy( &to, &from, sizeof(Matrix4f) );
-}
-
 static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the autotest section).
 
 // Animation survey (PTLE_MP_ANIMSURVEY=1) : every clip loaded on Harry and on Evil
@@ -485,7 +438,6 @@ struct PlayerInfo
 	char version[16];    // Their mod's (MP_VERSION); empty : a build from before versions.
 	uint8_t role;        // Hide and seek : ROLE_SEEKER, ROLE_HIDER.
 	uint32_t hideMs;     // Their total hide time.
-	bool playsHs;        // Their build has hide and seek (sends a role).
 	bool paused;         // Their game is paused (the Esc menu, F1) : their puppet stays, still.
 };
 
@@ -530,9 +482,12 @@ static const int MAX_VERSION = 15;
 static char g_myVersion[MAX_VERSION + 1] = MP_VERSION;   // Sent to the others (tests : PTLE_MP_FAKEVERSION, another one).
 static PlayerInfo g_players[MAX_PEERS];
 static char g_myName[MAX_NAME + 1] = "Harry";
+static int g_myNameLen = 5;
 static char g_roomName[64] = "";
 static uint32_t g_lastInfoSent = 0;
 static uint32_t g_lastNetUpdate = 0;
+
+static_assert( sizeof(MP_VERSION) - 1 <= MAX_VERSION, "version too long" );
 
 // Messages shown for a few seconds ("Bob joined").
 static const int MAX_TOASTS = 4;
@@ -623,7 +578,7 @@ static void FormatHideTime( uint32_t ms, char* out, size_t size )
 	else sprintf_s( out, size, "%u:%02u", s / 60, s % 60 );
 }
 
-static void CleanName( const char* in, int length, char* out )
+static int CleanName( const char* in, int length, char* out )
 {
 	int n = 0;
 	for ( int i = 0; i < length && n < MAX_NAME; i++ ) {
@@ -632,6 +587,7 @@ static void CleanName( const char* in, int length, char* out )
 	}
 	while ( n > 0 && out[n - 1] == ' ' ) n--;
 	out[n] = 0;
+	return n;
 }
 
 static const char* PlayerName( int id )
@@ -823,100 +779,128 @@ static void NetUpdate()
 	g_transport->Update();
 	int me = g_transport->PlayerId();
 	bool echo = g_transport->Echoes();
-	while ( (length = g_transport->Receive( packet, sizeof(packet) )) > 0 ) {
+	while ( (length = g_transport->Receive(packet, sizeof(packet))) > 0 ) {
+		MemoryReader r( packet, sizeof(packet) );
 		PacketHeader h;
-		if ( !DecodeHeader( packet, length, &h ) ) { g_netStats.badPackets++; continue; }
+		if ( !DecodeHeader(packet, length, &h) ) { g_netStats.badPackets++; continue; }
+		r.seek( PACKET_HEADER_SIZE );
 		if ( h.player >= MAX_PEERS ) { g_netStats.badPackets++; continue; }
 		Peer* peer = &g_peers[h.player];
-		if ( h.type == PACKET_LEAVE ) {
+		switch ( h.type )
+		{
+		case PACKET_LEAVE:
 			if ( peer->heard || g_players[h.player].present ) {
 				mp_log( "[NET] Player %d left.\n", h.player );
-				if ( g_players[h.player].present ) Toast( "%s left", PlayerName( h.player ) );
+				if ( g_players[h.player].present ) Toast( "%s left", PlayerName(h.player) );
 				ResetPeer( peer, h.player );   // Their puppet stays hidden (no target).
 			}
 			g_players[h.player].present = false;
 			g_players[h.player].name[0] = 0;
-			continue;
-		}
-		if ( h.type == PACKET_CAUGHT ) {
-			if ( h.player == me && !echo ) continue;
-			if ( length < PACKET_HEADER_SIZE + 1 || packet[PACKET_HEADER_SIZE] >= MAX_PEERS ) { g_netStats.badPackets++; continue; }
-			if ( g_lastCatchHeard[h.player] == h.sequence ) continue;   // A resend.
+			break;
+
+		case PACKET_CAUGHT: {
+			if ( h.player == me && !echo ) break;
+			if ( length < PACKET_HEADER_SIZE + 1 || packet[PACKET_HEADER_SIZE] >= MAX_PEERS ) { g_netStats.badPackets++; break; }
+			if ( g_lastCatchHeard[h.player] == h.sequence ) break;   // A resend.
 			g_lastCatchHeard[h.player] = h.sequence;
 			int seeker = packet[PACKET_HEADER_SIZE];
 			g_players[h.player].role = ROLE_SEEKER;   // (Their next info says so too.)
 			g_testCaughtBy = seeker; g_testCaughtHider = h.player;
-			mp_log( "[HS] Player %d (\"%s\") was caught by player %d (\"%s\").\n", h.player, PlayerName( h.player ), seeker, PlayerName( seeker ) );
+			mp_log( "[HS] Player %d (\"%s\") was caught by player %d (\"%s\").\n", h.player, PlayerName(h.player), seeker, PlayerName(seeker) );
 			if ( h.player == me ) {}   // (Our own, echoed : we said so when it happened.)
-			else if ( seeker == me ) Toast( "You caught %s!", PlayerName( h.player ) );
+			else if ( seeker == me ) Toast( "You caught %s!", PlayerName(h.player) );
 			else {
 				char hider[MAX_NAME + 1];
-				strcpy_s( hider, PlayerName( h.player ) );
-				Toast( "%s caught %s", PlayerName( seeker ), hider );
+				strcpy_s( hider, PlayerName(h.player) );
+				Toast( "%s caught %s", PlayerName(seeker), hider );
 			}
-			continue;
-		}
-		if ( h.type == PACKET_INFO ) {
-			if ( h.player == me && !echo ) continue;
-			if ( length < PACKET_HEADER_SIZE + 5 ) { g_netStats.badPackets++; continue; }
-			const uint8_t* q = packet + PACKET_HEADER_SIZE;
-			int nameLength = q[4];
-			if ( PACKET_HEADER_SIZE + 5 + nameLength > length ) { g_netStats.badPackets++; continue; }
+			}
+			break;
+
+		case PACKET_INFO: {
+			if ( h.player == me && !echo ) break;
+			if ( length < PACKET_HEADER_SIZE + 5 ) { g_netStats.badPackets++; break; }
+
 			PlayerInfo& info = g_players[h.player];
+
+			// Level.
+			r.read<uint32_t>( info.level );
+
+			// Player name.
+			int nameLength; r.read<uint8_t>(nameLength);
+			if ( PACKET_HEADER_SIZE + 5 + nameLength > length ) { g_netStats.badPackets++; break; }
 			char name[MAX_NAME + 1];
-			CleanName( (const char*) q + 5, nameLength, name );
-			if ( !name[0] ) sprintf_s( name, "Player %d", h.player + 1 );
-			memcpy( &info.level, q, 4 );
-			info.lastInfo = now;
-			int extra = PACKET_HEADER_SIZE + 5 + nameLength;   // After the name : the outfit (not sent by older builds).
-			info.outfit = (extra < length && packet[extra] < NUM_OUTFITS) ? packet[extra] : 0;
-			if ( extra + 1 + (int) sizeof(info.colors) <= length ) memcpy( info.colors, packet + extra + 1, sizeof(info.colors) );
-			else memcpy( info.colors, RETRO_DEFAULT, sizeof(info.colors) );
-			int at = extra + 1 + (int) sizeof(info.colors);   // Then the version : u8 length, text (not sent before versions).
+			CleanName( (const char*) r.getDataPtr(), nameLength, name );
+			r.seek( nameLength );
+
+			// Outfit & retro colors.
+			r.read<uint8_t>( info.outfit );
+			if ( info.outfit >= NUM_OUTFITS ) info.outfit = 0;
+			r.read( info.colors, sizeof(info.colors) );
+
+			// Version string.
 			char version[MAX_VERSION + 1] = "";
-			if ( at < length && packet[at] <= MAX_VERSION && at + 1 + packet[at] <= length ) CleanName( (const char*) packet + at + 1, packet[at], version );
+			int versionLength; r.read<uint8_t>( versionLength );
+			CleanName( (const char*) r.getDataPtr(), versionLength, version );
+			r.seek( versionLength );
+
 			bool versionNews = !info.present || strcmp( info.version, version ) != 0;
 			strcpy_s( info.version, version );
-			at += at < length ? 1 + packet[at] : 0;   // Then hide and seek : u8 role, u32 hide time (ms).
-			info.playsHs = at + 5 <= length;
-			info.role = info.playsHs && packet[at] <= ROLE_NONE ? packet[at] : ROLE_NONE;
+
+			// Gamemode role.
+			r.read<uint8_t>( info.role );
+			if ( info.role >= ROLE_NONE ) info.role = ROLE_NONE;
+
+			// Hide & seek hide duration.
 			info.hideMs = 0;
-			if ( info.playsHs ) memcpy( &info.hideMs, packet + at + 1, 4 );
-			info.paused = at + 6 <= length && (packet[at + 5] & INFO_PAUSED);   // Then : u8 flags (not sent before 0.3.0).
-			if ( !info.present || strcmp( info.name, name ) != 0 ) {
-				mp_log( "[NET] Player %d is \"%s\", in %s.\n", h.player, name, LevelName( info.level ) );
+			if ( info.role == ROLE_HIDER || info.role == ROLE_SEEKER ) {
+				r.read<uint32_t>( info.hideMs );
+			}
+
+			// Flags (paused, ...).
+			uint8_t flags; r.read<uint8_t>( flags );
+			info.paused = (flags & INFO_PAUSED);
+
+			info.lastInfo = now;
+
+			// Update presence.
+			if ( !info.present || strcmp(info.name, name) != 0 ) {
+				mp_log( "[NET] Player %d is \"%s\", in %s.\n", h.player, name, LevelName(info.level) );
 				if ( !info.present && h.player != me ) Toast( "%s joined", name );
 				strcpy_s( info.name, name );
 				info.present = true;
 			}
 			if ( versionNews ) {
 				mp_log( "[NET] Player %d has version %s.\n", h.player, version[0] ? version : "(older, none sent)" );
-				if ( h.player != me && strcmp( version, MP_VERSION ) != 0 )
+				if ( h.player != me && strcmp(version, MP_VERSION) != 0 )
 					Toast( "%s has %s%s (you : %s)", name, version[0] ? "version " : "an older version", version, MP_VERSION );
 			}
-			continue;
-		}
-		if ( h.type != PACKET_SNAPSHOT ) continue;
-		if ( h.player == me && !echo ) continue;   // Ourselves.
-		if ( !DecodeSnapshot( packet, length, &incoming ) ) { g_netStats.badPackets++; continue; }
-		if ( !peer->heard ) {
-			peer->heard = true;
-			mp_log( "[NET] Showing player %d.\n", h.player );
-			if ( g_mainId < 0 ) {
-				// A puppet spawned before anyone was heard from (F5, the autotest) is
-				// peer 0's : it now shows this player.
-				Peer* first = &g_peers[0];
-				if ( h.player != 0 && first->beast && !first->heard && !peer->beast && !peer->limbo ) MovePuppet( first, peer );
-				g_mainId = h.player;
-				g_cur = MainPeer();
 			}
-		}
-		peer->remote.Add( incoming, h.sequence );
-		peer->lastHeard = now;
-		peer->lastLevel = incoming.level;
-		if ( peer->keptPaused ) {
-			peer->keptPaused = false;
-			mp_log( "[NET] Player %d goes on.\n", h.player );
+			break;
+
+		case PACKET_SNAPSHOT:
+			if ( h.player == me && !echo ) break;   // Ourselves.
+			if ( !DecodeSnapshot(packet, length, &incoming) ) { g_netStats.badPackets++; break; }
+			if ( !peer->heard ) {
+				peer->heard = true;
+				mp_log( "[NET] Showing player %d.\n", h.player );
+				if ( g_mainId < 0 ) {
+					// A puppet spawned before anyone was heard from (F5, the autotest) is
+					// peer 0's : it now shows this player.
+					Peer* first = &g_peers[0];
+					if ( h.player != 0 && first->beast && !first->heard && !peer->beast && !peer->limbo ) MovePuppet( first, peer );
+					g_mainId = h.player;
+					g_cur = MainPeer();
+				}
+			}
+			peer->remote.Add( incoming, h.sequence );
+			peer->lastHeard = now;
+			peer->lastLevel = incoming.level;
+			if ( peer->keptPaused ) {
+				peer->keptPaused = false;
+				mp_log( "[NET] Player %d goes on.\n", h.player );
+			}
+			break;
 		}
 	}
 	uint32_t level = ShownLevel();
@@ -940,26 +924,32 @@ static void NetUpdate()
 	if ( me >= 0 && now - g_lastInfoSent >= INFO_INTERVAL_MS ) {   // Who we are, where.
 		g_lastInfoSent = now;
 		uint8_t info[PACKET_HEADER_SIZE + 5 + MAX_NAME + 1 + sizeof(g_myColors) + 1 + MAX_VERSION + 6];
-		EncodeHeader( PACKET_INFO, (uint8_t) me, 0, info );
-		uint32_t where = g_haveLocal ? level : 0;
-		memcpy( info + PACKET_HEADER_SIZE, &where, 4 );
-		int n = (int) strlen( g_myName );
-		info[PACKET_HEADER_SIZE + 4] = (uint8_t) n;
-		memcpy( info + PACKET_HEADER_SIZE + 5, g_myName, n );
-		info[PACKET_HEADER_SIZE + 5 + n] = (uint8_t) g_myWornOutfit;
-		memcpy( info + PACKET_HEADER_SIZE + 5 + n + 1, g_myColors, sizeof(g_myColors) );
-		int at = PACKET_HEADER_SIZE + 5 + n + 1 + sizeof(g_myColors);
-		static_assert( sizeof(MP_VERSION) - 1 <= MAX_VERSION, "version too long" );
-		int v = (int) strlen( g_myVersion );
-		info[at] = (uint8_t) v;
-		memcpy( info + at + 1, g_myVersion, v );
-		at += 1 + v;
+		MemoryWriter w(info, sizeof(info));
+
+		const uint32_t where = g_haveLocal ? level : 0;
+
+		EncodeHeader( PACKET_INFO, (uint8_t) me, 0, info ); w.seek(PACKET_HEADER_SIZE);
+		w.write<uint32_t>( where );
+		w.write<uint8_t>( g_myNameLen );
+		w.write( g_myName, g_myNameLen );
+		w.write<uint8_t>( g_myWornOutfit );
+		w.write( g_myColors, sizeof(g_myColors) );
+
+		const int v = (int) strlen( g_myVersion );
+		w.write<uint8_t>( v );
+		w.write( g_myVersion, v );
+
 		LoadHideTime();
-		info[at] = (uint8_t) (PlayingHs() ? g_myRole : ROLE_NONE);
-		memcpy( info + at + 1, &g_myHideMs, 4 );
+
+		w.write<uint8_t>( PlayingHs() ? g_myRole : ROLE_NONE );
+		if ( PlayingHs() ) {
+			w.write<uint32_t>( g_myHideMs );
+		}
+
 		const bool paused = g_haveLocal && where && !g_levelLeaving && GetTickCount() - g_harryTickAt > PAUSED_AFTER_MS;
-		info[at + 5] = paused ? INFO_PAUSED : 0;
-		g_transport->Send( info, at + 6 );
+		w.write<uint8_t>( paused ? INFO_PAUSED : 0 );
+
+		g_transport->Send( info, w.getPtr() );
 	}
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer* peer = &g_peers[i];
@@ -5629,7 +5619,7 @@ static void AutotestStep( EIHarry* harry )
 			uint32_t gained = g_myHideMs - startMs;
 			mp_log( "[AT] HS : 5 s as a hider : %u ms more.\n", gained );
 			Local::Check( "a hider's time goes on", gained >= 4000 && gained <= 6000 );
-			bool heard = me >= 0 && g_players[me].present && g_players[me].playsHs && g_players[me].role == ROLE_HIDER && g_myHideMs - g_players[me].hideMs < 2500;
+			bool heard = me >= 0 && g_players[me].present && g_players[me].role == ROLE_HIDER && g_myHideMs - g_players[me].hideMs < 2500;
 			mp_log( "[AT] HS : the room hears : role %d, %u ms (me %d).\n", me >= 0 ? g_players[me].role : -1, me >= 0 ? g_players[me].hideMs : 0, me );
 			Local::Check( "the room hears our role and time", heard );
 			RequestSnapshot( "hs_1_hider" );
@@ -6609,7 +6599,7 @@ static void CheckCaught( EIHarry* harry )
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const PlayerInfo& info = g_players[i];
 		const Peer& p = g_peers[i];
-		if ( i == me || !info.present || !info.playsHs || info.role != ROLE_SEEKER || !p.beast || !p.target ) continue;
+		if ( i == me || !info.present || info.role != ROLE_SEEKER || !p.beast || !p.target ) continue;
 
 		const Vector3f& s = p.beast->EIBeast::m_position;
 		const float dx = s.x - harry->m_position.x, dy = s.y - harry->m_position.y, dz = s.z - harry->m_position.z;
@@ -7108,7 +7098,7 @@ static const int MAX_LIST_ROWS = MAX_PEERS + 3;
 static bool HiddenFromMe( int id )
 {
 	int me = g_transport ? g_transport->PlayerId() : -1;
-	return id != me && g_players[id].playsHs && g_players[id].role == ROLE_HIDER;
+	return id != me && g_players[id].role == ROLE_HIDER;
 }
 
 static int BuildPlayerRows( char left[][96], char right[][64], uint32_t* colors, const char* lastRight )
@@ -7353,15 +7343,15 @@ static void DrawMenu( float sw, float sh, float h )
 		for ( int i = 0; i < MAX_PEERS; i++ ) {
 			bool mine = i == me;
 			const PlayerInfo& info = g_players[i];
-			if ( mine ? !on : (!info.present || !info.playsHs || info.role == ROLE_NONE) ) continue;
+			if ( mine ? !on : (!info.present || info.role == ROLE_NONE) ) continue;
 			int r = mine ? g_myRole : info.role;
 			char name[48], where[64];
 			FormatHideTime( mine ? g_myHideMs : info.hideMs, hidden, sizeof(hidden) );
 			sprintf_s( name, "%s%s", mine ? g_myName : info.name, mine ? " (you)" : "" );
 			uint32_t level = mine ? (g_haveLocal ? here : 0) : info.level;
-			if ( HiddenFromMe( i ) ) strcpy_s( where, "hiding" );
+			if ( HiddenFromMe(i) ) strcpy_s( where, "hiding" );
 			else if ( !mine && level && level == here ) strcpy_s( where, "here" );
-			else strcpy_s( where, LevelName( level ) );
+			else strcpy_s( where, LevelName(level) );
 			const char* cells[4] = { name, r == ROLE_HIDER ? "Hider" : "Seeker", hidden, where };
 			g_menu.TableRow( cells, 4, mine ? Menu::GREEN : (r == ROLE_HIDER ? Menu::GOLD : Menu::WHITE) );
 			listed++;
@@ -7807,8 +7797,11 @@ public:
 		ReadNetConfig( &config );
 		ApplyMyOutfit();   // Before the first level loads.
 		ResetHistory();
-		CleanName( config.name, (int) strlen( config.name ), g_myName );
-		if ( !g_myName[0] ) strcpy_s( g_myName, "Harry" );
+		g_myNameLen = CleanName( config.name, (int) strlen(config.name), g_myName );
+		if ( !g_myName[0] ) {
+			strcpy_s( g_myName, "Harry" );
+			g_myNameLen = 5;
+		}
 		strncpy_s( g_roomName, config.room, _TRUNCATE );
 		if ( !HookGameExitProcess() ) mp_log( "[NET] Couldn't hook the game's exit : the others drop us after a timeout.\n" );
 		if ( config.delayMs > 0 ) {   // The nearest choice.
