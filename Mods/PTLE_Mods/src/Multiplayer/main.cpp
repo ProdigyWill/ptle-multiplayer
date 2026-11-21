@@ -29,6 +29,15 @@
 //        down only). F8 again : he follows.
 // --------------------------------------------------------------------------------
 
+/*
+David note :
+
+There are several "TODO" comments in this file and other files indicating changes to be
+made in the future and features to be made core.
+Do NOT remove them, I use these to Ctrl+F locations that require my attention.
+*/
+
+
 #include <time.h>
 #include <intrin.h>
 #include <Windows.h>
@@ -73,9 +82,16 @@
 #include "menu.h"
 #include "ptle/levels/level_info.h"
 
-#include "matrixutil.h"
+#include "util/MatrixUtils.h"
 #include "util/MemoryWriter.h"
 #include "util/MemoryReader.h"
+
+
+#ifdef _DEBUG
+#	define PTLE_MP_EMBEDTESTS
+#else
+#	define g_autotest
+#endif
 
 
 #define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
@@ -285,6 +301,7 @@ static void LogModLoader()
 
 
 
+#ifdef PTLE_MP_EMBEDTESTS
 static bool g_autotest = false;                // PTLE_MP_AUTOTEST=1 (see the autotest section).
 
 // Animation survey (PTLE_MP_ANIMSURVEY=1) : every clip loaded on Harry and on Evil
@@ -294,6 +311,8 @@ static bool g_animSurvey = false;
 static int g_crashTest = 0;                       // PTLE_MP_CRASHTEST=av|div|stack : the autotest crashes the game (the crash logger's test).
 static int g_pitTest = 0;                        // PTLE_MP_PITTEST=1 : Harry walks into Crash Site's pitfall, the puppet right behind him; 2 : the puppet (ahead of him) goes in alone, as another player's does.
 static int g_iceTest = 0;                         // PTLE_MP_ICETEST=1 : the autotest puts the puppet in "thrown from water"; 2 : walks Harry (and the puppet) into Spinja Lair's cold water. PTLE_MP_ICEALLOW=1 : let it freeze, as before the fix.
+#endif
+
 static bool g_allowPuppetFreeze = false;
 static volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
 static bool g_deathTest = false;                 // PTLE_MP_DEATHTEST=1 : the autotest kills Harry beside his puppet.
@@ -350,17 +369,14 @@ struct Peer
 	RemotePlayer remote;
 	const PlayerSnapshot* target;      // What their puppet shows this tick (see NetUpdate).
 
-	// Their puppet, and where it was spawned : a puppet whose level is gone was
-	// freed with it.
+	// Their puppet.
+	// 
 	EIEvilHarryP* beast;
-	int shownOutfit;                   // The outfit its model is (-1 : whatever the game gave it).
-	EIEvilHarryP* limbo;               // Set aside when the game announced a level load (see SuspectPuppets).
-	uint32_t limboSince;
-	int limboTicks;
-	void* world;
-	uint32_t level;
-	uint32_t lastSpawnTry;
-	int forcedState;
+	int           shownOutfit;         // The outfit its model is (-1 : whatever the game gave it).
+	uint32_t      limboSince;
+	int           limboTicks;          // Negative if not in limbo.
+	uint32_t      lastSpawnTry;
+	int           forcedState;
 
 	// Locomotion (see UpdateLocomotion).
 	int idleState, runLayer, idleLayer, sprintLayer, airLayer;
@@ -386,6 +402,8 @@ struct Peer
 	uint32_t tagFrame;                 // g_presentCount then.
 };
 static Peer g_peers[MAX_PEERS];
+
+static inline bool PeerInLimbo( const Peer* p ) { return p->limboTicks >= 0; }
 
 // Who is in the room (from their PACKET_INFO), kept across levels. Presence goes by
 // those packets (sent even while a player's game is loading or paused), not by
@@ -504,13 +522,21 @@ static void Toast( const char* fmt, ... )
 	g_toasts[0].time = NetNowMs();
 }
 
+
+
 // Names : printable ASCII only (the font has nothing else), never empty.
 // The hide time's file : %LOCALAPPDATA%\PTLE Multiplayer\hide-time.txt, the total in
 // milliseconds (the autotests keep theirs in hide-time-autotest.txt).
 static void HideTimePath( char* path )   // MAX_PATH.
 {
 	path[0] = 0;
-	if ( GetDataDir( path ) ) strcat_s( path, MAX_PATH, g_autotest ? "\\hide-time-autotest.txt" : "\\hide-time.txt" );
+	if ( GetDataDir(path) )
+		strcat_s( path, MAX_PATH,
+#ifdef PTLE_MP_EMBEDTESTS
+			g_autotest ? "\\hide-time-autotest.txt" : "\\hide-time.txt" );
+#else
+			"\\hide-time.txt" );
+#endif
 }
 
 static bool g_hideTimeLoaded = false;
@@ -640,7 +666,9 @@ static bool IsViewerPeer( const Peer* p ) { return ((g_animViewer || g_emotePrev
 // The clip the current peer's puppet is made to play (survey, viewer), else 0.
 static uint32_t ForcedClip()
 {
+#ifdef PTLE_MP_EMBEDTESTS
 	if ( g_animSurvey ) return g_animSurveyClip;
+#endif
 	return IsViewerPeer( g_cur ) ? g_animSurveyClip : 0;
 }
 
@@ -730,6 +758,7 @@ static void SendLocalSnapshot()
 	if ( me < 0 ) return;   // Not in a room yet.
 	if ( g_netStats.sent && g_local.time - g_lastSentTime < SEND_INTERVAL_MS ) return;
 	g_lastSentTime = g_local.time;
+
 	uint8_t packet[MAX_PACKET];
 	int length = EncodeSnapshot( g_local, (uint8_t) me, ++g_sendSequence, packet, sizeof(packet) );
 	if ( !length ) {
@@ -741,12 +770,14 @@ static void SendLocalSnapshot()
 	g_netStats.sentBytes += length;
 	if ( (uint32_t) length > g_netStats.maxBytes ) g_netStats.maxBytes = length;
 
+#ifdef PTLE_MP_EMBEDTESTS
 	if ( g_autotest ) {   // How much the packing loses.
 		for ( int i = 0; i < g_local.bones; i++ ) CheckPacking( "bone", i, g_local.pose[i] );
 		CheckPacking( "right hand", 0, g_local.handR );
 		CheckPacking( "left hand", 0, g_local.handL );
 		for ( int i = 0; i < g_local.itemBones; i++ ) CheckPacking( "item bone", i, g_local.itemPose[i], true );
 	}
+#endif
 }
 
 static void LogNetStats()
@@ -888,7 +919,7 @@ static void NetUpdate()
 					// A puppet spawned before anyone was heard from (F5, the autotest) is
 					// peer 0's : it now shows this player.
 					Peer* first = &g_peers[0];
-					if ( h.player != 0 && first->beast && !first->heard && !peer->beast && !peer->limbo ) MovePuppet( first, peer );
+					if ( h.player != 0 && first->beast && !first->heard && !peer->beast && !peer->limboTicks < 0 ) MovePuppet( first, peer );
 					g_mainId = h.player;
 					g_cur = MainPeer();
 				}
@@ -1160,7 +1191,7 @@ static char* const GAME_EMPTY_STRING = (char*) 0x9410B0;   // The game strings' 
 static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry );
 static int g_puppetsSpawned = 0;   // For the autotest.
 
-static void RememberSpawned( EIEvilHarryP* beast, void* world, int owner );
+static void RememberSpawned( EIEvilHarryP* beast, ERLevel* world, int owner );
 
 static void SpawnPuppet( EIHarry* harry )
 {
@@ -1200,8 +1231,6 @@ static void SpawnPuppet( EIHarry* harry )
 	g_cur->beast = p;
 	g_cur->shownOutfit = -1;
 	g_puppetsSpawned++;
-	g_cur->world = harry->m_world;
-	g_cur->level = Gizmod::getCurrentLevelCRC();
 	g_cur->lastLoggedState = g_cur->lastRequested = -2;
 	RememberSpawned( p, harry->m_world, g_cur->id );
 	int count = 0;
@@ -1225,40 +1254,37 @@ static void SpawnPuppet( EIHarry* harry )
 	}
 }
 
-// Called when Harry's world or the level changes. The old level's puppets usually
-// went with it, but the level's CRC changes as soon as a load is announced, while the
-// old level still runs a moment : forgetting its puppets then left one standing still
-// in the old area, ticked by the game as its own Evil Harry (a second, frozen copy of
-// its player next to a fresh puppet; 2026-11-16, going back and forth between Turtle
-// Monument and Twin Outposts). So they are only set aside, as when a load is
-// announced : one that ticks again is kept, the others are gone after a second
-// (DropLostPuppets), and only then is a new one spawned. The pointers are only
-// compared, never followed.
-static void ForgetPuppet( EIHarry* harry )
+static ERLevel* g_currentWorld = 0;
+static uint32_t g_currentCRC = 0;
+
+// Called when Harry's world or the level changes.
+static void ForgetPuppets()
 {
 	int count = 0;
-	DWORD now = GetTickCount();
+	const DWORD now = GetTickCount();
+
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer& p = g_peers[i];
-		if ( p.beast ) p.limbo = p.beast;
-		p.beast = 0;
-		if ( p.limbo ) { p.limboSince = now; p.limboTicks = 0; count++; }
-		p.world = harry->m_world;   // So this change isn't seen again.
-		p.level = Gizmod::getCurrentLevelCRC();
+		if ( !p.beast ) continue;
+
+		p.limboSince = now;
+		p.limboTicks = 0;
+		count++;
 	}
+
 	if ( count ) mp_log( "[MP] New level, %d puppet(s) set aside (kept if they're still here).\n", count );
 	ResetHistory();
 }
 
 // Every puppet spawned in Harry's current world, to catch one nobody drives any more
 // (an orphan) : it would stand still, a frozen copy of its player.
-struct SpawnedPuppet { EIEvilHarryP* beast; void* world; int owner; bool reported; };
+struct SpawnedPuppet { EIEvilHarryP* beast; ERLevel* world; int owner; bool reported; };
 static const int MAX_SPAWNED = 32;
 static SpawnedPuppet g_spawned[MAX_SPAWNED];
 static int g_spawnedCount = 0;
 static volatile LONG g_orphansFound = 0;
 
-static void RememberSpawned( EIEvilHarryP* beast, void* world, int owner )
+static void RememberSpawned( EIEvilHarryP* beast, ERLevel* world, int owner )
 {
 	int keep = 0;   // Other worlds' are kept too : the old level runs on a moment after a loadzone.
 	for ( int i = 0; i < g_spawnedCount; i++ ) if ( g_spawned[i].beast != beast ) g_spawned[keep++] = g_spawned[i];
@@ -1266,28 +1292,6 @@ static void RememberSpawned( EIEvilHarryP* beast, void* world, int owner )
 	if ( g_spawnedCount == MAX_SPAWNED ) { memmove( g_spawned, g_spawned + 1, (MAX_SPAWNED - 1) * sizeof(SpawnedPuppet) ); g_spawnedCount--; }
 	SpawnedPuppet s = { beast, world, owner, false };
 	g_spawned[g_spawnedCount++] = s;
-}
-
-// The game announces a level load when one loads, but also when Harry dies and
-// comes back in the same level (the puppets live on), and sometimes a moment after
-// the new level's first ticks (puppets already spawned in it). Forgetting a live
-// puppet left it standing there as the game's own Evil Harry, and a second one was
-// spawned for its player. So the puppets are only set aside : one that ticks again
-// was alive after all (ReclaimPuppet), the others are gone (DropLostPuppets).
-static void SuspectPuppets()
-{
-	int count = 0;
-	for ( int i = 0; i < MAX_PEERS; i++ ) {
-		Peer& p = g_peers[i];
-		if ( !p.beast ) continue;
-		p.limbo = p.beast;
-		p.beast = 0;
-		p.limboSince = GetTickCount();
-		p.limboTicks = 0;
-		count++;
-	}
-	if ( count ) mp_log( "[MP] Level load announced : %d puppet(s) set aside.\n", count );
-	ResetHistory();
 }
 
 // Between a load's announcement and the new level's arrival the old level still
@@ -1311,13 +1315,13 @@ static void NoteLevelLeaving( uint32_t newLevel )
 
 static void* g_prevWorld = 0;   // Harry's world before this one.
 
-static void CheckLevelLeaving( EIHarry* harry )   // Each Harry tick.
+static void CheckLevelLeaving( ERLevel* myWorld )   // Each Harry tick.
 {
-	static void* world = 0;
-	if ( harry->m_world != world ) { g_prevWorld = world; world = harry->m_world; }
-	if ( !g_levelLeaving || harry->m_world != g_levelLeavingWorld ) g_tickLevel = Gizmod::getCurrentLevelCRC();
+	static ERLevel* world = 0;
+	if ( myWorld != world ) { g_prevWorld = world; world = myWorld; }
+	if ( !g_levelLeaving || myWorld != g_levelLeavingWorld ) g_tickLevel = Gizmod::getCurrentLevelCRC();
 	if ( !g_levelLeaving ) return;
-	bool arrived = harry->m_world != g_levelLeavingWorld;
+	bool arrived = myWorld != g_levelLeavingWorld;
 	if ( !arrived && GetTickCount() - g_levelLeavingSince < LEVEL_LEAVING_MAX_MS ) return;
 	g_levelLeaving = false;
 	mp_log( "[MP] %s : puppets shown again.\n", arrived ? "In the new level" : "Still no new level after 8 s" );
@@ -1327,11 +1331,10 @@ static Peer* ReclaimPuppet( EIEvilHarryP* beast )
 {
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer& p = g_peers[i];
-		if ( p.limbo != beast ) continue;
-		p.beast = beast;
-		p.limbo = 0;
+		if ( p.beast != beast || !PeerInLimbo(&p) ) continue;
+		p.limboTicks = -1;
 		p.lastLoggedState = p.lastRequested = -2;
-		if ( EIHarry* harry = Gizmod::getHarry() ) { p.world = harry->m_world; p.level = Gizmod::getCurrentLevelCRC(); }
+
 		mp_log( "[MP] Player %d's puppet is still there : kept.\n", i );
 		return &p;
 	}
@@ -1347,32 +1350,40 @@ static bool g_testStallPuppet = false;   // Autotest : the puppet's ticks are sk
 static EIEvilHarryP* g_testStalled = 0;  // ...this one's.
 static const DWORD PUPPET_STALL_MS = 2000;
 
-static void ReplaceStalledPuppets()   // Each Harry tick.
+static void ReplaceStalledPuppets()
 {
-	DWORD now = GetTickCount();
+	const DWORD now = GetTickCount();
 	static DWORD lastCall = 0;
 	bool paused = now - lastCall > 500;   // Harry didn't tick either (a pause, a load) : nothing stalled.
 	lastCall = now;
 	if ( g_levelLeaving ) return;
+
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer& p = g_peers[i];
-		if ( p.beast != p.watched || paused ) { p.watched = p.beast; p.lastTick = now; }
+		if ( p.beast != p.watched || paused ) {
+			p.watched = p.beast;
+			p.lastTick = now;
+		}
 		if ( !p.beast || now - p.lastTick <= PUPPET_STALL_MS ) continue;
+
 		mp_log( "[MP] Player %d's puppet 0x%.8X hasn't ticked for %u ms (a pitfall caught it?) : replaced.\n", i, p.beast, now - p.lastTick );
-		p.limbo = p.beast;
-		p.beast = 0;
 		p.watched = 0;
 		p.limboSince = now;
 		p.limboTicks = 0;
 	}
 }
 
-static void DropLostPuppets()   // Each Harry tick.
+// Scan puppets that have been in limbo for too long.
+// In this case, we can assume they've been destroyed by a level switch.
+static void DropLostPuppets()
 {
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		Peer& p = g_peers[i];
-		if ( !p.limbo || ++p.limboTicks <= 30 || GetTickCount() - p.limboSince <= 1000 ) continue;
-		p.limbo = 0;
+		if ( !PeerInLimbo(&p) ) continue; 
+
+		if ( ++p.limboTicks <= 30 || GetTickCount() - p.limboSince <= 1000 ) continue;
+		p.beast = 0;
+		p.limboTicks = -1;
 		mp_log( "[MP] Player %d's puppet went with the old level.\n", i );
 	}
 }
@@ -2215,9 +2226,12 @@ static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, flo
 	return true;
 }
 
+// Not all evil Harrys are ours.
 static bool IsPuppet( EIEvilHarryP* beast )
 {
-	for ( int i = 0; i < MAX_PEERS; i++ ) if ( g_peers[i].beast == beast || g_peers[i].limbo == beast ) return true;
+	for ( int i = 0; i < MAX_PEERS; i++ )
+		if ( g_peers[i].beast == beast )
+			return true;
 	return false;
 }
 
@@ -3603,6 +3617,7 @@ static volatile LONG g_tapLaterKey = 0;       // ... and this one at g_tapLaterA
 static volatile LONG g_tapLaterAt = 0;        // tick (the test script) doesn't run while it's paused.
 static char g_snapName[64];
 
+#ifdef PTLE_MP_EMBEDTESTS
 static const DWORD AUTOTEST_MENU_TIMEOUT_MS  = 180000;
 static DWORD AUTOTEST_TOTAL_TIMEOUT_MS = 360000;   // Longer for the level survey.
 
@@ -3661,6 +3676,7 @@ static const SurveyLevel SURVEY_WATER[] = {
 static const SurveyLevel* SURVEY_LEVELS = SURVEY_ALL;
 static int NUM_SURVEY_LEVELS = sizeof(SURVEY_ALL) / sizeof(SURVEY_ALL[0]);
 static int g_surveyLoaded = 0, g_surveyDrawn = 0;
+#endif
 
 
 static void RequestSnapshot( const char* name )
@@ -3965,7 +3981,7 @@ static IDirect3DTexture9* RetroTextureHere( IDirect3DDevice9* dev )
 		}
 		else {
 			const Peer& p = g_peers[i];
-			if ( !p.beast || p.shownOutfit != RETRO_OUTFIT ) continue;
+			if ( !p.beast || PeerInLimbo(&p) || p.shownOutfit != RETRO_OUTFIT ) continue;
 			who = p.beast;
 			c = (i == me || !g_networked || !g_players[i].present) ? g_myColors : g_players[i].colors;
 		}
@@ -4467,6 +4483,7 @@ static bool EnsureGameFocus( HWND wnd )
 	return GameHasFocus();
 }
 
+#ifdef PTLE_MP_EMBEDTESTS
 static DWORD WINAPI AutotestThread( void* )
 {
 	DWORD start = GetTickCount();
@@ -4613,6 +4630,7 @@ static DWORD WINAPI AutotestThread( void* )
 	QuitGame( g_autotestDone == 1 ? 0 : 2 );
 	return 0;
 }
+#endif
 
 static void LogTelemetry( EIHarry* harry, const char* tag )
 {
@@ -4656,6 +4674,7 @@ static int g_animClipCount = 0;
 
 static void ApplyMyOutfit();
 
+#ifdef PTLE_MP_EMBEDTESTS
 static void AutotestStep( EIHarry* harry )
 {
 	static const LONG WALK_KEYS[] = { 'W', 'A', 'S', 'D' };   // Arrow keys don't move Harry.
@@ -4933,7 +4952,7 @@ static void AutotestStep( EIHarry* harry )
 		if ( g_pitTest == 3 ) {
 			g_testStallPuppet = t >= 8000 && t < 16000;   // Caught by the pit (here, as if).
 			if ( g_testStallPuppet && !g_testStalled ) g_testStalled = g_cur->beast;
-			if ( !g_cur->beast && !g_cur->limbo && t >= 8000 ) {
+			if ( !g_cur->beast && !PeerInLimbo(g_cur) && t >= 8000 ) {
 				mp_log( "[AT] Pit : the caught puppet was dropped : spawning another.\n" );
 				SpawnPuppet( harry );
 			}
@@ -4953,7 +4972,7 @@ static void AutotestStep( EIHarry* harry )
 			EIEvilHarryP* b = g_cur->beast;
 			const Vector3f& h = harry->m_position;
 			mp_log( "[AT] Pit %5u ms : Harry (%.1f, %.1f, %.1f) health %d | puppet 0x%.8X limbo 0x%.8X at (%.1f, %.1f, %.1f) state %d, target %s, drawn %d\n",
-				t, h.x, h.y, h.z, harry->m_healthValue, b, g_cur->limbo,
+				t, h.x, h.y, h.z, harry->m_healthValue, b, PeerInLimbo(g_cur),
 				b ? b->EIBeast::m_position.x : 0.0F, b ? b->EIBeast::m_position.y : 0.0F, b ? b->EIBeast::m_position.z : 0.0F,
 				b ? b->m_stateIndexCurrent : -1, GetPuppetTarget() ? "yes" : "no", g_puppetPoseCopies );
 		}
@@ -6558,8 +6577,10 @@ static void AutotestStep( EIHarry* harry )
 		break;
 	}
 }
+#endif
 
 
+#ifdef PTLE_MP_EMBEDTESTS
 #pragma optimize( "", off )
 static int CrashTestRecurse( int depth )
 {
@@ -6575,6 +6596,7 @@ static void RunCrashTest()
 	if ( g_crashTest == 3 ) CrashTestRecurse( 0 );
 }
 #pragma optimize( "", on )
+#endif
 
 // A hider touched by a seeker (their puppet, as we show it) : Harry dies the game's
 // way (he comes back at the last loadzone), and we're a seeker from now on.
@@ -6588,7 +6610,7 @@ static void CheckCaught( EIHarry* harry )
 		uint32_t now = GetTickCount();
 		for ( int i = 0; i < MAX_PEERS && now - lastReport >= 1000; i++ ) {
 			const Peer& p = g_peers[i];
-			if ( i == me || !p.beast ) continue;
+			if ( i == me || !p.beast || PeerInLimbo(&p) ) continue;
 
 			const Vector3f& s = p.beast->EIBeast::m_position;
 			mp_log( "[AT] HS : player %d's puppet is (%.2f, %.2f, %.2f) from Harry.\n", i, s.x - harry->m_position.x, s.y - harry->m_position.y, s.z - harry->m_position.z );
@@ -6599,7 +6621,7 @@ static void CheckCaught( EIHarry* harry )
 	for ( int i = 0; i < MAX_PEERS; i++ ) {
 		const PlayerInfo& info = g_players[i];
 		const Peer& p = g_peers[i];
-		if ( i == me || !info.present || info.role != ROLE_SEEKER || !p.beast || !p.target ) continue;
+		if ( i == me || !info.present || info.role != ROLE_SEEKER || !p.beast || PeerInLimbo(&p) || !p.target ) continue;
 
 		const Vector3f& s = p.beast->EIBeast::m_position;
 		const float dx = s.x - harry->m_position.x, dy = s.y - harry->m_position.y, dz = s.z - harry->m_position.z;
@@ -6622,30 +6644,37 @@ static void CheckCaught( EIHarry* harry )
 
 static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 {
+#ifdef PTLE_MP_EMBEDTESTS
 	if ( g_crashTest && g_harryTicks == 300 ) RunCrashTest();
+#endif
 
 	EIHarry_Tick( self );
 
 	g_harryTickAt = GetTickCount();
 	if ( InterlockedIncrement(&g_harryTicks) == 1 ) {
 		mp_log( "[MP] Harry tick hook is running (this 0x%.8X, global Harry 0x%.8X).\n", self, Gizmod::getHarry() );
-		if ( !g_autotest ) Toast( "F1 : multiplayer menu" );
+#ifdef PTLE_MP_EMBEDTESTS
+		if ( !g_autotest )
+#endif
+			Toast( "F1 : multiplayer menu" );
 	}
 
 	if ( self != Gizmod::getHarry() ) return;
 
+	ERLevel* world = self->m_world;
+
 	// Another level since the puppet was spawned. The load events don't cover every
 	// way of changing levels (the "Go to" menu, loading a save), this does.
-	for ( int i = 0; i < MAX_PEERS; i++ ) {
-		const Peer& p = g_peers[i];
-		if ( (p.beast || p.limbo) && (self->m_world != p.world || Gizmod::getCurrentLevelCRC() != p.level) ) {
-			ForgetPuppet( self );
-			break;
-		}
+	// TODO: Gizmod 0.4 gotta get on top of this.
+	if ( g_currentWorld != world || g_currentCRC != Gizmod::getCurrentLevelCRC() ) {
+		g_currentWorld = world;   // So this change isn't seen again.
+		g_currentCRC = Gizmod::getCurrentLevelCRC();
+
+		ForgetPuppets();
 	}
 	DropLostPuppets();
 	ReplaceStalledPuppets();
-	CheckLevelLeaving( self );
+	CheckLevelLeaving( world );
 
 	if ( !g_origPresent ) {   // The overlay draws as frames are presented.
 		HookPresent();
@@ -6662,8 +6691,10 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 		uint32_t now = NetNowMs();
 		for ( int i = 0; i < MAX_PEERS; i++ ) {
 			Peer* p = &g_peers[i];
+#ifdef PTLE_MP_EMBEDTESTS
 			if ( g_autotest && p == MainPeer() && g_pitTest < 4 && g_distTest < 2 && g_hsTest < 2 ) continue;   // (The two-game pit test : as in play.)
-			if ( p->beast || p->limbo || !p->target || now - p->lastSpawnTry < 1000 ) continue;
+#endif
+			if ( p->beast || !p->target || now - p->lastSpawnTry < 1000 ) continue;
 			p->lastSpawnTry = now;
 			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", i );
 			CurrentPeer current( p );
@@ -6671,7 +6702,9 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 		}
 	}
 	g_cur = MainPeer();
+#ifdef PTLE_MP_EMBEDTESTS
 	if ( g_autotest ) AutotestStep( self );
+#endif
 	HandleHotkeys( self );
 }
 MAKE_THISCALL_WRAPPER( EIHarry_Tick_Hook, _EIHarry_Tick_Hook );
@@ -6749,14 +6782,14 @@ static bool HandleOrphan( EIEvilHarryP* self )
 {
 	EIHarry* harry = Gizmod::getHarry();
 	if ( !harry ) return false;
+
 	for ( int i = 0; i < g_spawnedCount; i++ ) {
 		SpawnedPuppet& s = g_spawned[i];
 		if ( s.beast != self || s.world != harry->m_world ) continue;
+
 		Peer& owner = g_peers[s.owner];
-		if ( !owner.beast && !owner.limbo ) {
+		if ( !owner.beast ) {
 			owner.beast = self;
-			owner.world = harry->m_world;
-			owner.level = Gizmod::getCurrentLevelCRC();
 			owner.lastLoggedState = owner.lastRequested = -2;
 			owner.shownOutfit = -1;
 			InterlockedIncrement( &g_orphansFound );
@@ -7057,7 +7090,11 @@ static __declspec(naked) void HarryModel_Hook()
 // The menu's settings, kept in the ini (not the autotests' : they leave it alone).
 static void SaveSettings()
 {
+#ifdef PTLE_MP_EMBEDTESTS
 	if ( g_autotest || !g_iniPath[0] ) return;
+#else
+	if ( !g_iniPath[0] ) return;
+#endif
 	WritePrivateProfileStringA( "Appearance", "Outfit", g_myOutfit < 0 ? "Default" : OUTFITS[g_myOutfit].name, g_iniPath );
 	WritePrivateProfileStringA( "Gamemodes", "Mode", MODE_NAMES[g_gameMode], g_iniPath );
 	{
@@ -7584,7 +7621,9 @@ static void DrawWheel( float sw, float sh, float h )
 
 static void DrawOverlay( IDirect3DDevice9* dev )
 {
+#ifdef PTLE_MP_EMBEDTESTS
 	if ( g_animSurvey ) return;   // Clean frames.
+#endif
 	uint32_t now = NetNowMs();
 	if ( InterlockedExchange( &g_reqMenu, 0 ) ) SetMenuOpen( !g_menu.IsOpen() );
 	bool any = g_showList || g_animViewer || g_menu.IsOpen() || PlayingHs() || WheelShown();
@@ -7841,6 +7880,7 @@ public:
 		if ( memcmp( (void*) POLL_GAMEPAD_CALL, PAD_ORIGINAL, 5 ) == 0 ) injector::MakeCALL( POLL_GAMEPAD_CALL, &PollGamepad_Hook );
 		else mp_log( "[MP] The gamepad poll call isn't what we expect : the gamepad reaches the game while the menu is open.\n" );
 
+#ifdef PTLE_MP_EMBEDTESTS
 		char env[8] = { 0, };
 		if ( GetEnvironmentVariableA( "PTLE_MP_AUTOTEST", env, sizeof(env) ) && env[0] == '1' ) {
 			g_autotest = true;
@@ -7926,6 +7966,7 @@ public:
 			}
 			CreateThread( 0, 0, AutotestThread, 0, 0, 0 );
 		}
+#endif
 
 		mp_log( "[MP] Hooked ticks. F1 menu, F5 spawn, F6 state, F7 delay, F8 stay here.\n" );
 	}
@@ -7941,12 +7982,12 @@ public:
 		NoteLevelLeaving( e.getLevelCRC() );
 		ApplyMyOutfit();   // The game clears its cheats while it starts : set again before each level loads.
 		ForgetRetroTextures();
-		SuspectPuppets();
+		ForgetPuppets();
 	}
 
 	virtual void onLevelLoaded( LevelLoadedEvent& e )
 	{
-		SuspectPuppets();
+		ForgetPuppets();
 	}
 };
 
