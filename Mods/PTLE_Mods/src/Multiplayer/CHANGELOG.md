@@ -5,6 +5,11 @@ title; players with another version are marked on its Players page.
 
 ## Unreleased (0.3.0)
 
+### New
+
+- F1 > **Emotes** : the list of emotes to choose from scrolls with the mouse
+  wheel.
+
 ### Changed
 
 - The logs of your last 3 games are kept (multiplayer-1.log is the one before,

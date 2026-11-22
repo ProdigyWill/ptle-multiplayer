@@ -33,6 +33,7 @@ struct MenuInput
 	bool mouseDown;                // Left button held.
 	bool mouseClicked;             // Left button went down this frame.
 	bool mouseMoved;
+	int wheel;                     // Mouse wheel notches (up : positive).
 	const char* typed;             // Characters typed since the last frame ('\b' : Backspace; may be 0).
 	const char* pasted;            // The clipboard's text, on Ctrl + V (may be 0).
 	bool copy;                     // Ctrl + C.
@@ -50,6 +51,13 @@ public:
 	bool TabCenter( int page, float* x, float* y ) const { return Center( page >= 0 && page < MAX_PAGES ? m_tabY[page] : -1.0F, x, y ); }
 	bool GroupCenter( int group, float* x, float* y ) const { return Center( group >= 0 && group < MAX_GROUPS ? m_groupY[group] : -1.0F, x, y ); }
 	bool GroupOpen( int group ) const { return group >= 0 && group < MAX_GROUPS && m_groupShown[group]; }
+	// Where the last List was drawn, for the tests to point at; false : none yet.
+	bool ListCenter( float* x, float* y ) const
+	{
+		*x = m_list.x + m_list.w * 0.5F;
+		*y = m_list.y + m_list.h * 0.5F;
+		return m_list.h > 0.0F;
+	}
 	void Open();
 	void Close();
 
@@ -101,7 +109,8 @@ public:
 	enum { RING_NONE, RING_CHOOSE, RING_CLEAR, RING_SWAP };
 	int Ring( const char* const* names, int* cursor, const char* centre, int* swapFrom, const char* hint = 0 );
 	// A list scrolling through visible rows. While it's selected, Up / Down go through it
-	// (out of it at its ends), Page Up / Down by pages. True : *cursor chosen (Enter, a click).
+	// (out of it at its ends), Page Up / Down by pages; the mouse wheel over it scrolls it.
+	// True : *cursor chosen (Enter, a click).
 	bool List( const char* const* names, const char* const* tags, int count, int* cursor, int* scroll, int visible, const char* hint = 0 );
 	// Esc, this frame : taken by the page (back out of something), the menu stays open.
 	bool Back();
@@ -140,6 +149,7 @@ private:
 	MenuInput m_in;
 	float m_h, m_rowH, m_pad;
 	Rect m_panel, m_tabs, m_body;
+	Rect m_list = { 0, 0, 0, 0 };         // The last List's.
 	int m_declPage, m_declSelectable, m_declTab, m_declGroup;
 	float m_declY;                        // Where the next row goes, below the body's top.
 	bool m_onPage;

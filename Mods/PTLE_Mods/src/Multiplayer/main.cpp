@@ -2456,6 +2456,7 @@ static volatile LONG g_menuKeys[MK_COUNT];   // Presses, from the hotkey thread.
 static volatile LONG g_menuOpen = 0;         // For the hotkey thread and the keyboard poll.
 static volatile DWORD g_menuBlockUntil = 0;  // Keys stay away from the game a moment after it closes (the Esc that closed it).
 static struct { bool active; float x, y; bool down; } g_testMouse;   // Autotest : stands in for the mouse.
+static int g_testWheelFrom = 0;    // Autotest : the list's top before a wheel notch.
 
 // Typing into the menu (a colour) : characters from the hotkey thread.
 static SRWLOCK g_typedLock = SRWLOCK_INIT;
@@ -2478,6 +2479,34 @@ static void TakeTyped( char* out, size_t size )
 	strcpy_s( out, size, g_typedChars );
 	g_typedChars[0] = 0;
 	ReleaseSRWLockExclusive( &g_typedLock );
+}
+
+// The mouse wheel only comes as a window message (the rest of the menu's input is
+// polled) : the game window's procedure is subclassed for it (when the menu first
+// shows). While the menu is open the wheel is the menu's.
+static volatile LONG g_menuWheel = 0;   // WHEEL_DELTA a notch (a touchpad's steps can be smaller).
+static HWND g_wheelWnd = 0;
+static WNDPROC g_gameWndProc = 0;
+static bool g_gameWndUnicode = false;
+
+static LRESULT CALLBACK GameWndProc_Hook( HWND wnd, UINT msg, WPARAM wp, LPARAM lp )
+{
+	if ( msg == WM_MOUSEWHEEL && g_menuOpen ) {
+		InterlockedExchangeAdd( &g_menuWheel, GET_WHEEL_DELTA_WPARAM(wp) );
+		return 0;
+	}
+	return g_gameWndUnicode ? CallWindowProcW( g_gameWndProc, wnd, msg, wp, lp ) : CallWindowProcA( g_gameWndProc, wnd, msg, wp, lp );
+}
+
+static void HookGameWindowWheel( HWND wnd )
+{
+	if ( !wnd || wnd == g_wheelWnd ) return;
+	g_wheelWnd = wnd;
+	g_gameWndUnicode = IsWindowUnicode( wnd ) != 0;
+	g_gameWndProc = (WNDPROC) (g_gameWndUnicode ? GetWindowLongPtrW( wnd, GWLP_WNDPROC ) : GetWindowLongPtrA( wnd, GWLP_WNDPROC ));
+	if ( g_gameWndUnicode ) SetWindowLongPtrW( wnd, GWLP_WNDPROC, (LONG_PTR) GameWndProc_Hook );
+	else SetWindowLongPtrA( wnd, GWLP_WNDPROC, (LONG_PTR) GameWndProc_Hook );
+	mp_log( "[MP] Game window 0x%.8X : mouse wheel hooked.\n", wnd );
 }
 
 static bool ReadClipboard( char* out, size_t size )
@@ -3475,7 +3504,7 @@ static void EmotesPage()
 	}
 
 	// Choosing : the menu at the left, the preview at the right.
-	g_menu.SetKeys( "Enter : choose    Esc : back    Mouse : click" );
+	g_menu.SetKeys( "Enter : choose    Esc : back    Mouse : click, wheel" );
 	char title[64];
 	sprintf_s( title, "Choose an emote for %s, slot %d", wheel.name, g_ringSlot + 1 );
 	g_menu.Info( title, 0, Menu::GOLD );
@@ -5582,6 +5611,18 @@ static void AutotestStep( EIHarry* harry )
 		else if ( step == 38 && t >= 1500 ) {
 			Local::Check( "Page Down : further down the list, the preview follows", g_listCursor > 8 && g_previewWant != FindEmoteByName( "Idle" ) );
 			RequestSnapshot( "emote_10_pagedown" );
+			// The mouse wheel (a real message to the game window), the pointer over the list : a notch down.
+			g_testWheelFrom = g_listScroll;
+			g_menu.ListCenter( &g_testMouse.x, &g_testMouse.y );
+			g_testMouse.active = true; g_testMouse.down = false;
+			PostMessageA( *((HWND*) HWND_GAME_WINDOW), WM_MOUSEWHEEL, MAKEWPARAM( 0, (WORD) (SHORT) -WHEEL_DELTA ), 0 );
+			step = 380; phaseStart = now;
+		}
+		else if ( step == 380 && t >= 600 ) {
+			mp_log( "[AT] Emote : wheel, the list's top %d -> %d, current %d.\n", g_testWheelFrom, g_listScroll, g_listCursor );
+			Local::Check( "the mouse wheel scrolls the list, the row under the pointer is the current one",
+				g_listScroll == g_testWheelFrom + 3 && g_listCursor >= g_listScroll + 3 && g_listCursor <= g_listScroll + 4 );
+			g_testMouse.active = false;
 			g_listCursor = 0;   // Back to the top ("Empty slot"), then Up : out of the list, to Category, then Search.
 			InterlockedIncrement( &g_menuKeys[MK_UP] );
 			step = 39; phaseStart = now;
@@ -7321,6 +7362,13 @@ static void DrawMenu( float sw, float sh, float h )
 	in.mouseClicked = in.mouseDown && !lastDown;
 	lastX = in.mouseX; lastY = in.mouseY; lastDown = in.mouseDown;
 
+	// The wheel : whole notches (smaller steps add up).
+	HookGameWindowWheel( *((HWND*) HWND_GAME_WINDOW) );
+	static LONG wheelRest = 0;
+	wheelRest += InterlockedExchange( &g_menuWheel, 0 );
+	in.wheel = wheelRest / WHEEL_DELTA;
+	wheelRest -= in.wheel * WHEEL_DELTA;
+
 	static char left[MAX_LIST_ROWS][96], right[MAX_LIST_ROWS][64];
 	static uint32_t colors[MAX_LIST_ROWS];
 	int rows = BuildPlayerRows( left, right, colors, "" );
@@ -7329,7 +7377,7 @@ static void DrawMenu( float sw, float sh, float h )
 	if ( g_binding != BIND_NONE ) {   // Waiting for a key or a button : the menu doesn't get them.
 		PollBinding();
 		in.up = in.down = in.left = in.right = in.accept = in.back = in.nextPage = in.prevPage = 0;
-		in.del = in.pageUp = in.pageDown = in.shiftLeft = in.shiftRight = 0;
+		in.del = in.pageUp = in.pageDown = in.shiftLeft = in.shiftRight = in.wheel = 0;
 		in.mouseClicked = false;
 	}
 	g_menu.SetNarrow( g_chooser );
