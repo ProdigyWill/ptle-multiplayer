@@ -3,6 +3,8 @@
 What's new in each build given to players. The version shows in the F1 menu's
 title; players with another version are marked on its Players page.
 
+## Unreleased (0.4.0)
+
 ## 0.3.0 (2026-11-22)
 
 ### New
