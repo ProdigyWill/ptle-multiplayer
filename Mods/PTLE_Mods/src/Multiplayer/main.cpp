@@ -2155,7 +2155,7 @@ static WNDPROC g_gameWndProc = 0;
 static bool PollTyping( int vk );
 static bool RecordMenuMouseWheel( short delta );
 
-static void Keydown( int vk );
+static void Keydown( int vk, bool repeat );
 static bool MouseWheel( short delta );
 
 static LRESULT CALLBACK GameWndProc_Hook( HWND wnd, UINT msg, WPARAM wp, LPARAM lp )
@@ -2163,8 +2163,10 @@ static LRESULT CALLBACK GameWndProc_Hook( HWND wnd, UINT msg, WPARAM wp, LPARAM 
 	switch ( msg )
 	{
 	case WM_KEYDOWN:
-		Keydown( wp );
-		return 0;
+		Keydown( wp, (lp & 0x40000000) != 0 );   // Bit 30 : the key was already down (auto-repeat).
+		if ( g_menuOpen )
+			return 0;   // The menu has the keyboard.
+		break;
 
 	case WM_MOUSEWHEEL:
 		if ( MouseWheel(GET_WHEEL_DELTA_WPARAM(wp)) )
@@ -2306,7 +2308,7 @@ static void ProcessHotkey( int vk )
 	}
 }
 
-static void ProcessMenuKey( int vk )
+static void ProcessMenuKey( int vk, bool repeat )
 {
 	static const int NUM_MENU_VK = 10;
 	static const int MENU_VK[NUM_MENU_VK] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB, VK_DELETE, VK_PRIOR, VK_NEXT };
@@ -2319,6 +2321,10 @@ static void ProcessMenuKey( int vk )
 	const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 	for ( int i = 0; i < NUM_MENU_VK; i++ ) {
 		if ( MENU_VK[i] != vk ) continue;
+
+		const bool repeats = i < 4 || i >= 8;   // Held, the arrows and Page Up / Down repeat.
+		if ( repeat && !repeats )
+			continue;
 
 		int slot = MENU_SLOT[i];
 		if ( shift && slot == MK_NEXT ) slot = MK_PREV;
@@ -2338,10 +2344,11 @@ static bool RecordMenuMouseWheel( short delta )
 	return false;
 }
 
-static void Keydown( int vk )
+static void Keydown( int vk, bool repeat )
 {
-	ProcessHotkey( vk );
-	ProcessMenuKey( vk );
+	if ( !repeat )   // Held, F1 would open and close the menu over and over.
+		ProcessHotkey( vk );
+	ProcessMenuKey( vk, repeat );
 	PollTyping( vk );
 }
 static bool MouseWheel( short delta )
