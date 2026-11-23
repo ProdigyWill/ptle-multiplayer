@@ -3606,7 +3606,7 @@ static DIJOYSTATE2* __cdecl PollGamepad_Hook( int index )
 		return 0;
 	}
 	else {
-		CustomGameInput_Gamepad( &g_gamepadSeen );
+		CustomGameInput_Gamepad( state );   // The game's (g_gamepadSeen stays as the controller is).
 		TestSawGamepad( state );
 		return state;
 	}
