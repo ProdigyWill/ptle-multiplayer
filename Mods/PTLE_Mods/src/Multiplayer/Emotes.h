@@ -1,0 +1,57 @@
+#pragma once
+
+
+static const int MAX_WHEELS = 4, WHEEL_SLOTS = 8, WHEEL_NAME_SIZE = 24;
+
+struct EmoteDef
+{
+	const char* id;        // Chains : their name in the ini (the others go by their clip).
+	const char* name;
+	int category;          // EMOTE_CATEGORIES.
+	bool loops;            // Plays again until Harry moves.
+	bool favourite;
+	uint32_t intro;        // Chains : played once first, then the clip loops.
+	uint32_t clip;
+	uint32_t ending[2];    // Played (one, then the other) when you move : a chain's, or getting up from a hold.
+	float hold[2];         // Harry stays between these frames of the clip (there and back, slowing at each end; the
+	// same : on that frame; -1 : the last) until you move. 0, 0 : no hold.
+	float endingFrom;      // The ending's first frame.
+};
+
+struct EmoteWheel
+{
+	char name[WHEEL_NAME_SIZE];
+	int slot[WHEEL_SLOTS];   // EMOTES index, -1 : empty. Clockwise from the top.
+};
+
+struct EmoteState
+{
+	bool active;
+	int emote;            // EMOTES index.
+	uint32_t clip;        // Playing now (a chain's intro, then its clip, then its ending).
+	int slot;             // Which of EMOTE_LAYERS.
+	bool started;
+	bool holding;         // At its hold (Teleport Zen floating, Death lying there) ...
+	bool finishing;       // Let go of its hold, the rest of the clip playing (no ending). Harry stays put meanwhile.
+	bool loop;
+	int ending;           // Its ending : which of its clips plays (-1 : not yet). Harry stays put meanwhile.
+	uint32_t holdSince;   // ... since then.
+	float startFrame;     // The clip begins here.
+	int blendFrom;        // Layer blended out as the clip comes in (-1 : none) ...
+	uint32_t blendSince, blendMs;   // ... from then, this long.
+	float lastFrame;      // The layer's frame last time (a loop's goes back to the start : another play).
+	int plays;
+	uint32_t start;       // NetNowMs.
+	Vector3f where;       // Harry, at the start.
+	int health;
+};
+
+
+void LoadEmoteWheels( const char* ini );
+void SaveEmoteWheels( const char* ini );
+
+bool EmoteWheelShown();
+void EmoteWheelOpen( const uint8_t* pad );
+
+void RequestPlayEmote( int id );
+

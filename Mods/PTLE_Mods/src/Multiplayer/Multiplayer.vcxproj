@@ -78,6 +78,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="gamemodes\HideAndSeek\HideAndSeek.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="overlay.cpp" />
     <ClCompile Include="menu.cpp" />
@@ -89,6 +90,11 @@
     <ClCompile Include="util\MatrixUtils.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Emotes.h" />
+    <ClInclude Include="emotes_data.h" />
+    <ClInclude Include="gamemodes\HideAndSeek\HideAndSeek.h" />
+    <ClInclude Include="tests.h" />
+    <ClInclude Include="Multiplayer.h" />
     <ClInclude Include="net\affine.h" />
     <ClInclude Include="overlay.h" />
     <ClInclude Include="menu.h" />
