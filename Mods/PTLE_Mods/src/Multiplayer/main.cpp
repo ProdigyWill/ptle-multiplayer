@@ -282,6 +282,33 @@ static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
 }
 
 
+
+// Game modes (F1 -> Gamemodes; Multiplayer.ini, [Gamemodes] Mode). Off : just
+// see each other.
+enum { MODE_OFF, MODE_HIDE_AND_SEEK, NUM_MODES };
+static const char* const MODE_NAMES[NUM_MODES] = { "Off", "Hide and seek" };
+static int g_gameMode = MODE_OFF;
+
+
+// Swapping roles without the menu : hold the controller button or the key, then
+// either direction of the d-pad or either arrow key (Multiplayer.ini, [Keys]
+// RoleSwapButton, RoleSwapKey). While it's held, the d-pad and the arrows don't
+// reach the game : no item comes out.
+static int g_swapButton = 4;     // DirectInput button : the fifth, L1 / LB.
+static int g_swapKey = 0x2A;     // DirectInput key code : Left Shift.
+
+static const int MAX_VERSION = 15;
+static char g_myVersion[MAX_VERSION + 1] = MP_VERSION;   // Sent to the others (tests : PTLE_MP_FAKEVERSION, another one).
+static char g_myName[MAX_NAME + 1] = "Harry";
+static int g_myNameLen = 5;
+static char g_roomName[64] = "";
+static uint32_t g_lastInfoSent = 0;
+static uint32_t g_lastNetUpdate = 0;
+
+static_assert( sizeof(MP_VERSION) - 1 <= MAX_VERSION, "version too long" );
+
+
+
 static bool g_allowPuppetFreeze = false;
 static volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
 
@@ -335,15 +362,12 @@ static const uint32_t INFO_INTERVAL_MS = 1000;
 static const uint32_t INFO_TIMEOUT_MS = 15000;
 static const uint8_t INFO_PAUSED = 0x01;   // PACKET_INFO's flags.
 static const uint32_t PAUSE_GRACE_MS = 3000;   // Unpaused, but no snapshot yet : still kept this long.
-// Outfits. Harry's own comes from the level : his jungle clothes, or his snowy
-// ones in the snowy levels (White Valley...), which is also the model Evil Harry
-// has. The game has three more, each a cheat (a flag, read when a level loads :
-// Harry gets that model, 0x4ADB38). "Default" (OUTFIT_DEFAULT, not one of these :
-// the others are told what's worn) leaves it to the level; "Harry" makes it the
-// jungle one everywhere, "Snowy Harry" the snowy one (HarryModel_Hook). A character's model is its CRC at
-// +0x130 for Harry, +0x2F4 for a beast; 0x60F770( character, crc ) changes a
-// beast's on the spot (Evil Harry's Init does it to match Harry, 0x47A90D), which is
-// how each puppet wears its own player's outfit. All four share Harry's skeleton.
+
+
+
+// --------------------------------------------------------------------------------
+// Outfits.
+// --------------------------------------------------------------------------------
 struct Outfit { const char* name; uint32_t model; uint32_t cheatFlag; };
 static const Outfit OUTFITS[] = {
 	{ "Harry",       0xC9252A08, 0 },
@@ -352,49 +376,20 @@ static const Outfit OUTFITS[] = {
 	{ "Retro Harry", 0xBF8D2C68, 0x90DA1F },
 	{ "Snowy Harry", 0x94DB2F98, 0 },
 };
+static const int NUM_OUTFITS = countof(OUTFITS);
+static const int RETRO_OUTFIT = 3;
 static const int SNOWY_OUTFIT = 4;
+
 static uint32_t g_forceHarryModel = 0;   // The model Harry gets instead of the level's, when a level loads (0 : the level's).
-static const int NUM_OUTFITS = sizeof(OUTFITS) / sizeof(OUTFITS[0]);
 static const int OUTFIT_DEFAULT = -1;   // Chosen : whatever the level gives Harry.
 static int g_myOutfit = OUTFIT_DEFAULT;  // The one chosen (Multiplayer.ini, [Appearance] Outfit, by name) : worn from the next level load.
 static int g_myWornOutfit = 0;   // The one Harry wears now : what the others are told.
-static int g_testOutfit = -1;    // Autotest : every puppet wears this.
 
 // Retro Harry's colours. His model takes all its colour from a 32x32 texture of four
 // flat squares, so each player can have their own (see the Retro palette section).
-static const int RETRO_OUTFIT = 3;
 static const char* const RETRO_PART_NAMES[RETRO_PARTS] = { "Hair", "Head", "Shirt", "Pants" };   // In the menu, and the ini keys (RetroHair...).
 static const uint8_t RETRO_DEFAULT[RETRO_PARTS][3] = { { 142, 118, 62 }, { 255, 161, 123 }, { 78, 200, 74 }, { 0, 87, 0 } };
 static uint8_t g_myColors[RETRO_PARTS][3];   // Multiplayer.ini, [Appearance] RetroHair... (RRGGBB).
-
-
-
-// Game modes (F1 -> Gamemodes; Multiplayer.ini, [Gamemodes] Mode). Off : just
-// see each other.
-enum { MODE_OFF, MODE_HIDE_AND_SEEK, NUM_MODES };
-static const char* const MODE_NAMES[NUM_MODES] = { "Off", "Hide and seek" };
-static int g_gameMode = MODE_OFF;
-
-
-// Swapping roles without the menu : hold the controller button or the key, then
-// either direction of the d-pad or either arrow key (Multiplayer.ini, [Keys]
-// RoleSwapButton, RoleSwapKey). While it's held, the d-pad and the arrows don't
-// reach the game : no item comes out.
-static int g_swapButton = 4;     // DirectInput button : the fifth, L1 / LB.
-static int g_swapKey = 0x2A;     // DirectInput key code : Left Shift.
-
-static bool HiddenFromMe( int id );   // (Below : a hider, to a seeker.)
-static int VkToDik( int vk );            // (Below : the role swap's key binding.)
-static const char* KeyName( int dik );
-static const int MAX_VERSION = 15;
-static char g_myVersion[MAX_VERSION + 1] = MP_VERSION;   // Sent to the others (tests : PTLE_MP_FAKEVERSION, another one).
-static char g_myName[MAX_NAME + 1] = "Harry";
-static int g_myNameLen = 5;
-static char g_roomName[64] = "";
-static uint32_t g_lastInfoSent = 0;
-static uint32_t g_lastNetUpdate = 0;
-
-static_assert( sizeof(MP_VERSION) - 1 <= MAX_VERSION, "version too long" );
 
 
 
@@ -778,6 +773,8 @@ static void NetUpdate()
 		LogNetStats();
 	}
 }
+
+
 
 // --------------------------------------------------------------------------------
 // Animation clips. EAnimController (+0xB4 in every character) keeps its layers in a
@@ -2289,6 +2286,59 @@ static bool PollTyping( int vk )
 	return true;
 }
 
+// In-game hotkeys.
+static volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
+g_reqReplay = 0, g_reqStarredOnly = 0;
+static volatile LONG g_harryTicks = 0;
+
+static void ProcessHotkey( int vk )
+{
+	// The animation viewer's keys ([ ] \ ') only matter while it's open.
+	static const int NUM_KEYS = 8;
+	const int keys[NUM_KEYS] = { VK_F7, VK_F1, VK_F10, VK_F11, VK_OEM_4, VK_OEM_6, VK_OEM_5, VK_OEM_7 };
+	const char* names[NUM_KEYS] = { "F7", "F1", "F10", "F11", "[", "]", "\\", "'" };
+	volatile LONG* reqs[NUM_KEYS] = { &g_reqDelay, &g_reqMenu,
+		&g_reqViewer, &g_reqStar, &g_reqPrev, &g_reqNext, &g_reqReplay, &g_reqStarredOnly };
+
+	for ( int i = 0; i < NUM_KEYS; i++ ) {
+		if ( keys[i] != vk ) continue;
+
+		if ( GameHasFocus() ) {
+			volatile LONG* req = reqs[i];
+			const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;   // Shift + [ ] : by ten.
+			if ( shift && req == &g_reqPrev ) req = &g_reqPrev10;
+			if ( shift && req == &g_reqNext ) req = &g_reqNext10;
+			InterlockedIncrement( req );
+			if ( i <= 6 ) mp_log( "[MP] %s pressed (Harry ticks so far : %ld).\n", names[i], g_harryTicks );
+		}
+		else if ( i <= 6 ) {
+			mp_log( "[MP] %s ignored : game window not focused.\n", names[i] );
+		}
+	}
+}
+
+static void ProcessMenuKey( int vk )
+{
+	static const int NUM_MENU_VK = 10;
+	static const int MENU_VK[NUM_MENU_VK] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB, VK_DELETE, VK_PRIOR, VK_NEXT };
+	static const int MENU_SLOT[NUM_MENU_VK] = { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_DELETE, MK_PGUP, MK_PGDN };
+
+	if ( !g_menuOpen || !GameHasFocus() ) return;
+
+	const DWORD now = GetTickCount();
+
+	const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+	for ( int i = 0; i < NUM_MENU_VK; i++ ) {
+		if ( MENU_VK[i] != vk ) continue;
+
+		int slot = MENU_SLOT[i];
+		if ( shift && slot == MK_NEXT ) slot = MK_PREV;
+		if ( shift && slot == MK_LEFT ) slot = MK_SLEFT;
+		if ( shift && slot == MK_RIGHT ) slot = MK_SRIGHT;
+		InterlockedIncrement( &g_menuKeys[slot] );
+	}
+}
+
 static volatile LONG g_menuWheel = 0;   // WHEEL_DELTA a notch (a touchpad's steps can be smaller).
 static bool RecordMenuMouseWheel( short delta )
 {
@@ -2301,74 +2351,13 @@ static bool RecordMenuMouseWheel( short delta )
 
 static void Keydown( int vk )
 {
+	ProcessHotkey( vk );
+	ProcessMenuKey( vk );
 	PollTyping( vk );
 }
 static bool MouseWheel( short delta )
 {
 	return RecordMenuMouseWheel( delta );
-}
-
-
-static volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
-					 g_reqReplay = 0, g_reqStarredOnly = 0;
-static volatile LONG g_harryTicks = 0;
-
-static DWORD WINAPI HotkeyThread( void* )
-{
-	// The animation viewer's keys ([ ] \ ') only matter while it's open.
-	static const int NUM_KEYS = 8;
-	bool wasDown[NUM_KEYS] = { false, };
-	const int keys[NUM_KEYS] = { VK_F7, VK_F1, VK_F10, VK_F11, VK_OEM_4, VK_OEM_6, VK_OEM_5, VK_OEM_7 };
-	const char* names[NUM_KEYS] = { "F7", "F1", "F10", "F11", "[", "]", "\\", "'" };
-	volatile LONG* reqs[NUM_KEYS] = { &g_reqDelay, &g_reqMenu,
-		&g_reqViewer, &g_reqStar, &g_reqPrev, &g_reqNext, &g_reqReplay, &g_reqStarredOnly };
-
-	for ( ;; ) {
-		for ( int i = 0; i < NUM_KEYS; i++ ) {
-			bool down = (GetAsyncKeyState( keys[i] ) & 0x8000) != 0;
-			if ( down && !wasDown[i] ) {
-				if ( GameHasFocus() ) {
-					volatile LONG* req = reqs[i];
-					bool shift = (GetAsyncKeyState( VK_SHIFT ) & 0x8000) != 0;   // Shift + [ ] : by ten.
-					if ( shift && req == &g_reqPrev ) req = &g_reqPrev10;
-					if ( shift && req == &g_reqNext ) req = &g_reqNext10;
-					InterlockedIncrement( req );
-					if ( i <= 6 ) mp_log( "[MP] %s pressed (Harry ticks so far : %ld).\n", names[i], g_harryTicks );
-				}
-				else if ( i <= 6 ) {
-					mp_log( "[MP] %s ignored : game window not focused.\n", names[i] );
-				}
-			}
-			wasDown[i] = down;
-		}
-
-		// The menu's keys, while it's open. Held arrows (and Page Up / Down) repeat; with
-		// Shift, Tab goes back and Left / Right are the Shift ones.
-		static const int NUM_MENU_VK = 10;
-		static const int MENU_VK[NUM_MENU_VK] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB, VK_DELETE, VK_PRIOR, VK_NEXT };
-		static const int MENU_SLOT[NUM_MENU_VK] = { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_DELETE, MK_PGUP, MK_PGDN };
-		static bool menuDown[NUM_MENU_VK] = { false, };
-		static DWORD menuNext[NUM_MENU_VK];
-		bool menu = g_menuOpen && GameHasFocus();
-		bool shift = (GetAsyncKeyState( VK_SHIFT ) & 0x8000) != 0;
-		for ( int i = 0; i < NUM_MENU_VK; i++ ) {
-			bool down = menu && (GetAsyncKeyState( MENU_VK[i] ) & 0x8000) != 0;
-			DWORD now = GetTickCount();
-			bool repeats = i < 4 || i >= 8;
-			if ( down && (!menuDown[i] || (repeats && (int) (now - menuNext[i]) >= 0)) ) {
-				int slot = MENU_SLOT[i];
-				if ( shift && slot == MK_NEXT ) slot = MK_PREV;
-				if ( shift && slot == MK_LEFT ) slot = MK_SLEFT;
-				if ( shift && slot == MK_RIGHT ) slot = MK_SRIGHT;
-				InterlockedIncrement( &g_menuKeys[slot] );
-				menuNext[i] = now + (menuDown[i] ? 70 : 350);
-			}
-			menuDown[i] = down;
-		}
-		//PollTyping( menu );
-		Sleep( 15 );
-	}
-	return 0;
 }
 
 
@@ -4027,10 +4016,9 @@ static void ApplyPuppetOutfit( EIEvilHarryP* p, Peer* peer )
 {
 	int me = g_transport ? g_transport->PlayerId() : -1;
 	bool ours = peer->id == me || !g_networked;   // It replays us (echo, the loopback).
-	if ( !ours && !g_players[peer->id].present && g_testOutfit < 0 ) return;   // They left : as it is.
+	if ( !ours && !g_players[peer->id].present ) return;   // They left : as it is.
 
 	int outfit = ours ? g_myWornOutfit : g_players[peer->id].outfit;
-	if ( g_testOutfit >= 0 ) outfit = g_testOutfit;
 	if ( outfit == peer->shownOutfit ) return;
 
 	uint32_t model = OUTFITS[outfit].model;
@@ -4343,6 +4331,7 @@ static void ReadNetConfig( NetConfig* c )
 // --------------------------------------------------------------------------------
 // The PC game has one retail build, 1.0.12.18-1 : every address in this mod is
 // that build's. Its version string, in .rdata.
+// TODO: Gizmod 0.4 should perform corrupt / compat checks like this.
 static const uint32_t GAME_VERSION_ADDRESS = 0x887B5C;
 static const char GAME_VERSION[] = "Pitfall Harry    1.0.12.18-1";
 
@@ -4355,25 +4344,18 @@ static bool IsKnownGameVersion()
 	return memcmp( (void*) GAME_VERSION_ADDRESS, GAME_VERSION, sizeof(GAME_VERSION) ) == 0;
 }
 
-// --------------------------------------------------------------------------------
-// The overlay : name tags over the other players, the player list (F9), and
-// "joined" / "left" messages.
-// --------------------------------------------------------------------------------
-
-static uint32_t WithAlpha( uint32_t color, float alpha )
-{
-	if ( alpha < 0.0F ) alpha = 0.0F;
-	if ( alpha > 1.0F ) alpha = 1.0F;
-	return (color & 0x00FFFFFF) | ((uint32_t) (((color >> 24) & 0xFF) * alpha + 0.5F) << 24);
-}
-
 // Our outfit : the game's cheat flag for it (and none of the others). Harry changes
 // when the next level loads.
 static void ApplyMyOutfit()
 {
-	for ( int i = 1; i < NUM_OUTFITS; i++ ) if ( OUTFITS[i].cheatFlag ) *(uint8_t*) OUTFITS[i].cheatFlag = (i == g_myOutfit) ? 1 : 0;
+	for ( int i = 1; i < NUM_OUTFITS; i++ )
+		if ( OUTFITS[i].cheatFlag )
+			*(uint8_t*) OUTFITS[i].cheatFlag = (i == g_myOutfit) ? 1 : 0;
+
 	g_forceHarryModel = g_myOutfit < 0 || OUTFITS[g_myOutfit].cheatFlag ? 0 : OUTFITS[g_myOutfit].model;   // Harry : the jungle one, even in the snow.
 }
+
+
 
 // Without a cheat, Harry's model is the level's (0x4ADC1E : mov [ecx+0x130], eax, the
 // CRC from the level's data). Ours instead, when one is chosen that has no cheat.
@@ -5091,18 +5073,22 @@ static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, flo
 {
 	EIEvilHarryP* p = peer.beast;
 	if ( !p || !peer.tagFrame || g_presentCount - peer.tagFrame > TAG_GRACE_FRAMES || g_levelLeaving ) return false;
+
 	// The view the renderer drew this frame with (the last it was given : any
 	// reflection comes first), whichever camera mode built it. Choosing among the
 	// cameras' own look-ats instead left the tag behind when aiming the TNT, and
 	// jumping about while the camera swung into it.
 	if ( !g_haveProj || g_presentCount - g_rendFrame > 1 ) return false;
+
 	Matrix4f view;
-	if ( !MatInverseAffine( g_rendCam, &view ) ) return false;
+	if ( !MatInverseAffine(g_rendCam, &view) ) return false;
+
 	IDirect3DSurface9* screen = 0;
 	D3DSURFACE_DESC d = { };
-	bool ok = SUCCEEDED( dev->GetBackBuffer( 0, 0, D3DBACKBUFFER_TYPE_MONO, &screen ) ) && screen && SUCCEEDED( screen->GetDesc( &d ) );
+	bool ok = SUCCEEDED( dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &screen) ) && screen && SUCCEEDED( screen->GetDesc(&d) );
 	if ( screen ) screen->Release();
 	if ( !ok ) return false;
+
 	const float* proj = &g_cameraProj.data[0][0];
 	const Matrix4f& m = p->m_transformMatrix;
 	float px = m.data[3][0], py = m.data[3][1], pz = m.data[3][2] + TAG_ABOVE_FEET;
@@ -5110,10 +5096,23 @@ static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, flo
 	for ( int j = 0; j < 4; j++ ) v[j] = px * view.data[0][j] + py * view.data[1][j] + pz * view.data[2][j] + view.data[3][j];
 	for ( int j = 0; j < 4; j++ ) c[j] = v[0] * proj[j] + v[1] * proj[4 + j] + v[2] * proj[8 + j] + v[3] * proj[12 + j];
 	if ( c[3] < 0.1F ) return false;   // Behind the camera.
+
 	*x = (c[0] / c[3] + 1.0F) * 0.5F * d.Width;
 	*y = (1.0F - c[1] / c[3]) * 0.5F * d.Height;
 	*depth = c[3];
 	return true;
+}
+
+// --------------------------------------------------------------------------------
+// The overlay : name tags over the other players, the player list (F9), and
+// "joined" / "left" messages.
+// --------------------------------------------------------------------------------
+
+static uint32_t WithAlpha( uint32_t color, float alpha )
+{
+	if ( alpha < 0.0F ) alpha = 0.0F;
+	if ( alpha > 1.0F ) alpha = 1.0F;
+	return (color & 0x00FFFFFF) | ((uint32_t) (((color >> 24) & 0xFF) * alpha + 0.5F) << 24);
 }
 
 static void DrawOverlay( IDirect3DDevice9* dev )
@@ -5323,8 +5322,6 @@ public:
 		Gizmod::getInstance()->getEventListener()->registerEvent<LoadLevelEvent>( this );
 		Gizmod::getInstance()->getEventListener()->registerEvent<LevelLoadedEvent>( this );
 		Gizmod::getInstance()->getEventListener()->registerEvent<HarryDeathEvent>( this );
-
-		CreateThread( 0, 0, HotkeyThread, 0, 0, 0 );
 
 		g_netLog = mp_log;
 		NetConfig config;
