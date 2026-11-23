@@ -680,7 +680,7 @@ static void NetUpdate()
 					// A puppet spawned before anyone was heard from (F5, the autotest) is
 					// peer 0's : it now shows this player.
 					Peer* first = &g_peers[0];
-					if ( h.player != 0 && first->beast && !first->heard && !peer->beast && !peer->limboTicks < 0 ) MovePuppet( first, peer );
+					if ( h.player != 0 && first->beast && !first->heard && !peer->beast && !PeerInLimbo(peer) ) MovePuppet( first, peer );
 					g_mainId = h.player;
 				}
 			}
