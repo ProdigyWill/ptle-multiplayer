@@ -28,7 +28,7 @@ extern struct HsCaughtOut { int seeker; uint32_t number; int left; uint32_t last
 
 // Definitions.
 
-static inline bool PlayingHs() { return g_hsMyRole != ROLE_NONE; }
+bool PlayingHs();   // The game mode is hide and seek.
 
 
 void HsSetRole( int role );

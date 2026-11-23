@@ -20,6 +20,13 @@ int      g_hsMyRole = ROLE_SEEKER;      // Everyone starts as a seeker.
 uint32_t g_hsMyHideMs = 0;              // Total hide time.
 
 HsCaughtOut g_caughtOut = { -1, 0, 0, 0 };
+
+
+bool PlayingHs()
+{
+	return g_gameMode == MODE_HIDE_AND_SEEK;
+}
+
 static uint32_t g_catchNumber = 0;             // Ours (a random start : another session's don't look the same).
 static uint32_t g_lastCatchHeard[MAX_PEERS];   // Each hider's last catch number heard.
 

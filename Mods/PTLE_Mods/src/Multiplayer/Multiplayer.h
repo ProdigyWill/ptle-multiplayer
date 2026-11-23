@@ -128,7 +128,8 @@ bool GameHasFocus();
 
 // main.cpp's, shared with the tests (tests.cpp).
 
-enum { MODE_OFF, MODE_HIDE_AND_SEEK, NUM_MODES };   // The game modes (g_gameMode).
+enum { MODE_OFF, MODE_HIDE_AND_SEEK, NUM_MODES };   // The game modes.
+extern int g_gameMode;
 enum { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_PREV, MK_DELETE, MK_PGUP, MK_PGDN, MK_SLEFT, MK_SRIGHT, MK_COUNT };   // The menu's keys.
 
 struct Outfit { const char* name; uint32_t model; uint32_t cheatFlag; };
@@ -184,7 +185,6 @@ bool HiddenFromMe( int id );
 
 // Settings.
 extern char g_logDir[MAX_PATH];
-extern int g_gameMode;
 extern int g_delayIndex;
 extern bool g_showTags;
 extern bool g_showList;

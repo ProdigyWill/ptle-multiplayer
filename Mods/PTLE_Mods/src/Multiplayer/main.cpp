@@ -732,7 +732,7 @@ static void NetUpdate()
 
 		LoadHideTime();
 
-		w.write<uint8_t>( g_hsMyRole );
+		w.write<uint8_t>( PlayingHs() ? g_hsMyRole : ROLE_NONE );   // ROLE_NONE : no hide time follows.
 		if ( PlayingHs() ) {
 			w.write<uint32_t>( g_hsMyHideMs );
 		}
