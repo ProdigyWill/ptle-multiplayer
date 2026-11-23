@@ -1,6 +1,9 @@
 #pragma once
 
 
+struct DIJOYSTATE2;
+
+
 static const int MAX_WHEELS = 4, WHEEL_SLOTS = 8, WHEEL_NAME_SIZE = 24;
 
 struct EmoteDef
@@ -51,7 +54,7 @@ void LoadEmoteWheels( const char* ini );
 void SaveEmoteWheels( const char* ini );
 
 bool EmoteWheelShown();
-void EmoteWheelOpen( const uint8_t* pad );
+void EmoteWheelOpen( const DIJOYSTATE2* pad );
 
 void RequestPlayEmote( int id );
 
