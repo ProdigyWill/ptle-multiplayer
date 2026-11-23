@@ -584,6 +584,7 @@ bool Menu::List( const char* const* names, const char* const* tags, int count, i
 	int index = m_declSelectable;
 	float itemH = floorf( m_h * 1.35F );
 	bool selected = Selectable( hint, &r, &clicked, itemH * visible, false );
+	m_list = r;
 	m_captureNext = index;
 	bool chosen = false;
 	if ( *cursor >= count ) *cursor = count - 1;
@@ -597,6 +598,15 @@ bool Menu::List( const char* const* names, const char* const* tags, int count, i
 			if ( *cursor < 0 ) *cursor = 0;
 		}
 		if ( m_in.accept && count > 0 ) chosen = true;
+	}
+	// The mouse wheel over the list : it scrolls (3 rows a notch), and the row then under
+	// the pointer is the current one, as when it's pointed at (the cursor stays in view).
+	if ( m_in.wheel && count > 0 && Hit( r ) ) {
+		*scroll -= m_in.wheel * 3;
+		if ( *scroll > count - visible ) *scroll = count - visible;
+		if ( *scroll < 0 ) *scroll = 0;
+		int under = *scroll + (int) ((m_in.mouseY - r.y) / itemH);
+		*cursor = under < count ? under : count - 1;
 	}
 	// Scrolled so the cursor shows.
 	if ( *cursor < *scroll ) *scroll = *cursor;

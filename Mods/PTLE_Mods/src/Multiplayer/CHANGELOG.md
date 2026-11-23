@@ -3,10 +3,20 @@
 What's new in each build given to players. The version shows in the F1 menu's
 title; players with another version are marked on its Players page.
 
-## Unreleased (0.3.0)
+## Unreleased (0.4.0)
+
+## 0.3.0 (2026-11-22)
+
+### New
+
+- F1 > **Emotes** : the list of emotes to choose from scrolls with the mouse
+  wheel.
 
 ### Changed
 
+- Needs **Gizmod 0.3.0** (the mod loader) : install it first. This version
+  doesn't load with Gizmod 0.2, and older versions of the mod don't load with
+  Gizmod 0.3.0.
 - The logs of your last 3 games are kept (multiplayer-1.log is the one before,
   then -2 and -3), so a crash's log isn't lost when you start the game again.
   After a crash, send multiplayer.log and multiplayer-1.log.
