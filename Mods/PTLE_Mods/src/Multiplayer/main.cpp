@@ -4950,7 +4950,8 @@ static void DrawMenu( float sw, float sh, float h )
 	}
 }
 
-// Tells the hotkey thread and the keyboard poll whether the menu is open.
+// Tells the key handlers and the input polls whether the menu is open (it closes
+// itself on Esc : this notices).
 static void SyncMenuOpen()
 {
 	bool open = g_menu.IsOpen();
@@ -4961,6 +4962,7 @@ static void SyncMenuOpen()
 			InterlockedExchange( &g_menuKeys[i], 0 );
 
 	InterlockedExchange( &g_menuOpen, open ? 1 : 0 );
+	g_inputBlocked = open;
 	mp_log( "[MP] Menu %s.\n", open ? "opened" : "closed" );
 }
 
@@ -4970,13 +4972,9 @@ void SetMenuOpen( bool open )
 	if ( open ) {
 		g_menu.Open();
 		g_wheelUi.open = false;
-
-		g_inputBlocked = true;
 	}
 	else {
 		g_menu.Close();
-
-		g_inputBlocked = false;
 	}
 	SyncMenuOpen();
 }
