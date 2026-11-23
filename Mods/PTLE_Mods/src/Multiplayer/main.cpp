@@ -97,8 +97,6 @@ GET_FUNC(   0x6F8EC0, uint32_t, HashPath, const char* );
 static const uint32_t VTABLE_SLOT_TICK   = 0x2C;     // EInstance::Tick().
 static const uint32_t VTABLE_SLOT_RENDER = 0x34;     // EInstance::Render( context, arg ).
 
-static HWND* const HWND_GAME_WINDOW   = (HWND*) 0x93ED60;
-
 
 typedef void (__thiscall *TickFunc)( EInstance* );
 typedef void (__thiscall *RenderFunc)( EInstance* self, void* context, void* arg );
@@ -166,6 +164,15 @@ static void OpenLogFile()
 	}
 
 	g_logFile = _fsopen( path, "w", _SH_DENYWR );
+}
+
+bool GameHasFocus()
+{
+	HWND fg = GetForegroundWindow();
+	if ( !fg ) return false;
+	DWORD pid = 0;
+	GetWindowThreadProcessId( fg, &pid );
+	return pid == GetCurrentProcessId();   // Game window or its console.
 }
 
 void mp_log( const char* fmt, ... )
@@ -2114,7 +2121,7 @@ static void DrivePuppet( EIEvilHarryP* p, Peer* peer )
 
 
 // --------------------------------------------------------------------------------
-// Hotkeys.
+// Hotkeys & menu typing.
 // --------------------------------------------------------------------------------
 // Keys are polled on our own thread (independent of the game's tick rate and of
 // which window the game thinks it owns), and turned into requests the game
@@ -2155,18 +2162,15 @@ static void TakeTyped( char* out, size_t size )
 	ReleaseSRWLockExclusive( &g_typedLock );
 }
 
-// The mouse wheel only comes as a window message (the rest of the menu's input is
-// polled) : the game window's procedure is subclassed for it (when the menu first
-// shows). While the menu is open the wheel is the menu's.
-static volatile LONG g_menuWheel = 0;   // WHEEL_DELTA a notch (a touchpad's steps can be smaller).
-static HWND g_wheelWnd = 0;
+static HWND* const HWND_GAME_WINDOW   = (HWND*) 0x93ED60;
+
 static WNDPROC g_gameWndProc = 0;
 
-static void PollTyping( int vk );
-static void Keydown( int vk )
-{
-	PollTyping( vk );
-}
+static bool PollTyping( int vk );
+static bool RecordMenuMouseWheel( short delta );
+
+static void Keydown( int vk );
+static bool MouseWheel( short delta );
 
 static LRESULT CALLBACK GameWndProc_Hook( HWND wnd, UINT msg, WPARAM wp, LPARAM lp )
 {
@@ -2177,10 +2181,9 @@ static LRESULT CALLBACK GameWndProc_Hook( HWND wnd, UINT msg, WPARAM wp, LPARAM 
 		return 0;
 
 	case WM_MOUSEWHEEL:
-		if ( g_menuOpen ) {
-			InterlockedExchangeAdd( &g_menuWheel, GET_WHEEL_DELTA_WPARAM(wp) );
+		if ( MouseWheel(GET_WHEEL_DELTA_WPARAM(wp)) )
 			return 0;
-		}
+		break;
 
 	default:
 		break;
@@ -2189,14 +2192,16 @@ static LRESULT CALLBACK GameWndProc_Hook( HWND wnd, UINT msg, WPARAM wp, LPARAM 
 }
 
 // TODO: late init
+// Currently checked every tick.
 static void HookGameWindowProc()
 {
-	if ( g_wheelWnd ) return;
+	static bool installed = false;
+	if ( installed ) return;
 
 	HWND hwnd = *HWND_GAME_WINDOW;
 	if ( !hwnd ) return;
 
-	g_wheelWnd = hwnd;
+	installed = true;
 
 	g_gameWndProc = (WNDPROC) GetWindowLongPtrA( hwnd, GWLP_WNDPROC );
 	SetWindowLongPtrA( hwnd, GWLP_WNDPROC, (LONG_PTR) GameWndProc_Hook );
@@ -2204,13 +2209,22 @@ static void HookGameWindowProc()
 	mp_log( "[MP] Game window 0x%.8X : mouse wheel hooked.\n", hwnd );
 }
 
+
+//
+// Win32 clipboard utils.
+//
+
 static bool ReadClipboard( char* out, size_t size )
 {
 	out[0] = 0;
 	if ( !OpenClipboard( 0 ) ) return false;
+
 	HANDLE h = GetClipboardData( CF_TEXT );
 	const char* text = h ? (const char*) GlobalLock( h ) : 0;
-	if ( text ) { strncpy_s( out, size, text, _TRUNCATE ); GlobalUnlock( h ); }
+	if ( text ) {
+		strncpy_s( out, size, text, _TRUNCATE );
+		GlobalUnlock( h );
+	}
 	CloseClipboard();
 	return out[0] != 0;
 }
@@ -2220,15 +2234,20 @@ static void WriteClipboard( const char* text )
 	size_t n = strlen( text ) + 1;
 	HGLOBAL h = GlobalAlloc( GMEM_MOVEABLE, n );
 	if ( !h ) return;
+
 	memcpy( GlobalLock(h), text, n );
 	GlobalUnlock( h );
-	if ( OpenClipboard( 0 ) ) {
+	if ( OpenClipboard(0) ) {
 		EmptyClipboard();
-		if ( !SetClipboardData( CF_TEXT, h ) ) GlobalFree( h );
+		if ( !SetClipboardData(CF_TEXT, h) )
+			GlobalFree( h );
 		CloseClipboard();
 	}
-	else GlobalFree( h );
+	else
+		GlobalFree( h );
 }
+
+
 
 // The keys that type : digits, letters (Shift : capitals), space, , . - ' # ( ) !, backspace.
 static inline bool TypingAcceptedKey( int vk )
@@ -2239,13 +2258,13 @@ static inline bool TypingAcceptedKey( int vk )
 }
 
 static bool IsMenuOpen();
-static void PollTyping( int vk )
+static bool PollTyping( int vk )
 {
-	if ( !IsMenuOpen() || !GameHasFocus() ) return;
+	if ( !IsMenuOpen() || !GameHasFocus() ) return false;
 
 	const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 
-	if ( !TypingAcceptedKey(vk) ) return;
+	if ( !TypingAcceptedKey(vk) ) return false;
 
 	if ( ctrl ) {
 		if ( vk == 'V' ) InterlockedIncrement( &g_menuPaste );
@@ -2266,20 +2285,33 @@ static void PollTyping( int vk )
 		else c = (char) vk;
 		AddTyped( c );
 	}
+
+	return true;
 }
+
+static volatile LONG g_menuWheel = 0;   // WHEEL_DELTA a notch (a touchpad's steps can be smaller).
+static bool RecordMenuMouseWheel( short delta )
+{
+	if ( g_menuOpen ) {
+		InterlockedExchangeAdd( &g_menuWheel, delta );
+		return true;
+	}
+	return false;
+}
+
+static void Keydown( int vk )
+{
+	PollTyping( vk );
+}
+static bool MouseWheel( short delta )
+{
+	return RecordMenuMouseWheel( delta );
+}
+
 
 static volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
 					 g_reqReplay = 0, g_reqStarredOnly = 0;
 static volatile LONG g_harryTicks = 0;
-
-bool GameHasFocus()
-{
-	HWND fg = GetForegroundWindow();
-	if ( !fg ) return false;
-	DWORD pid = 0;
-	GetWindowThreadProcessId( fg, &pid );
-	return pid == GetCurrentProcessId();   // Game window or its console.
-}
 
 static DWORD WINAPI HotkeyThread( void* )
 {
