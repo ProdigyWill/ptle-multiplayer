@@ -2,20 +2,21 @@
 
 #include "Multiplayer.h"
 
+#include "ptle/ERAnim.h"
+#include "ptle/EAnimController.h"
+
 
 // The puppets : the other players' Evil Harrys, spawned, animated and placed where their player is.
 
 
-static const int      MAX_LAYER_SCAN  = 256;
+static const int MAX_LAYER_SCAN = 256;
+
+static inline uint32_t GetLayerClipCRC( AnimLayer* layer ) { return layer->m_anim ? layer->m_anim->m_crc : 0; }
 
 Matrix4f* GetPose( EAnimController* animCtrl, int* bones );
 AnimLayer* GetAnimLayer( EICharacter* c, int key );
-uint32_t GetLayerClipCRC( AnimLayer* layer );
 uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight );
 int GetHeldItem( EIHarry* harry );
-
-extern ERLevel* g_currentWorld;
-extern uint32_t g_currentCRC;
 
 void ForgetPuppets();
 void NoteLevelLeaving( uint32_t newLevel );

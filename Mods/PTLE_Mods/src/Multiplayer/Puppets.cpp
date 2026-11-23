@@ -71,8 +71,6 @@ AnimLayer* GetAnimLayer( EICharacter* c, int key )
 	return layer;
 }
 
-uint32_t GetLayerClipCRC( AnimLayer* layer ) { return layer->m_anim ? layer->m_anim->m_crc : 0; }
-
 // Layer 217 holds a frozen pose (its clock never moves) that Harry blends from
 // when he switches item animations; mirroring it froze the puppet mid pull-out.
 static const int HOLD_POSE_LAYER = 217;
@@ -201,9 +199,6 @@ void SpawnPuppet( Peer* peer )
 		}
 	}
 }
-
-ERLevel* g_currentWorld = 0;
-uint32_t g_currentCRC = 0;
 
 // Called when Harry's world or the level changes.
 void ForgetPuppets()

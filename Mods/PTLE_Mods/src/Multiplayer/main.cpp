@@ -68,7 +68,6 @@ Do NOT remove them, I use these to Ctrl+F locations that require my attention.
 
 #include "tests.h"
 
-
 #include "gamemodes/HideAndSeek/HideAndSeek.h"
 
 
@@ -78,8 +77,7 @@ typedef void (__thiscall *RenderFunc)( EInstance* self, void* context, void* arg
 
 GET_METHOD( 0x4B2CD0, void, EIHarry_Tick, EIHarry* );
 
-// Shortcut.
-static inline Logger* logger() { return Gizmod::getInstance()->getLogger(); }
+int g_gameMode = MODE_OFF;   // F1 -> Gamemodes; Multiplayer.ini, [Gamemodes] Mode.
 
 
 
@@ -91,6 +89,9 @@ static inline Logger* logger() { return Gizmod::getInstance()->getLogger(); }
 static FILE* g_logFile = 0;
 static CRITICAL_SECTION g_logLock;
 char g_logDir[MAX_PATH] = { 0, };
+
+// Shortcut.
+static inline Logger* logger() { return Gizmod::getInstance()->getLogger(); }
 
 // %LOCALAPPDATA%\PTLE Multiplayer (created) : what the mod writes goes there.
 bool GetDataDir( char* path )
@@ -256,9 +257,11 @@ static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
 
 
 
-int g_gameMode = MODE_OFF;   // F1 -> Gamemodes; Multiplayer.ini, [Gamemodes] Mode.
-
-
+// --------------------------------------------------------------------------------
+// Custom Harry tick.
+// This is where we handle updating gamemode state, emotes, and perform
+//  network communication.
+// --------------------------------------------------------------------------------
 
 static void HandleHotkeys( EIHarry* harry )
 {
@@ -271,8 +274,6 @@ static void HandleHotkeys( EIHarry* harry )
 		mp_log( "[MP] Playback delay : %d ms.\n", DELAY_CHOICES[g_delayIndex] );
 	}
 }
-
-
 
 static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 {
@@ -297,9 +298,11 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 	// Another level since the puppet was spawned. The load events don't cover every
 	// way of changing levels (the "Go to" menu, loading a save), this does.
 	// TODO: Gizmod 0.4 gotta get on top of this.
-	if ( g_currentWorld != world || g_currentCRC != Gizmod::getCurrentLevelCRC() ) {
-		g_currentWorld = world;   // So this change isn't seen again.
-		g_currentCRC = Gizmod::getCurrentLevelCRC();
+	static ERLevel* currentWorld = 0;
+	static uint32_t currentCRC = 0;
+	if ( currentWorld != world || currentCRC != Gizmod::getCurrentLevelCRC() ) {
+		currentWorld = world;   // So this change isn't seen again.
+		currentCRC = Gizmod::getCurrentLevelCRC();
 
 		ForgetPuppets();
 	}
@@ -335,6 +338,8 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 	HandleHotkeys( self );
 }
 MAKE_THISCALL_WRAPPER( EIHarry_Tick_Hook, _EIHarry_Tick_Hook );
+
+
 
 // --------------------------------------------------------------------------------
 // Settings (see the top of this file).
@@ -623,6 +628,7 @@ public:
 		InitPeers();
 
 		// Replace Harry and Evil Harry tick functions with our own.
+		// TODO: 0.4 subclassing.
 		const uint32_t harrySlot = EIHarry::VTABLE + VTABLE_SLOT_TICK;
 		injector::WriteMemory( harrySlot, &EIHarry_Tick_Hook );
 		InstallPuppetTickHook();

@@ -29,9 +29,6 @@ struct PlayerSnapshot;
 class Transport;
 
 
-enum { RETRO_HAIR, RETRO_SKIN, RETRO_SHIRT, RETRO_TROUSERS, RETRO_PARTS };
-
-
 extern Transport* g_transport;
 
 
@@ -88,6 +85,8 @@ static inline bool PeerInLimbo( const Peer* p ) { return p->limboTicks >= 0; }
 
 // Player info.
 
+#include "Outfits.h"
+
 struct PlayerInfo
 {
 	bool present;
@@ -128,9 +127,6 @@ bool GameHasFocus();
 
 
 // main.cpp's.
-
-#define countof(arr) (sizeof(arr) / sizeof(arr[0]))
-#define FIELD( obj, type, offset ) (*(type*)((uint8_t*)(obj) + (offset)))
 
 static const uint32_t VTABLE_SLOT_TICK   = 0x2C;     // EInstance::Tick().
 static const uint32_t VTABLE_SLOT_RENDER = 0x34;     // EInstance::Render( context, arg ).

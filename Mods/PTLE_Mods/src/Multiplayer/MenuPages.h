@@ -2,6 +2,8 @@
 
 #include "Multiplayer.h"
 
+#include "menu.h"
+
 
 // The menu's pages (F1) : players, display, keys, game modes and emotes.
 
@@ -16,7 +18,8 @@ const char* KeyName( int dik );
 
 extern Menu g_menu;
 
-bool IsMenuOpen();
+static inline bool IsMenuOpen() { return g_menu.IsOpen(); }
+
 void DrawMenu( float sw, float sh, float h );
 void SyncMenuOpen();
 void SetMenuOpen( bool open );

@@ -51,6 +51,7 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <MinimalRebuild>false</MinimalRebuild>
       <AdditionalIncludeDirectories>$(ProjectDir);$(SolutionDir)src\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>DIRECTINPUT_VERSION=0x0800;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -68,6 +69,7 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DebugInformationFormat>None</DebugInformationFormat>
       <AdditionalIncludeDirectories>$(ProjectDir);$(SolutionDir)src\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>DIRECTINPUT_VERSION=0x0800;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>false</GenerateDebugInformation>
@@ -114,6 +116,7 @@
     <ClInclude Include="net\affine.h" />
     <ClInclude Include="overlay.h" />
     <ClInclude Include="menu.h" />
+    <ClInclude Include="util\common.h" />
     <ClInclude Include="util\MatrixUtils.h" />
     <ClInclude Include="util\MemoryReader.h" />
     <ClInclude Include="util\MemoryWriter.h" />

@@ -1,10 +1,16 @@
+// Outfits
+// Harry's and the puppets' models, and Retro Harry's palette.
+
 #pragma once
 
-#include "Multiplayer.h"
+#include "util/common.h"
+
+class EIEvilHarryP;
+
+struct Peer;
 
 
-// Outfits : Harry's and the puppets' models, and Retro Harry's palette.
-
+enum { RETRO_HAIR, RETRO_SKIN, RETRO_SHIRT, RETRO_TROUSERS, RETRO_PARTS };
 
 struct Outfit { const char* name; uint32_t model; uint32_t cheatFlag; };
 

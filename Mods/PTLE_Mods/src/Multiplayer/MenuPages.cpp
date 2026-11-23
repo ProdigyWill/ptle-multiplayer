@@ -350,11 +350,6 @@ static const char MENU_NAMETAGSFADE_DESC[] =
 static const char MENU_NAMETAGSGONE_DESC[] =
 	"Distance from the camera where the others' names have faded out completely.";
 
-bool IsMenuOpen()
-{
-	return g_menu.IsOpen();
-}
-
 static void EmotesPage()
 {
 	if ( g_editWheel >= g_wheelCount ) g_editWheel = g_wheelCount - 1;
