@@ -97,7 +97,7 @@ GET_FUNC(   0x6F8EC0, uint32_t, HashPath, const char* );
 static const uint32_t VTABLE_SLOT_TICK   = 0x2C;     // EInstance::Tick().
 static const uint32_t VTABLE_SLOT_RENDER = 0x34;     // EInstance::Render( context, arg ).
 
-static const uint32_t HWND_GAME_WINDOW   = 0x93ED60;
+static HWND* const HWND_GAME_WINDOW   = (HWND*) 0x93ED60;
 
 
 typedef void (__thiscall *TickFunc)( EInstance* );
@@ -2161,26 +2161,47 @@ static void TakeTyped( char* out, size_t size )
 static volatile LONG g_menuWheel = 0;   // WHEEL_DELTA a notch (a touchpad's steps can be smaller).
 static HWND g_wheelWnd = 0;
 static WNDPROC g_gameWndProc = 0;
-static bool g_gameWndUnicode = false;
+
+static void PollTyping( int vk );
+static void Keydown( int vk )
+{
+	PollTyping( vk );
+}
 
 static LRESULT CALLBACK GameWndProc_Hook( HWND wnd, UINT msg, WPARAM wp, LPARAM lp )
 {
-	if ( msg == WM_MOUSEWHEEL && g_menuOpen ) {
-		InterlockedExchangeAdd( &g_menuWheel, GET_WHEEL_DELTA_WPARAM(wp) );
+	switch ( msg )
+	{
+	case WM_KEYDOWN:
+		Keydown( wp );
 		return 0;
+
+	case WM_MOUSEWHEEL:
+		if ( g_menuOpen ) {
+			InterlockedExchangeAdd( &g_menuWheel, GET_WHEEL_DELTA_WPARAM(wp) );
+			return 0;
+		}
+
+	default:
+		break;
 	}
-	return g_gameWndUnicode ? CallWindowProcW( g_gameWndProc, wnd, msg, wp, lp ) : CallWindowProcA( g_gameWndProc, wnd, msg, wp, lp );
+	return CallWindowProcA( g_gameWndProc, wnd, msg, wp, lp );
 }
 
-static void HookGameWindowWheel( HWND wnd )
+// TODO: late init
+static void HookGameWindowProc()
 {
-	if ( !wnd || wnd == g_wheelWnd ) return;
-	g_wheelWnd = wnd;
-	g_gameWndUnicode = IsWindowUnicode( wnd ) != 0;
-	g_gameWndProc = (WNDPROC) (g_gameWndUnicode ? GetWindowLongPtrW( wnd, GWLP_WNDPROC ) : GetWindowLongPtrA( wnd, GWLP_WNDPROC ));
-	if ( g_gameWndUnicode ) SetWindowLongPtrW( wnd, GWLP_WNDPROC, (LONG_PTR) GameWndProc_Hook );
-	else SetWindowLongPtrA( wnd, GWLP_WNDPROC, (LONG_PTR) GameWndProc_Hook );
-	mp_log( "[MP] Game window 0x%.8X : mouse wheel hooked.\n", wnd );
+	if ( g_wheelWnd ) return;
+
+	HWND hwnd = *HWND_GAME_WINDOW;
+	if ( !hwnd ) return;
+
+	g_wheelWnd = hwnd;
+
+	g_gameWndProc = (WNDPROC) GetWindowLongPtrA( hwnd, GWLP_WNDPROC );
+	SetWindowLongPtrA( hwnd, GWLP_WNDPROC, (LONG_PTR) GameWndProc_Hook );
+
+	mp_log( "[MP] Game window 0x%.8X : mouse wheel hooked.\n", hwnd );
 }
 
 static bool ReadClipboard( char* out, size_t size )
@@ -2216,38 +2237,34 @@ static inline bool TypingAcceptedKey( int vk )
 		(vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
 		|| vk == VK_SPACE || vk == VK_OEM_COMMA || vk == VK_OEM_PERIOD || vk == VK_OEM_MINUS || vk == VK_OEM_7 || vk == VK_BACK;
 }
-static void PollTyping( bool active )
+
+static bool IsMenuOpen();
+static void PollTyping( int vk )
 {
-	// TODO: use events instead of polling & differentiating.
-	static bool was[256] = { false, };
+	if ( !IsMenuOpen() || !GameHasFocus() ) return;
+
 	const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 
-	for ( int vk = 0x08; vk < 0xE0; vk++ ) {
-		if ( !TypingAcceptedKey(vk) ) continue;
+	if ( !TypingAcceptedKey(vk) ) return;
 
-		bool down = active && (GetAsyncKeyState(vk) & 0x8000) != 0;
-		if ( down && !was[vk] ) {
-			if ( ctrl ) {
-				if ( vk == 'V' ) InterlockedIncrement( &g_menuPaste );
-				if ( vk == 'C' ) InterlockedIncrement( &g_menuCopy );
-			}
-			else if ( g_menuTyping ) {
-				char c = 0;
-				if ( vk == VK_OEM_COMMA ) c = ',';
-				else if ( vk == VK_OEM_PERIOD ) c = '.';
-				else if ( vk == VK_OEM_MINUS ) c = '-';
-				else if ( vk == VK_OEM_7 ) c = '\'';
-				else if ( vk == '1' && shift ) c = '!';
-				else if ( vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9 ) c = (char) ('0' + vk - VK_NUMPAD0);
-				else if ( vk == '3' && shift ) c = '#';
-				else if ( vk == '9' && shift ) c = '(';
-				else if ( vk == '0' && shift ) c = ')';
-				else if ( vk >= 'A' && vk <= 'Z' ) c = (char) (vk - 'A' + (shift ? 'A' : 'a'));
-				else c = (char) vk;
-				AddTyped( c );
-			}
-		}
-		was[vk] = down;
+	if ( ctrl ) {
+		if ( vk == 'V' ) InterlockedIncrement( &g_menuPaste );
+		if ( vk == 'C' ) InterlockedIncrement( &g_menuCopy );
+	}
+	else if ( g_menuTyping ) {
+		char c = 0;
+		if      ( vk == VK_OEM_COMMA )  c = ',';
+		else if ( vk == VK_OEM_PERIOD ) c = '.';
+		else if ( vk == VK_OEM_MINUS )  c = '-';
+		else if ( vk == VK_OEM_7 )      c = '\'';
+		else if ( vk == '1' && shift )  c = '!';
+		else if ( vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9 ) c = (char) ('0' + vk - VK_NUMPAD0);
+		else if ( vk == '3' && shift )  c = '#';
+		else if ( vk == '9' && shift )  c = '(';
+		else if ( vk == '0' && shift )  c = ')';
+		else if ( vk >= 'A' && vk <= 'Z' ) c = (char) (vk - 'A' + (shift ? 'A' : 'a'));
+		else c = (char) vk;
+		AddTyped( c );
 	}
 }
 
@@ -2316,7 +2333,7 @@ static DWORD WINAPI HotkeyThread( void* )
 			}
 			menuDown[i] = down;
 		}
-		PollTyping( menu );
+		//PollTyping( menu );
 		Sleep( 15 );
 	}
 	return 0;
@@ -3138,117 +3155,6 @@ static void OpenChooser()
 	mp_log( "[EM] Choosing an emote : %s, slot %d.\n", g_emoteWheels[g_editWheel].name, g_ringSlot + 1 );
 }
 
-static void EmotesPage()
-{
-	if ( g_editWheel >= g_wheelCount ) g_editWheel = g_wheelCount - 1;
-	if ( g_editWheel < 0 ) g_editWheel = 0;
-	EmoteWheel& wheel = g_wheels[g_editWheel];
-	if ( g_armed && GetTickCount() - g_armedAt > 4000 ) g_armed = 0;
-	if ( !g_chooser ) {
-		g_previewWant = -2;
-		const char* names[MAX_WHEELS];
-		for ( int w = 0; w < g_wheelCount; w++ ) names[w] = g_wheels[w].name[0] ? g_wheels[w].name : "(no name)";
-		if ( g_menu.Choice( "Wheel", &g_editWheel, names, g_wheelCount,
-			"The wheel shown below. In the game, R1 (Tab on the keyboard) goes from one wheel to the next." ) ) g_armed = 0;
-		if ( g_menu.TextField( "Name", wheel.name, WHEEL_NAME_SIZE, "(no name)", "Its name, in the middle of the wheel. Enter, type it, Enter." ) ) SaveSettings();
-		const char* slots[WHEEL_SLOTS];
-		for ( int i = 0; i < WHEEL_SLOTS; i++ ) slots[i] = wheel.slot[i] >= 0 ? EMOTES[wheel.slot[i]].name : 0;
-		int from = 0;
-		switch ( g_menu.Ring( slots, &g_ringSlot, wheel.name, &from,
-			"Enter or a click : choose this slot's emote.  Left / Right : go round.  Delete : empty it.  Shift + Left / Right : move it round." ) ) {
-		case Menu::RING_CHOOSE:
-			OpenChooser();
-			break;
-		case Menu::RING_CLEAR:
-			wheel.slot[g_ringSlot] = -1;
-			SaveSettings();
-			break;
-		case Menu::RING_SWAP: {
-			int moved = wheel.slot[from];
-			wheel.slot[from] = wheel.slot[g_ringSlot];
-			wheel.slot[g_ringSlot] = moved;
-			SaveSettings();
-			break;
-		}
-		}
-		if ( g_wheelCount < MAX_WHEELS && g_menu.Action( "+ New wheel", "Another wheel, empty, to fill (up to 4)." ) ) {
-			EmoteWheel& added = g_wheels[g_wheelCount];
-			sprintf_s( added.name, "Wheel %d", g_wheelCount + 1 );
-			for ( int i = 0; i < WHEEL_SLOTS; i++ ) added.slot[i] = -1;
-			g_editWheel = g_wheelCount++;
-			g_armed = 0;
-			SaveSettings();
-		}
-		if ( g_menu.Action( g_armed == 1 ? "Reset this wheel : press again" : "Reset this wheel",
-			"Puts it back as it was at first (Party and Silly; the others empty). Press twice." ) ) {
-			if ( g_armed == 1 ) {
-				char name[WHEEL_NAME_SIZE];
-				strcpy_s( name, wheel.name );
-				DefaultWheel( g_editWheel );
-				if ( g_editWheel >= 2 ) strcpy_s( wheel.name, name );
-				g_armed = 0;
-				SaveSettings();
-				Toast( "Wheel reset" );
-			}
-			else { g_armed = 1; g_armedAt = GetTickCount(); }
-		}
-		if ( g_wheelCount > 1 && g_menu.Action( g_armed == 2 ? "Delete this wheel : press again" : "Delete this wheel", "Gone for good. Press twice." ) ) {
-			if ( g_armed == 2 ) {
-				for ( int w = g_editWheel; w < g_wheelCount - 1; w++ ) g_wheels[w] = g_wheels[w + 1];
-				g_wheelCount--;
-				if ( g_editWheel >= g_wheelCount ) g_editWheel = g_wheelCount - 1;
-				if ( g_wheelIndex >= g_wheelCount ) g_wheelIndex = 0;
-				g_armed = 0;
-				SaveSettings();
-				Toast( "Wheel deleted" );
-			}
-			else { g_armed = 2; g_armedAt = GetTickCount(); }
-		}
-		return;
-	}
-
-	// Choosing : the menu at the left, the preview at the right.
-	g_menu.SetKeys( "Enter : choose    Esc : back    Mouse : click, wheel" );
-	char title[64];
-	sprintf_s( title, "Choose an emote for %s, slot %d", wheel.name, g_ringSlot + 1 );
-	g_menu.Info( title, 0, Menu::GOLD );
-	if ( g_menu.TextField( "Search", g_emoteSearch, sizeof(g_emoteSearch), "(Enter to type)",
-		"Only the emotes with this in their name. Enter, type, Enter." ) ) g_listCursor = g_listScroll = 0;
-	static const char* categories[2 + NUM_EMOTE_CATEGORIES];
-	categories[0] = "Favourites";
-	categories[1] = "All";
-	for ( int i = 0; i < NUM_EMOTE_CATEGORIES; i++ ) categories[2 + i] = EMOTE_CATEGORIES[i];
-	if ( g_menu.Choice( "Category", &g_emoteCategory, categories, 2 + NUM_EMOTE_CATEGORIES,
-		"Favourites : the ones picked out for dancing and fooling about. All : every one of Harry's animations." ) ) g_listCursor = g_listScroll = 0;
-	static int items[NUM_EMOTES + 1];
-	static const char* names[NUM_EMOTES + 1];
-	static const char* tags[NUM_EMOTES + 1];
-	int n = 0;
-	items[n] = -1; names[n] = "Empty slot"; tags[n] = ""; n++;
-	for ( int e = 0; e < NUM_EMOTES; e++ ) {
-		if ( !EmoteMatches( e ) ) continue;
-		items[n] = e;
-		names[n] = EMOTES[e].name;
-		tags[n] = EMOTES[e].intro ? "chain" : EMOTES[e].loops ? "loop" : "once";
-		n++;
-	}
-	if ( g_listWant != -2 ) {
-		for ( int i = 0; i < n; i++ ) if ( items[i] == g_listWant ) g_listCursor = i;
-		g_listWant = -2;
-	}
-	if ( g_menu.List( names, tags, n, &g_listCursor, &g_listScroll, 8,
-		"once : plays, then it's over. loop : plays until you move. chain : a start, then a loop until you move." ) ) {
-		int e = items[g_listCursor];
-		wheel.slot[g_ringSlot] = e;
-		mp_log( "[EM] %s, slot %d : %s.\n", wheel.name, g_ringSlot + 1, e >= 0 ? EMOTES[e].name : "empty" );
-		SaveSettings();
-		g_chooser = false;
-	}
-	if ( g_menu.Back() ) g_chooser = false;
-	g_previewWant = g_chooser && g_listCursor >= 0 && g_listCursor < n ? items[g_listCursor] : -2;
->>>>>>> multiplayer
-}
-
 static void HandleHotkeys( EIHarry* harry )
 {
 	bool f7 = InterlockedExchange( &g_reqDelay, 0 ) != 0;
@@ -3297,7 +3203,7 @@ static void WriteBmp( const char* name, int w, int h, const void* bits )
 // Foreground : grabs the game window's client area from the screen.
 static void GrabScreen( const char* name )
 {
-	HWND wnd = *((HWND*) HWND_GAME_WINDOW);
+	HWND wnd = *HWND_GAME_WINDOW;
 	RECT rc;
 	GetClientRect( wnd, &rc );
 	POINT origin = { 0, 0 };
@@ -4030,6 +3936,8 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 {
 	EIHarry_Tick( self );
 
+	HookGameWindowProc();
+
 	g_harryTickAt = GetTickCount();
 	if ( InterlockedIncrement(&g_harryTicks) == 1 ) {
 		mp_log( "[MP] Harry tick hook is running (this 0x%.8X, global Harry 0x%.8X).\n", self, Gizmod::getHarry() );
@@ -4680,14 +4588,12 @@ static void EmotesPage()
 		for ( int w = 0; w < g_wheelCount; w++ ) names[w] = g_emoteWheels[w].name[0] ? g_emoteWheels[w].name : "(no name)";
 		if ( g_menu.Choice( "Wheel", &g_editWheel, names, g_wheelCount,
 			"The wheel shown below. In the game, R1 (Tab on the keyboard) goes from one wheel to the next." ) ) g_armed = 0;
-		if ( g_menu.TextField("Name", wheel.name, WHEEL_NAME_SIZE, "(no name)", "Its name, in the middle of the wheel. Enter, type it, Enter.") )
-			SaveSettings();
+		if ( g_menu.TextField( "Name", wheel.name, WHEEL_NAME_SIZE, "(no name)", "Its name, in the middle of the wheel. Enter, type it, Enter." ) ) SaveSettings();
 		const char* slots[WHEEL_SLOTS];
-		for ( int i = 0; i < WHEEL_SLOTS; i++ )
-			slots[i] = wheel.slot[i] >= 0 ? EMOTES[wheel.slot[i]].name : 0;
+		for ( int i = 0; i < WHEEL_SLOTS; i++ ) slots[i] = wheel.slot[i] >= 0 ? EMOTES[wheel.slot[i]].name : 0;
 		int from = 0;
-		switch ( g_menu.Ring(slots, &g_ringSlot, wheel.name, &from, "Enter or a click : choose this slot's emote.  Left / Right : go round.  Delete : empty it.  Shift + Left / Right : move it round.") )
-		{
+		switch ( g_menu.Ring( slots, &g_ringSlot, wheel.name, &from,
+			"Enter or a click : choose this slot's emote.  Left / Right : go round.  Delete : empty it.  Shift + Left / Right : move it round." ) ) {
 		case Menu::RING_CHOOSE:
 			OpenChooser();
 			break;
@@ -4740,18 +4646,18 @@ static void EmotesPage()
 	}
 
 	// Choosing : the menu at the left, the preview at the right.
-	g_menu.SetKeys( "Enter : choose    Esc : back    Mouse : click" );
+	g_menu.SetKeys( "Enter : choose    Esc : back    Mouse : click, wheel" );
 	char title[64];
 	sprintf_s( title, "Choose an emote for %s, slot %d", wheel.name, g_ringSlot + 1 );
 	g_menu.Info( title, 0, Menu::GOLD );
-	if ( g_menu.TextField("Search", g_emoteSearch, sizeof(g_emoteSearch), "(Enter to type)", "Only the emotes with this in their name. Enter, type, Enter.") )
-		g_listCursor = g_listScroll = 0;
+	if ( g_menu.TextField( "Search", g_emoteSearch, sizeof(g_emoteSearch), "(Enter to type)",
+		"Only the emotes with this in their name. Enter, type, Enter." ) ) g_listCursor = g_listScroll = 0;
 	static const char* categories[2 + NUM_EMOTE_CATEGORIES];
 	categories[0] = "Favourites";
 	categories[1] = "All";
 	for ( int i = 0; i < NUM_EMOTE_CATEGORIES; i++ ) categories[2 + i] = EMOTE_CATEGORIES[i];
-	if ( g_menu.Choice("Category", &g_emoteCategory, categories, 2 + NUM_EMOTE_CATEGORIES, "Favourites : the ones picked out for dancing and fooling about. All : every one of Harry's animations.") )
-		g_listCursor = g_listScroll = 0;
+	if ( g_menu.Choice( "Category", &g_emoteCategory, categories, 2 + NUM_EMOTE_CATEGORIES,
+		"Favourites : the ones picked out for dancing and fooling about. All : every one of Harry's animations." ) ) g_listCursor = g_listScroll = 0;
 	static int items[NUM_EMOTES + 1];
 	static const char* names[NUM_EMOTES + 1];
 	static const char* tags[NUM_EMOTES + 1];
@@ -4807,7 +4713,7 @@ static void DrawMenu( float sw, float sh, float h )
 	// The mouse, in the overlay's pixels (the window may be scaled).
 	bool cursorShown = true;
 	{
-		HWND wnd = *((HWND*) HWND_GAME_WINDOW);
+		HWND wnd = *HWND_GAME_WINDOW;
 		POINT p;
 		RECT rc;
 		if ( wnd && GameHasFocus() && GetCursorPos(&p) && ScreenToClient(wnd, &p) && GetClientRect(wnd, &rc) && rc.right > 0 && rc.bottom > 0 ) {
@@ -4827,7 +4733,6 @@ static void DrawMenu( float sw, float sh, float h )
 	lastX = in.mouseX; lastY = in.mouseY; lastDown = in.mouseDown;
 
 	// The wheel : whole notches (smaller steps add up).
-	HookGameWindowWheel( *((HWND*) HWND_GAME_WINDOW) );
 	static LONG wheelRest = 0;
 	wheelRest += InterlockedExchange( &g_menuWheel, 0 );
 	in.wheel = wheelRest / WHEEL_DELTA;
