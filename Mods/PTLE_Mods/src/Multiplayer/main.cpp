@@ -3558,6 +3558,8 @@ static bool HookPresent()
 // Input hooks (keyboard + gamepad).
 //
 
+#include <dinput.h>
+
 // The game polls the keyboard (0x6E8A80, called from 0x663BBE) through DirectInput
 // in foreground mode : the keys down now at 0x940EC0, a frame earlier at 0x940C90
 // (all up while the window isn't in front). In background autotests the keys come
@@ -3571,16 +3573,14 @@ static const uint32_t POLL_KEYBOARD_CALL = 0x663BBE, POLL_GAMEPAD_CALL = 0x663BA
 // The state is a DIJOYSTATE2 (0x110 bytes, 0x940B78 + index * 0x110; the game
 // keeps the one before at 0x940DA8 + ...) : the d-pad is the hat at +0x20 (hundredths
 // of a degree, 0xFFFF... : centred), the buttons at +0x30.
-static const int DIRECTINPUT_GAMEPAD_SIZE = 0x110;
-typedef uint8_t GamepadState[DIRECTINPUT_GAMEPAD_SIZE];
-static GamepadState g_gamepadSeen;   // The last state polled (the Keys page reads its buttons).
+static DIJOYSTATE2 g_gamepadSeen;   // The last state polled (the Keys page reads its buttons).
 static bool g_padSeenAny = false;
 
 static bool g_inputBlocked = false;   // Should all input to the game be blocked (e.g. when F1 menu brought up).
 
 // Custom in-game handlers (when not in menu).
 static void CustomGameInput_Keyboard( uint8_t* keys );
-static void CustomGameInput_Gamepad( GamepadState pad );
+static void CustomGameInput_Gamepad( DIJOYSTATE2* pad );
 
 
 // DirectInput key code of a virtual key (the arrows are "extended" keys).
@@ -3609,20 +3609,20 @@ static void PollKeyboard_Hook()
 	}
 }
 
-static const auto POLL_GAMEPAD_ORIGINAL = (GamepadState* (__cdecl*)(int)) 0x6E8660;
-static GamepadState* __cdecl PollGamepad_Hook( int index )
+static const auto POLL_GAMEPAD_ORIGINAL = (DIJOYSTATE2* (__cdecl*)(int)) 0x6E8660;
+static DIJOYSTATE2* __cdecl PollGamepad_Hook( int index )
 {
-	GamepadState* state = POLL_GAMEPAD_ORIGINAL( index );
+	DIJOYSTATE2* state = POLL_GAMEPAD_ORIGINAL( index );
 	if ( !state ) return 0;
 
-	memcpy( g_gamepadSeen, state, DIRECTINPUT_GAMEPAD_SIZE );
+	memcpy( &g_gamepadSeen, state, sizeof(DIJOYSTATE2) );
 	g_padSeenAny = true;
 
 	if ( g_inputBlocked ) {
 		return 0;
 	}
 	else {
-		CustomGameInput_Gamepad( g_gamepadSeen );
+		CustomGameInput_Gamepad( &g_gamepadSeen );
 		return state;
 	}
 }
@@ -3652,7 +3652,6 @@ static void InstallInputHooks()
 // arrows, Tab, 1-8). While Harry emotes, any other button or key, or the left stick,
 // ends it (a chain plays its ending first).
 // --------------------------------------------------------------------------------
-static const int PAD_HAT = 0x20, PAD_BUTTONS = 0x30;
 static const int PAD_R1 = 5;
 static const int DIK_ARROWS[4] = { 0xC8, 0xD0, 0xCB, 0xCD };   // DirectInput key codes : up, down, left, right.
 
@@ -3689,7 +3688,7 @@ bool EmoteWheelShown()
 	return g_wheelUi.open && !g_wheelUi.done && (g_wheelUi.shown || NetNowMs() - g_wheelUi.since >= WHEEL_SHOW_MS);
 }
 
-void EmoteWheelOpen( const uint8_t* pad )
+void EmoteWheelOpen( const DIJOYSTATE2* pad )
 {
 	memset( &g_wheelUi, 0, sizeof(g_wheelUi) );
 	g_wheelUi.open = true;
@@ -3699,7 +3698,7 @@ void EmoteWheelOpen( const uint8_t* pad )
 	if ( g_wheelIndex >= g_wheelCount ) g_wheelIndex = 0;
 	if ( pad ) {
 		for ( int i = 0; i < 8; i++ ) g_wheelUi.centre[i] = ((const LONG*) pad)[i];
-		g_wheelUi.r1Was = (pad[PAD_BUTTONS + PAD_R1] & 0x80) != 0;
+		g_wheelUi.r1Was = (pad->rgbButtons[PAD_R1] & 0x80) != 0;
 		mp_log( "[EM] Wheel opened (controller; axes %ld %ld %ld %ld %ld %ld).\n", g_wheelUi.centre[0], g_wheelUi.centre[1], g_wheelUi.centre[2],
 			g_wheelUi.centre[3], g_wheelUi.centre[4], g_wheelUi.centre[5] );
 	}
@@ -3741,13 +3740,13 @@ static int WedgeAt( float dx, float dy )
 	return ((int) floorf( (a + 0.3926991F) / 0.7853982F )) % WHEEL_SLOTS;
 }
 
-static void Emote_Gamepad( GamepadState state )
+static void Emote_Gamepad( DIJOYSTATE2* state )
 {
 	LONG* axes = (LONG*) state;
-	uint8_t* buttons = state + PAD_BUTTONS;
+	uint8_t* buttons = state->rgbButtons;
 	static bool big[8] = { false, };   // The axis goes 0 .. 65535 (or so), not -1000 .. 1000.
 	for ( int i = 0; i < 8; i++ ) if ( axes[i] > 1100 || axes[i] < -1100 ) big[i] = true;
-	DWORD hat = *(DWORD*) (state + PAD_HAT);
+	DWORD hat = state->rgdwPOV[0];
 	bool hatCentred = LOWORD( hat ) == 0xFFFF;
 	bool held = g_emoteButton >= 0 && g_emoteButton < 32 && (buttons[g_emoteButton] & 0x80);
 	bool r1 = (buttons[PAD_R1] & 0x80) != 0;
@@ -3804,7 +3803,7 @@ static void Emote_Gamepad( GamepadState state )
 		if ( hold ) {   // (The camera still turns.)
 			axes[0] = rest[0]; axes[1] = rest[1];
 			for ( int b = 0; b < 32; b++ ) if ( !IsCameraButton( b ) ) buttons[b] = 0;
-			*(DWORD*) (state + PAD_HAT) = 0xFFFFFFFF;
+			state->rgdwPOV[0] = 0xFFFFFFFF;
 		}
 	}
 	// The right stick reaches with Harry's arm (and aims some items) : not while it points
@@ -3899,24 +3898,33 @@ static void RoleSwap_Keyboard( uint8_t* keys )
 	bool any = false;
 	for ( int i = 0; i < 4; i++ ) any |= (keys[DIK_ARROWS[i]] & 0x80) != 0;
 	static bool wasLeft = false, wasRight = false, masking = false;
-	if ( !PlayingHs() ) { wasLeft = left; wasRight = right; masking = false; return; }
-	if ( held && ((left && !wasLeft) || (right && !wasRight)) ) HsToggleRole( "keyboard" );
+	if ( !PlayingHs() ) {
+		wasLeft = left;
+		wasRight = right;
+		masking = false;
+		return;
+	}
+	if ( held && ((left && !wasLeft) || (right && !wasRight)) )
+		HsToggleRole( "keyboard" );
 	wasLeft = left; wasRight = right;
 	if ( held ) masking = true;
 	if ( masking ) {
-		if ( !held && !any ) masking = false;
-		else for ( int i = 0; i < 4; i++ ) keys[DIK_ARROWS[i]] = 0;
+		if ( !held && !any )
+			masking = false;
+		else
+			for ( int i = 0; i < 4; i++ )
+				keys[DIK_ARROWS[i]] = 0;
 	}
 }
 
-static void RoleSwap_Gamepad( GamepadState state )
+static void RoleSwap_Gamepad( DIJOYSTATE2* state )
 {
-	DWORD& hat = *(DWORD*) (state + PAD_HAT);
+	DWORD& hat = state->rgdwPOV[0];
 	bool centred = LOWORD( hat ) == 0xFFFF;
 	int dir = 0;   // -1 : left, 1 : right.
 	if ( !centred && hat > 4500 && hat < 13500 ) dir = 1;
 	if ( !centred && hat > 22500 && hat < 31500 ) dir = -1;
-	bool held = g_swapButton >= 0 && g_swapButton < 128 && (state[PAD_BUTTONS + g_swapButton] & 0x80);
+	bool held = g_swapButton >= 0 && g_swapButton < 128 && (state->rgbButtons[g_swapButton] & 0x80);
 	static int lastDir = 0;
 	static bool masking = false;
 	if ( !PlayingHs() ) {
@@ -3939,7 +3947,7 @@ static void CustomGameInput_Keyboard( uint8_t* keys )
 	RoleSwap_Keyboard( keys );
 }
 
-static void CustomGameInput_Gamepad( GamepadState pad )
+static void CustomGameInput_Gamepad( DIJOYSTATE2* pad )
 {
 	Emote_Gamepad( pad );
 	RoleSwap_Gamepad( pad );
@@ -4543,7 +4551,7 @@ static void PollBinding()
 	else {
 		int down = -1;
 		for ( int b = 0; g_padSeenAny && b < 32; b++ ) {
-			if ( g_gamepadSeen[PAD_BUTTONS + b] & 0x80 ) {
+			if ( g_gamepadSeen.rgbButtons[b] & 0x80 ) {
 				down = b;
 				break;
 			}
