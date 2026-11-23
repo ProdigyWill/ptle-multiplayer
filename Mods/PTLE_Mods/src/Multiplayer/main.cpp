@@ -1037,7 +1037,6 @@ struct SpawnedPuppet { EIEvilHarryP* beast; ERLevel* world; int owner; bool repo
 static const int MAX_SPAWNED = 32;
 static SpawnedPuppet g_spawned[MAX_SPAWNED];
 static int g_spawnedCount = 0;
-static volatile LONG g_orphansFound = 0;
 
 static void RememberSpawned( EIEvilHarryP* beast, ERLevel* world, int owner )
 {
@@ -1737,7 +1736,6 @@ const int NUM_CAMERA_LOOKAT_CALLS = sizeof(CAMERA_LOOKAT_CALLS) / sizeof(CAMERA_
 static const LookAtFunc CameraLookAt = (LookAtFunc) 0x6EE560;
 Matrix4f g_cameraWorld;
 bool g_haveCamera = false;
-static uint32_t g_cameraFrame = 0;          // g_presentCount when g_cameraWorld was last set.
 uint32_t g_cameraSite = 0;           // The call that built it.
 static Matrix4f* g_mainCamera = 0;          // What the usual call (0x449B9A) writes.
 static uint32_t g_mainCameraFrame = 0;
@@ -1763,7 +1761,6 @@ static Matrix4f* __fastcall CameraLookAt_Hook( Matrix4f* self, void*, Vector3f* 
 	else if ( g_mainCameraFrame == g_presentCount ) return m;   // The main camera is this frame's.
 	g_cameraWorld = *m;
 	g_haveCamera = true;
-	g_cameraFrame = g_presentCount;
 	g_cameraSite = site;
 	if ( g_tagDiagOn ) {
 		if ( g_tagDiag.lookAtsThisFrame < 4 ) g_tagDiag.eyes[g_tagDiag.lookAtsThisFrame] = *eye;
@@ -2130,7 +2127,6 @@ static volatile LONG g_menuOpen = 0;         // For the hotkey thread and the ke
 static SRWLOCK g_typedLock = SRWLOCK_INIT;
 static char g_typedChars[64];
 static volatile LONG g_menuTyping = 0, g_menuPaste = 0, g_menuCopy = 0;
-static DWORD g_lastCopied = 0;
 
 void AddTyped( char c )
 {
@@ -2315,8 +2311,6 @@ static void ProcessMenuKey( int vk, bool repeat )
 	static const int MENU_SLOT[NUM_MENU_VK] = { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_DELETE, MK_PGUP, MK_PGDN };
 
 	if ( !g_menuOpen || !GameHasFocus() ) return;
-
-	const DWORD now = GetTickCount();
 
 	const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 	for ( int i = 0; i < NUM_MENU_VK; i++ ) {
@@ -4084,13 +4078,11 @@ static bool HandleOrphan( EIEvilHarryP* self )
 			owner.beast = self;
 			owner.lastLoggedState = owner.lastRequested = -2;
 			owner.shownOutfit = -1;
-			InterlockedIncrement( &g_orphansFound );
 			mp_log( "[MP] Player %d's old puppet 0x%.8X ticked with nobody driving it : given back to them.\n", s.owner, self );
 			return false;
 		}
 		if ( !s.reported ) {
 			s.reported = true;
-			InterlockedIncrement( &g_orphansFound );
 			mp_log( "[MP] Player %d's old puppet 0x%.8X ticked with nobody driving it, and they have another : hidden.\n", s.owner, self );
 		}
 		Vector3f away = { self->EIBeast::m_position.x, self->EIBeast::m_position.y, -5000.0F };
@@ -4938,10 +4930,8 @@ static void DrawMenu( float sw, float sh, float h )
 	}
 	g_menu.End();
 	InterlockedExchange( &g_menuTyping, g_menu.IsTyping() ? 1 : 0 );
-	if ( const char* copy = g_menu.CopyText() ) {
+	if ( const char* copy = g_menu.CopyText() )
 		WriteClipboard( copy );
-		g_lastCopied = GetTickCount();
-	}
 
 	// Our own pointer where the game hides Windows'.
 	if ( in.mouseInside && !cursorShown ) {
