@@ -87,6 +87,7 @@
     <ClCompile Include="net\remote.cpp" />
     <ClCompile Include="net\transport.cpp" />
     <ClCompile Include="net\udp_transport.cpp" />
+    <ClCompile Include="tests.cpp" />
     <ClCompile Include="util\MatrixUtils.cpp" />
   </ItemGroup>
   <ItemGroup>

@@ -1,6 +1,7 @@
 #include "HideAndSeek.h"
 
 #include "Multiplayer.h"
+#include "tests.h"
 
 #include "net/transport.h"
 
@@ -30,11 +31,11 @@ static uint32_t g_lastCatchHeard[MAX_PEERS];   // Each hider's last catch number
 // Names : printable ASCII only (the font has nothing else), never empty.
 // The hide time's file : %LOCALAPPDATA%\PTLE Multiplayer\hide-time.txt, the total in
 // milliseconds (the autotests keep theirs in hide-time-autotest.txt).
-static void HideTimePath( char* path )   // MAX_PATH.
+void HideTimePath( char* path )
 {
 	path[0] = 0;
 	if ( GetDataDir(path) )
-		strcat_s( path, MAX_PATH, "\\hide-time.txt" );
+		strcat_s( path, MAX_PATH, g_autotest ? "\\hide-time-autotest.txt" : "\\hide-time.txt" );
 }
 
 static bool g_hideTimeLoaded = false;
@@ -73,6 +74,7 @@ void HsReceiveCaught( int player, int seeker, int seq, int me )
 
 	g_lastCatchHeard[player] = seq;
 	g_players[player].role = ROLE_SEEKER;   // (Their next info says so too.)
+	TestHsHeardCatch( player, seeker );
 
 	const char* playerName = PlayerName( player );
 	const char* seekerName = PlayerName( seeker );
@@ -142,6 +144,7 @@ void HsUpdate( EIHarry* harry )
 {
 	HideTick();
 	CheckCaught( harry );
+	TestHsTick( harry );
 }
 
 void HsEnter()

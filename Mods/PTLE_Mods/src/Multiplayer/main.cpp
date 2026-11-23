@@ -117,7 +117,7 @@ static inline Logger* logger() { return Gizmod::getInstance()->getLogger(); }
 // --------------------------------------------------------------------------------
 static FILE* g_logFile = 0;
 static CRITICAL_SECTION g_logLock;
-static char g_logDir[MAX_PATH] = { 0, };
+char g_logDir[MAX_PATH] = { 0, };
 
 // %LOCALAPPDATA%\PTLE Multiplayer (created) : what the mod writes goes there.
 bool GetDataDir( char* path )
@@ -285,9 +285,8 @@ static LONG CALLBACK CrashLogger( EXCEPTION_POINTERS* e )
 
 // Game modes (F1 -> Gamemodes; Multiplayer.ini, [Gamemodes] Mode). Off : just
 // see each other.
-enum { MODE_OFF, MODE_HIDE_AND_SEEK, NUM_MODES };
 static const char* const MODE_NAMES[NUM_MODES] = { "Off", "Hide and seek" };
-static int g_gameMode = MODE_OFF;
+int g_gameMode = MODE_OFF;
 
 
 // Swapping roles without the menu : hold the controller button or the key, then
@@ -309,8 +308,8 @@ static_assert( sizeof(MP_VERSION) - 1 <= MAX_VERSION, "version too long" );
 
 
 
-static bool g_allowPuppetFreeze = false;
-static volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
+bool g_allowPuppetFreeze = false;
+volatile LONG g_puppetFreezesStopped = 0;     // Puppets kept out of the ice cube (ThrownFromWater_Hook).
 
 // Leaving a level (see NoteLevelLeaving) : the old one still runs and is shown.
 static bool g_levelLeaving = false;
@@ -330,9 +329,9 @@ static inline uint32_t ShownLevel()
 	return g_levelLeaving ? 0 : Gizmod::getCurrentLevelCRC();
 }
 
-static volatile LONG g_cropPending = 0;          // A cropped grab, taken in Present.
-static char g_cropName[64];
-static RECT g_crop;
+volatile LONG g_cropPending = 0;          // A cropped grab, taken in Present.
+char g_cropName[64];
+RECT g_crop;
 
 static PlayerSnapshot g_local;                 // Static storage keeps Matrix4f 16-byte aligned.
 static bool g_haveLocal = false;
@@ -348,7 +347,7 @@ PlayerInfo g_players[MAX_PEERS];
 // and the autotest work on (the first player heard from).
 static int g_mainId = -1;
 
-static Peer* MainPeer()
+Peer* MainPeer()
 {
 	return &g_peers[g_mainId >= 0 ? g_mainId : 0];
 }
@@ -368,28 +367,27 @@ static const uint32_t PAUSE_GRACE_MS = 3000;   // Unpaused, but no snapshot yet 
 // --------------------------------------------------------------------------------
 // Outfits.
 // --------------------------------------------------------------------------------
-struct Outfit { const char* name; uint32_t model; uint32_t cheatFlag; };
-static const Outfit OUTFITS[] = {
+const Outfit OUTFITS[] = {
 	{ "Harry",       0xC9252A08, 0 },
 	{ "Nicole",      0x7BBEDDE3, 0x90DA18 },
 	{ "Native",      0x182A7689, 0x90DA19 },
 	{ "Retro Harry", 0xBF8D2C68, 0x90DA1F },
 	{ "Snowy Harry", 0x94DB2F98, 0 },
 };
-static const int NUM_OUTFITS = countof(OUTFITS);
-static const int RETRO_OUTFIT = 3;
-static const int SNOWY_OUTFIT = 4;
+const int NUM_OUTFITS = countof(OUTFITS);
+const int RETRO_OUTFIT = 3;
+const int SNOWY_OUTFIT = 4;
 
 static uint32_t g_forceHarryModel = 0;   // The model Harry gets instead of the level's, when a level loads (0 : the level's).
-static const int OUTFIT_DEFAULT = -1;   // Chosen : whatever the level gives Harry.
-static int g_myOutfit = OUTFIT_DEFAULT;  // The one chosen (Multiplayer.ini, [Appearance] Outfit, by name) : worn from the next level load.
-static int g_myWornOutfit = 0;   // The one Harry wears now : what the others are told.
+const int OUTFIT_DEFAULT = -1;   // Chosen : whatever the level gives Harry.
+int g_myOutfit = OUTFIT_DEFAULT;  // The one chosen (Multiplayer.ini, [Appearance] Outfit, by name) : worn from the next level load.
+int g_myWornOutfit = 0;   // The one Harry wears now : what the others are told.
 
 // Retro Harry's colours. His model takes all its colour from a 32x32 texture of four
 // flat squares, so each player can have their own (see the Retro palette section).
 static const char* const RETRO_PART_NAMES[RETRO_PARTS] = { "Hair", "Head", "Shirt", "Pants" };   // In the menu, and the ini keys (RetroHair...).
 static const uint8_t RETRO_DEFAULT[RETRO_PARTS][3] = { { 142, 118, 62 }, { 255, 161, 123 }, { 78, 200, 74 }, { 0, 87, 0 } };
-static uint8_t g_myColors[RETRO_PARTS][3];   // Multiplayer.ini, [Appearance] RetroHair... (RRGGBB).
+uint8_t g_myColors[RETRO_PARTS][3];   // Multiplayer.ini, [Appearance] RetroHair... (RRGGBB).
 
 
 
@@ -440,16 +438,16 @@ static const char* LevelName( uint32_t crc )
 // for going through Harry's animations and noting what they are.
 // --------------------------------------------------------------------------------
 
-static bool g_animViewer = false;
-static Peer* g_viewerPeer = 0;          // The puppet it uses.
+bool g_animViewer = false;
+Peer* g_viewerPeer = 0;          // The puppet it uses.
 static Vector3f g_viewerPin;            // Where that puppet stands.
 
-static uint32_t g_animPreviewCRC = 0;   // The clip the puppet plays (0 : normal).
+uint32_t g_animPreviewCRC = 0;   // The clip the puppet plays (0 : normal).
 
 // The Emotes page's preview uses the same : g_viewerPeer, while it's choosing. Between
 // previews its puppet is parked out of sight (not drawn, far below), kept for the next.
-static bool g_emotePreview = false;
-static Peer* g_parkedPeer = 0;
+bool g_emotePreview = false;
+Peer* g_parkedPeer = 0;
 static Vector3f g_parkedPin;
 
 static bool IsParkedPeer( const Peer* p ) { return p && p == g_parkedPeer && !((g_animViewer || g_emotePreview) && p == g_viewerPeer); }
@@ -458,7 +456,7 @@ static bool IsViewerPeer( const Peer* p ) { return ((g_animViewer || g_emotePrev
 // The clip the current peer's puppet is made to play (survey, viewer), else 0.
 static uint32_t ForcedClip( const Peer* p )
 {
-	return IsViewerPeer( p ) ? g_animPreviewCRC : 0;
+	return (IsViewerPeer(p) || TestAnimSurveyOn()) ? g_animPreviewCRC : 0;
 }
 
 static Peer* FindPeerFromBeast( const EIEvilHarryP* beast )
@@ -503,7 +501,7 @@ static void ResetPeer( Peer* p, int id )   // Forgets them (their puppet is left
 
 
 static const int DELAY_CHOICES[] = { 133, 250, 500, 1000, 1500, 3000 };   // Playback delay (ms).
-static int g_delayIndex = 1;   // 250 ms (Multiplayer.ini : Delay).
+int g_delayIndex = 1;   // 250 ms (Multiplayer.ini : Delay).
 
 // The network side.
 Transport* g_transport = 0;
@@ -515,10 +513,7 @@ static uint32_t g_sendSequence = 0;
 static const uint32_t SEND_INTERVAL_MS = 33 - 8;
 static uint32_t g_lastSentTime = 0;
 static const uint32_t REMOTE_SILENT_MS = 5000; // Then : forget them.
-static struct NetStats {
-	uint32_t sent, sentBytes, maxBytes, tooBig, badPackets, otherPlayers;
-	float maxPackingError;
-} g_netStats;
+NetStats g_netStats;
 
 // The local snapshot written last : Harry's item draws (after his tick) add to it.
 static PlayerSnapshot* LatestSnapshot()
@@ -553,9 +548,11 @@ static void SendLocalSnapshot()
 	g_netStats.sent++;
 	g_netStats.sentBytes += length;
 	if ( (uint32_t) length > g_netStats.maxBytes ) g_netStats.maxBytes = length;
+
+	TestCheckPacking( g_local );
 }
 
-static void LogNetStats()
+void LogNetStats()
 {
 	const NetStats& n = g_netStats;
 	int shown = 0;
@@ -789,14 +786,14 @@ static const int      MAX_LAYER_SCAN  = 256;
 
 static const uint32_t* RENDER_FRAME   = (const uint32_t*) 0x91779C;   // Global frame counter.
 
-static Matrix4f* GetPose( EAnimController* animCtrl, int* bones )
+Matrix4f* GetPose( EAnimController* animCtrl, int* bones )
 {
 	ERCharacter* skeleton = animCtrl->m_characterResource;
 	*bones = skeleton ? skeleton->m_numBones : 0;
 	return animCtrl->m_pose;
 }
 
-static AnimLayer* GetAnimLayer( EICharacter* c, int key )
+AnimLayer* GetAnimLayer( EICharacter* c, int key )
 {
 	AnimLayer* layer = 0;
 	TreeMap* map = &c->m_animController.m_animMap;
@@ -804,14 +801,14 @@ static AnimLayer* GetAnimLayer( EICharacter* c, int key )
 	return layer;
 }
 
-static inline uint32_t GetLayerClipCRC( AnimLayer* layer ) { return layer->m_anim ? layer->m_anim->m_crc : 0; }
+uint32_t GetLayerClipCRC( AnimLayer* layer ) { return layer->m_anim ? layer->m_anim->m_crc : 0; }
 
 // Layer 217 holds a frozen pose (its clock never moves) that Harry blends from
 // when he switches item animations; mirroring it froze the puppet mid pull-out.
 static const int HOLD_POSE_LAYER = 217;
 
 // The clip a character is mostly showing : its highest-weight layer.
-static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight )
+uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight )
 {
 	uint32_t best = 0;
 	float bestWeight = 0.01F;
@@ -830,13 +827,13 @@ static uint32_t GetPlayingClip( EICharacter* c, int* outLayer, float* outWeight 
 }
 
 
-static ItemStruct* ITEM_TABLE = (ItemStruct*) 0x8EEB90;
+ItemStruct* ITEM_TABLE = (ItemStruct*) 0x8EEB90;
 static const int NUM_ITEMS = 9;
 
 #include "ptle/EItemBase.h"
-static inline EItemBase* GetItemObject( int index ) { return ITEM_TABLE[index].m_object; }
+EItemBase* GetItemObject( int index ) { return ITEM_TABLE[index].m_object; }
 
-static int GetHeldItem( EIHarry* harry )
+int GetHeldItem( EIHarry* harry )
 {
 	EInventory* inv = harry->m_inventory;
 	if ( !inv ) return -1;
@@ -849,7 +846,7 @@ static int GetHeldItem( EIHarry* harry )
 	return -1;
 }
 
-static void ApplyMyOutfit();
+void ApplyMyOutfit();
 
 static void KeepUndrawnItem( EIHarry* harry );
 
@@ -917,7 +914,7 @@ static void PushLocalSnapshot( EIHarry* harry )
 	g_haveLocal = true;
 }
 
-static const PlayerSnapshot* GetPuppetTarget( const Peer* peer )
+const PlayerSnapshot* GetPuppetTarget( const Peer* peer )
 {
 	if ( !peer->target && IsViewerPeer(peer) && g_haveLocal ) return &g_local;
 	return peer->target;
@@ -930,7 +927,7 @@ static const PlayerSnapshot* GetPuppetTarget( const Peer* peer )
 // --------------------------------------------------------------------------------
 
 // Index of a state by its short name ("idle left" matches "evil harry.idle left").
-static int FindStateIndex( EIBeast* beast, const char* shortName )
+int FindStateIndex( EIBeast* beast, const char* shortName )
 {
 	EBeastStateMachine* sm = beast->GetStateMachine();
 	if ( !sm || !sm->m_states ) return -1;
@@ -947,7 +944,7 @@ static char g_puppetName[] = "evil harry";
 static char* const GAME_EMPTY_STRING = (char*) 0x9410B0;   // The game strings' "" (0x6F047A).
 
 
-static int g_puppetsSpawned = 0;   // For the autotest.
+int g_puppetsSpawned = 0;   // For the autotest.
 
 static void RememberSpawned( EIEvilHarryP* beast, ERLevel* world, int owner );
 static void InitLocomotion( EIEvilHarryP* p, EIHarry* harry, Peer* peer );
@@ -1157,6 +1154,7 @@ static bool GetPuppetTargetPosition( Vector3f* out, Peer* peer )
 	out->x = t->position.x;
 	out->y = t->position.y;
 	out->z = t->position.z;
+	TestMovePuppetTarget( out );
 	return true;
 }
 
@@ -1165,9 +1163,9 @@ static bool GetPuppetTargetPosition( Vector3f* out, Peer* peer )
 // Locomotion : the puppet's animation and facing come from how its target moves
 // (later : how the remote player moves). x/y is the ground plane, z is up.
 // --------------------------------------------------------------------------------
-static const float MP_PI = 3.14159265F;
+const float MP_PI = 3.14159265F;
 
-static bool  g_autoLocomotion = true;   // F6 switches to hand-forced states.
+bool  g_autoLocomotion = true;   // F6 switches to hand-forced states.
 // The rest of the locomotion state is per puppet (Peer).
 static const int AIRBORNE_MIN_TICKS = 6;   // Slopes and bumps blip for up to ~5 ticks.
 static const float JUMP_RISE_SPEED  = 0.10F;   // Units per tick upward while off the ground.
@@ -1175,13 +1173,13 @@ static const float JUMP_RISE_SPEED  = 0.10F;   // Units per tick upward while of
 static const float RUN_START_SPEED = 0.05F;  // Units per tick (hysteresis).
 static const float RUN_STOP_SPEED  = 0.02F;
 // Harry's normal run measured about 0.36/tick (peaks near 0.44 on slopes).
-static const float SPRINT_START_SPEED = 0.50F;
+const float SPRINT_START_SPEED = 0.50F;
 static const float SPRINT_STOP_SPEED  = 0.45F;
 static const float TELEPORT_DIST   = 5.0F;   // Bigger jumps aren't movement.
 
 // Angle of the model's forward axis in its own frame (0 = +X, pi/2 = +Y).
 // +Y made it run backwards, so the model faces local -Y.
-static float g_forwardLocalAngle = -MP_PI / 2.0F;
+float g_forwardLocalAngle = -MP_PI / 2.0F;
 
 static void ResetLocomotion( Peer* peer )
 {
@@ -1301,7 +1299,7 @@ static void PlayAnimLayer( EIEvilHarryP* p, int layer )
 // etc. : Evil Harry's state clips have no ordinary jump). Two spare layers take
 // turns so the old clip can fade out while the new one fades in.
 static bool g_mirrorClips = true;
-static const int MIRROR_LAYERS[2] = { 200, 201 };
+const int MIRROR_LAYERS[2] = { 200, 201 };
 
 static bool ApplyMirroredClip( EIEvilHarryP* p, Peer* peer )
 {
@@ -1355,7 +1353,7 @@ static void SetRunAnimation( EIEvilHarryP* p, const char* stateName, Peer* peer 
 
 // Standing animation. 0 = the beast's quickdata idle (locomotion layer +1); the
 // "idle left/right" states' animation is the wall-climbing idle (pickaxes out).
-static void SetIdleAnimation( EIEvilHarryP* p, const char* stateName, Peer* peer )
+void SetIdleAnimation( EIEvilHarryP* p, const char* stateName, Peer* peer )
 {
 	if ( !stateName ) {
 		int base = p->m_locoBase;
@@ -1368,7 +1366,7 @@ static void SetIdleAnimation( EIEvilHarryP* p, const char* stateName, Peer* peer
 	}
 }
 
-static void SetAirAnimation( EIEvilHarryP* p, const char* stateName, Peer* peer )
+void SetAirAnimation( EIEvilHarryP* p, const char* stateName, Peer* peer )
 {
 	peer->airLayer = GetStateAnimLayer( p, FindStateIndex(p, stateName) );
 	mp_log( "[MP] Air animation : \"%s\" state's anim, layer %d.\n", stateName, peer->airLayer );
@@ -1461,7 +1459,7 @@ static void PrePositionPuppet( EIEvilHarryP* p, Peer* peer )
 // back; with it at 0 Harry walks straight through. (The collision layer masks at
 // +0x230/+0x564/+0x574/+0x584 made no difference, cleared or not.)
 // The puppet is only a visual, so it is never solid.
-static bool g_puppetSolid = false;                 // Autotest flips it to compare.
+bool g_puppetSolid = false;                 // Autotest flips it to compare.
 
 static inline void ApplyPuppetCollision( EIEvilHarryP* p )
 {
@@ -1469,7 +1467,7 @@ static inline void ApplyPuppetCollision( EIEvilHarryP* p )
 }
 
 // EInstance flags (offset 0x2C).
-static const uint32_t INSTANCE_VISIBLE = 0x1;
+const uint32_t INSTANCE_VISIBLE = 0x1;
 
 static inline void ShowModel( EInstance* model, bool show )
 {
@@ -1489,7 +1487,7 @@ static void ApplyPuppetItem( EIEvilHarryP* p )
 // the item keys, etc.), which mirroring his main clip alone can't. Done right
 // before the puppet renders, and marked posed for this frame so the game doesn't
 // pose it over them. (The mirrored clip still runs underneath.)
-static int g_puppetPoseCopies = 0;   // For the autotest.
+int g_puppetPoseCopies = 0;   // For the autotest.
 
 static void ApplyPuppetPose( EIEvilHarryP* p, const PlayerSnapshot* t )
 {
@@ -1535,9 +1533,9 @@ static const struct { int item; uint32_t vtable; uint32_t anim; uint32_t shown; 
 static const int NUM_DRAWN_ITEMS = sizeof(DRAWN_ITEMS) / sizeof(DRAWN_ITEMS[0]);
 static ItemDrawFunc g_origItemDraw[NUM_DRAWN_ITEMS];
 
-static int g_puppetItemDraws = 0;     // For the autotest.
-static int g_aimItemDraws = 0;
-static int g_copyDrawsAlone = 0;      // For the autotest : copies drawn while Harry draws no item.
+int g_puppetItemDraws = 0;     // For the autotest.
+int g_aimItemDraws = 0;
+int g_copyDrawsAlone = 0;      // For the autotest : copies drawn while Harry draws no item.
 static DWORD g_harryItemDrawTime = 0;
 
 static void NoteHarryItemDraw( int slot, EItemBase* item )
@@ -1686,6 +1684,7 @@ static void DrawPuppetItem( Peer* peer, int slot, void* context, void* arg )
 #define ITEM_DRAW_HOOK( n ) \
 	static void __fastcall ItemDraw_Hook##n( EItemBase* item, void*, void* context, void* arg ) \
 	{ \
+		if ( TestHidesHarryItem(item) ) return; \
 		g_origItemDraw[n]( item, context, arg ); \
 		NoteHarryItemDraw( n, item ); \
 	}
@@ -1708,9 +1707,9 @@ static_assert( sizeof(ITEM_DRAW_HOOKS) / sizeof(ITEM_DRAW_HOOKS[0]) == NUM_DRAWN
 // Name tags : where the top of a puppet's head lands on screen, from the camera
 // matrices the game rendered it with. Drawn when the frame is presented.
 // --------------------------------------------------------------------------------
-static const uint32_t RENDERER_DEVICE = 0x926790 + 0x74;
+const uint32_t RENDERER_DEVICE = 0x926790 + 0x74;
 static const float TAG_ABOVE_FEET = 5.6F;   // The top of Harry's head (measured on screenshots).
-static uint32_t g_presentCount = 1;
+uint32_t g_presentCount = 1;
 
 // The camera : the game builds its matrix each frame with a look-at (0x6EE560,
 // called from 0x449B9A : eye, target, up), the camera's own world matrix (it looks
@@ -1728,35 +1727,26 @@ static uint32_t g_presentCount = 1;
 // this frame. A frame where none was (a cutscene, its own camera) shows no tags.
 typedef Matrix4f* (__thiscall *LookAtFunc)( Matrix4f*, Vector3f*, Vector3f*, Vector3f* );
 static const uint32_t CAMERA_LOOKAT_CALL = 0x449B9A;
-static const uint32_t CAMERA_LOOKAT_CALLS[] = {
+const uint32_t CAMERA_LOOKAT_CALLS[] = {
 	0x449B9A, 0x449BC4, 0x456169, 0x457065, 0x457783, 0x457A58, 0x4582BE, 0x4584E7, 0x459A08, 0x45AC65,
 	0x45B30C, 0x45B6E7, 0x45B774, 0x45C9F2, 0x45D6B1, 0x45D956, 0x45E46D, 0x45E7E0, 0x460815, 0x4609BA,
 	0x460BDA, 0x461AF0, 0x461EE7, 0x462720, 0x4645D4, 0x465106, 0x4657AF, 0x466054, 0x46736F, 0x467C7D,
 	0x677851, 0x677B58,
 };
-static const int NUM_CAMERA_LOOKAT_CALLS = sizeof(CAMERA_LOOKAT_CALLS) / sizeof(CAMERA_LOOKAT_CALLS[0]);
+const int NUM_CAMERA_LOOKAT_CALLS = sizeof(CAMERA_LOOKAT_CALLS) / sizeof(CAMERA_LOOKAT_CALLS[0]);
 static const LookAtFunc CameraLookAt = (LookAtFunc) 0x6EE560;
-static Matrix4f g_cameraWorld;
-static bool g_haveCamera = false;
+Matrix4f g_cameraWorld;
+bool g_haveCamera = false;
 static uint32_t g_cameraFrame = 0;          // g_presentCount when g_cameraWorld was last set.
-static uint32_t g_cameraSite = 0;           // The call that built it.
+uint32_t g_cameraSite = 0;           // The call that built it.
 static Matrix4f* g_mainCamera = 0;          // What the usual call (0x449B9A) writes.
 static uint32_t g_mainCameraFrame = 0;
-static int g_cameraSiteCount[NUM_CAMERA_LOOKAT_CALLS];
+int g_cameraSiteCount[NUM_CAMERA_LOOKAT_CALLS];
 
 // Diagnostics (name tags near water) : the look-ats of the frame, and where the
 // puppet was drawn. Reset by the survey; logged per level.
-struct TagDiag
-{
-	int frames, lookAts, maxLookAts;
-	int drawsOnScreen, drawsElsewhere, behind, noted;
-	UINT elseW, elseH, screenW, screenH;
-	int lookAtsThisFrame;
-	Vector3f eyes[4];                 // This frame's look-ats (eye positions).
-	int sampleLogged;
-};
-static TagDiag g_tagDiag;
-static bool g_tagDiagOn = false;
+TagDiag g_tagDiag;
+bool g_tagDiagOn = false;
 
 static Matrix4f* __fastcall CameraLookAt_Hook( Matrix4f* self, void*, Vector3f* eye, Vector3f* target, Vector3f* up )
 {
@@ -1808,11 +1798,11 @@ static Matrix4f* __fastcall Perspective_Hook( Matrix4f* self, void*, float a, fl
 // The renderer's own view (what it draws with) : set through 0x64A480 (a view
 // matrix), 0x64A4C0 (a camera matrix) or 0x64A500 (a look-at), each keeping the
 // view at +0xB0 and the camera's matrix at +0xF0.
-static Matrix4f g_rendCam;
-static uint32_t g_rendFrame = 0, g_rendSets = 0, g_rendSetsThisFrame = 0, g_rendSetsMax = 0;
-static void* g_rendSelf = 0;
+Matrix4f g_rendCam;
+uint32_t g_rendFrame = 0, g_rendSets = 0, g_rendSetsThisFrame = 0, g_rendSetsMax = 0;
+void* g_rendSelf = 0;
 static Vector3f g_rendEyes[4];
-static int g_rendTwiceLogged = 0;
+int g_rendTwiceLogged = 0;
 static void NoteRendererView( void* self )
 {
 	if ( g_rendFrame != g_presentCount ) { g_rendSetsThisFrame = 0; g_rendFrame = g_presentCount; }
@@ -1856,7 +1846,7 @@ static void HookCamera()
 	if ( !hooked ) mp_log( "[MP] No camera call hooked : no name tags.\n" );
 }
 
-static int g_tagPasses[2] = { 0, 0 };   // Puppet draws elsewhere than to the screen, and to the screen (diagnostics).
+int g_tagPasses[2] = { 0, 0 };   // Puppet draws elsewhere than to the screen, and to the screen (diagnostics).
 
 static void NoteNameTag( Peer* peer, EIEvilHarryP* p )
 {
@@ -2046,10 +2036,10 @@ static const uint32_t DISTANCE_FADE_VTABLES[] = {   // Every vtable with it in t
 	0x8A1CF0, 0x8A2C70,
 };
 
-static volatile LONG g_fadesStopped = 0;
-static float g_lastPuppetFade = 1.0F;   // What the game wanted for a puppet (tests).
-static volatile LONG g_puppetFadeCalls = 0;
-static bool g_allowPuppetFade = false;
+volatile LONG g_fadesStopped = 0;
+float g_lastPuppetFade = 1.0F;   // What the game wanted for a puppet (tests).
+volatile LONG g_puppetFadeCalls = 0;
+bool g_allowPuppetFade = false;
 
 GET_METHOD( 0x41ED70, bool, EIBeast_DistanceFade, EIBeast*, float );
 static bool __stdcall _DistanceFade_Hook( EIBeast* self, float distance )
@@ -2124,17 +2114,16 @@ static void DrivePuppet( EIEvilHarryP* p, Peer* peer )
 // which window the game thinks it owns), and turned into requests the game
 // thread consumes in HandleHotkeys().
 static volatile LONG g_reqDelay = 0;
-static volatile LONG g_reqMenu = 0;
+volatile LONG g_reqMenu = 0;
 
-static bool g_showTags = true;    // Names above the other players.
+bool g_showTags = true;    // Names above the other players.
 // Name tags fade out with the camera distance, between these two (the menu's
 // sliders; Multiplayer.ini : Display, TagFadeFrom and TagFadeTo).
-static const int TAG_FADE_MAX = 1000, TAG_FADE_STEP = 10;
-static int g_tagFadeFrom = 100, g_tagFadeTo = 200;
-static bool g_showList = false;   // The player list stays on screen while playing.
+const int TAG_FADE_MAX = 1000, TAG_FADE_STEP = 10;
+int g_tagFadeFrom = 100, g_tagFadeTo = 200;
+bool g_showList = false;   // The player list stays on screen while playing.
 static char g_iniPath[MAX_PATH] = { 0, };
-enum { MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT, MK_ACCEPT, MK_BACK, MK_NEXT, MK_PREV, MK_DELETE, MK_PGUP, MK_PGDN, MK_SLEFT, MK_SRIGHT, MK_COUNT };
-static volatile LONG g_menuKeys[MK_COUNT];   // Presses, from the hotkey thread.
+volatile LONG g_menuKeys[MK_COUNT];   // Presses, from the hotkey thread.
 static volatile LONG g_menuOpen = 0;         // For the hotkey thread and the keyboard poll.
 
 // Typing into the menu (a colour) : characters from the hotkey thread.
@@ -2143,7 +2132,7 @@ static char g_typedChars[64];
 static volatile LONG g_menuTyping = 0, g_menuPaste = 0, g_menuCopy = 0;
 static DWORD g_lastCopied = 0;
 
-static void AddTyped( char c )
+void AddTyped( char c )
 {
 	AcquireSRWLockExclusive( &g_typedLock );
 	size_t n = strlen( g_typedChars );
@@ -2159,7 +2148,7 @@ static void TakeTyped( char* out, size_t size )
 	ReleaseSRWLockExclusive( &g_typedLock );
 }
 
-static HWND* const HWND_GAME_WINDOW   = (HWND*) 0x93ED60;
+HWND* const HWND_GAME_WINDOW   = (HWND*) 0x93ED60;
 
 static WNDPROC g_gameWndProc = 0;
 
@@ -2287,9 +2276,9 @@ static bool PollTyping( int vk )
 }
 
 // In-game hotkeys.
-static volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
+volatile LONG g_reqViewer = 0, g_reqStar = 0, g_reqPrev = 0, g_reqNext = 0, g_reqPrev10 = 0, g_reqNext10 = 0,
 g_reqReplay = 0, g_reqStarredOnly = 0;
-static volatile LONG g_harryTicks = 0;
+volatile LONG g_harryTicks = 0;
 
 static void ProcessHotkey( int vk )
 {
@@ -2369,18 +2358,10 @@ static bool MouseWheel( short delta )
 // The numbers are the animation survey's. Edited by hand (reloaded when it changes)
 // and by F11 (star). Clips found on Harry and not in it yet are added.
 // --------------------------------------------------------------------------------
-struct AnimNote
-{
-	int num;
-	uint32_t crc;
-	char source[24];
-	bool star;
-	char note[200];
-};
 static const int MAX_ANIM_NOTES = 1024;
-static AnimNote g_animNotes[MAX_ANIM_NOTES];
-static int g_animNoteCount = 0;
-static int g_animIndex = 0;
+AnimNote g_animNotes[MAX_ANIM_NOTES];
+int g_animNoteCount = 0;
+int g_animIndex = 0;
 static bool g_animStarredOnly = false;
 static char g_animNotesPath[MAX_PATH];
 static FILETIME g_animNotesTime;
@@ -2629,13 +2610,13 @@ static void HandleAnimViewer( EIHarry* harry )
 EmoteState g_emoteState;
 
 EmoteWheel g_emoteWheels[MAX_WHEELS];
-static int g_wheelCount = 0;
+int g_wheelCount = 0;
 static int g_emoteButton = 4;        // DirectInput button held for the wheel : L1 / LB.
 static bool g_emoteNeedsR1 = false;  // ... with R1 / RB too.
 static int g_emoteKey = 0x14;        // DirectInput key code : T.
-static int g_wheelIndex = 0;         // The wheel up in the game (kept between openings).
+int g_wheelIndex = 0;         // The wheel up in the game (kept between openings).
 
-static int FindEmoteByName( const char* name )
+int FindEmoteByName( const char* name )
 {
 	for ( int i = 0; name && i < NUM_EMOTES; i++ ) if ( _stricmp( EMOTES[i].name, name ) == 0 ) return i;
 	return -1;
@@ -2661,7 +2642,7 @@ static void EmoteCode( int e, char* out, size_t size )
 }
 
 // The wheels everyone starts with (Reset puts them back; the others start empty).
-static void MakeDefaultWheel( int w )
+void MakeDefaultWheel( int w )
 {
 	static const char* const PARTY[WHEEL_SLOTS] = { "Victory Dance", "Jig", "Running Man", "Breakdance", "Pickaxe Spin", "Teleport Zen", "Scratch Butt", "T-Pose" };
 	static const char* const SILLY[WHEEL_SLOTS] = { "Bug Buzz", "Dizzy Walk", "Poison Gas Walk", "Death", "Death 2", "Breakdance Finish", 0, 0 };
@@ -2725,7 +2706,7 @@ void SaveEmoteWheels( const char* ini )
 	}
 }
 
-static const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (his own go up to 253), taking turns.
+const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (his own go up to 253), taking turns.
 
 GET_METHOD( 0x61E4F0, void, EAnimController_SetTicked, EAnimController*, void*, bool );
 static const float EMOTE_MOVE = 0.5F;               // Harry got moved this far from where he started : over.
@@ -3020,21 +3001,21 @@ static void EmoteTick( EIHarry* harry )
 // highlighted emote again and again.
 // --------------------------------------------------------------------------------
 static int g_editWheel = 0;       // The wheel the page shows.
-static int g_ringSlot = 0;        // Its slot the ring points at.
-static bool g_chooser = false;    // Choosing an emote for that slot.
-static char g_emoteSearch[32] = "";
-static int g_emoteCategory = 0;   // 0 : favourites, 1 : all, then EMOTE_CATEGORIES.
-static int g_listCursor = 0, g_listScroll = 0;
+int g_ringSlot = 0;        // Its slot the ring points at.
+bool g_chooser = false;    // Choosing an emote for that slot.
+char g_emoteSearch[32] = "";
+int g_emoteCategory = 0;   // 0 : favourites, 1 : all, then EMOTE_CATEGORIES.
+int g_listCursor = 0, g_listScroll = 0;
 static int g_listWant = -2;       // EMOTES index to put the list's cursor on (-1 : "Empty slot"; -2 : none).
 static int g_armed = 0;           // Pressed once, to be pressed again : 1 reset, 2 delete.
 static DWORD g_armedAt = 0;
-static int g_previewWant = -2;    // The chooser, each frame : EMOTES index, -1 : none (idle), -2 : no preview.
+int g_previewWant = -2;    // The chooser, each frame : EMOTES index, -1 : none (idle), -2 : no preview.
 static bool g_previewFailed = false;
 static int g_previewShown = -3;
 static int g_previewStage = 0;    // A chain : 0 its intro, 1 - 2 its loop, 3 - 4 its ending.
 static bool g_previewArmed = false;   // The clip seen under way (not at its end from last time).
 static const uint32_t IDLE_CLIP = 0xB23CB6D0;
-static void SetMenuOpen( bool open );
+void SetMenuOpen( bool open );
 static void SaveSettings();
 
 static void SetPreviewClip( uint32_t animCRC )
@@ -3222,7 +3203,7 @@ static void WriteBmp( const char* name, int w, int h, const void* bits )
 }
 
 // Foreground : grabs the game window's client area from the screen.
-static void GrabScreen( const char* name )
+void GrabScreen( const char* name )
 {
 	HWND wnd = *HWND_GAME_WINDOW;
 	RECT rc;
@@ -3260,9 +3241,9 @@ static void GrabScreen( const char* name )
 static const int VTABLE_SLOT_PRESENT = 17;   // IDirect3DDevice9::Present.
 typedef HRESULT (__stdcall *PresentFunc)( IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA* );
 static PresentFunc g_origPresent = 0;
-static volatile LONG g_grabRequested = 0;
-static char g_grabName[64];
-static HANDLE g_grabDone = 0;
+volatile LONG g_grabRequested = 0;
+char g_grabName[64];
+HANDLE g_grabDone = 0;
 
 static void GrabBackBuffer( IDirect3DDevice9* dev, const char* name, const RECT* crop )
 {
@@ -3368,7 +3349,7 @@ static SetTextureFunc g_origSetTexture = 0;
 static DrawPrimFunc g_origDrawPrim = 0;
 static IDirect3DBaseTexture9* g_stage0 = 0;   // The texture the game has set.
 static bool g_stage0Retro = false;            // It's the Retro palette.
-static int g_retroSwaps = 0;                  // Pieces drawn with a player's palette (for the autotest).
+int g_retroSwaps = 0;                  // Pieces drawn with a player's palette (for the autotest).
 
 // Is this texture the game's Retro palette ? Asked for each texture set, so the
 // answer is remembered : the palette itself, and the few other textures of its size
@@ -3455,7 +3436,7 @@ static IDirect3DTexture9* RetroTexture( IDirect3DDevice9* dev, int slot, const u
 // a character's 15 pieces are drawn in a row.
 static int g_retroOwner = -1;   // The slot of g_retroTex (-1 : nobody yet since the palette was set).
 static const uint8_t (*g_retroOwnerColors)[3] = 0;
-static int g_retroMatched = 0, g_retroUnmatched = 0;   // For the autotest.
+int g_retroMatched = 0, g_retroUnmatched = 0;   // For the autotest.
 
 static bool HasBoneAt( EICharacter* c, const float bone[3][4] )
 {
@@ -3523,7 +3504,7 @@ static HRESULT __stdcall DrawPrim_Hook( IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
 	return hr;
 }
 
-static bool HookPresent()
+bool HookPresent()
 {
 	if ( g_origPresent ) return true;
 	IDirect3DDevice9* dev = *(IDirect3DDevice9**) RENDERER_DEVICE;
@@ -3584,7 +3565,7 @@ static void CustomGameInput_Gamepad( DIJOYSTATE2* pad );
 
 
 // DirectInput key code of a virtual key (the arrows are "extended" keys).
-static uint8_t KeyToDIK( WORD vk )
+uint8_t KeyToDIK( WORD vk )
 {
 	switch ( vk ) {
 	case VK_UP:    return 0xC8;
@@ -3599,7 +3580,8 @@ static uint8_t KeyToDIK( WORD vk )
 static const auto POLL_KEYBOARD_ORIGINAL = (void (*)()) 0x6E8A80;
 static void PollKeyboard_Hook()
 {
-	POLL_KEYBOARD_ORIGINAL();
+	if ( !TestPollKeyboard(POLL_KEYBOARD_ORIGINAL, g_directInputKeysCurrent, g_directInputKeysLast) )
+		POLL_KEYBOARD_ORIGINAL();
 
 	if ( g_inputBlocked ) {
 		memset( g_directInputKeysCurrent, 0, DIRECTINPUT_NUM_KEYS );
@@ -3607,12 +3589,14 @@ static void PollKeyboard_Hook()
 	else {
 		CustomGameInput_Keyboard( g_directInputKeysCurrent );
 	}
+
+	TestSawKeys( g_directInputKeysCurrent );
 }
 
 static const auto POLL_GAMEPAD_ORIGINAL = (DIJOYSTATE2* (__cdecl*)(int)) 0x6E8660;
 static DIJOYSTATE2* __cdecl PollGamepad_Hook( int index )
 {
-	DIJOYSTATE2* state = POLL_GAMEPAD_ORIGINAL( index );
+	DIJOYSTATE2* state = TestPollGamepad( index, POLL_GAMEPAD_ORIGINAL(index) );
 	if ( !state ) return 0;
 
 	memcpy( &g_gamepadSeen, state, sizeof(DIJOYSTATE2) );
@@ -3623,6 +3607,7 @@ static DIJOYSTATE2* __cdecl PollGamepad_Hook( int index )
 	}
 	else {
 		CustomGameInput_Gamepad( &g_gamepadSeen );
+		TestSawGamepad( state );
 		return state;
 	}
 }
@@ -3652,13 +3637,13 @@ static void InstallInputHooks()
 // arrows, Tab, 1-8). While Harry emotes, any other button or key, or the left stick,
 // ends it (a chain plays its ending first).
 // --------------------------------------------------------------------------------
-static const int PAD_R1 = 5;
+const int PAD_R1 = 5;
 static const int DIK_ARROWS[4] = { 0xC8, 0xD0, 0xCB, 0xCD };   // DirectInput key codes : up, down, left, right.
 
 // The game's controls (its options, kept in the registry) : 20 per controller (0x941020,
 // 0x2C apart; a button is its number + 11) and for the keyboard (0x940FC0, DIK codes).
 // 4 - 7 : the right stick (reaching), 14 - 15 : turning the camera.
-static const uint32_t PAD_BINDINGS = 0x941020, KEY_BINDINGS = 0x940FC0;
+const uint32_t PAD_BINDINGS = 0x941020, KEY_BINDINGS = 0x940FC0;
 static bool IsCameraButton( int b )
 {
 	const int* bind = (const int*) PAD_BINDINGS;
@@ -3668,20 +3653,7 @@ static bool IsCameraButton( int b )
 static const uint32_t WHEEL_SHOW_MS = 150;   // Held this long (or pointed) : the wheel shows (a tap of L1 doesn't).
 static const uint32_t WHEEL_KEEP_MS = 300;   // The stick back in the middle : the choice stays this long.
 
-struct WheelUi
-{
-	bool open;
-	bool byPad;          // Else the keyboard's.
-	bool shown;          // Pointed at, or flipped : showing whatever the time.
-	bool done;           // Played (1-8, a click) or given up : nothing more until it's let go.
-	uint32_t since;
-	int hover;           // Slot pointed at, -1 : none.
-	uint32_t hoverAt;
-	LONG centre[8];      // The controller's axes when it opened (lX lY lZ lRx lRy lRz, the sliders).
-	POINT mouse;         // Where the cursor's way is measured from.
-	bool r1Was, clickWas;
-};
-static WheelUi g_wheelUi;
+WheelUi g_wheelUi;
 
 bool EmoteWheelShown()
 {
@@ -3857,7 +3829,7 @@ static void Emote_Keyboard( uint8_t* keys )
 				if ( (raw[0x02 + i] & 0x80) && !(before[0x02 + i] & 0x80) ) { WheelPoint( i ); WheelPlay( i, "number key" ); }
 			// The mouse : which way it went (the start follows it, so turning back is quick).
 			POINT p;
-			if ( !g_wheelUi.done && GameHasFocus() && GetCursorPos(&p) ) {
+			if ( !g_wheelUi.done && !TestInBackground() && GameHasFocus() && GetCursorPos(&p) ) {
 				float dx = (float) (p.x - g_wheelUi.mouse.x), dy = (float) (p.y - g_wheelUi.mouse.y);
 				float d = sqrtf( dx * dx + dy * dy );
 				if ( d > 30.0F ) WheelPoint( WedgeAt( dx, dy ) );
@@ -3955,14 +3927,13 @@ static void CustomGameInput_Gamepad( DIJOYSTATE2* pad )
 
 
 
-static int g_itemFailures = 0;
-static int g_animClipCount = 0;
-
-static void ApplyMyOutfit();
+void ApplyMyOutfit();
 
 
 static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 {
+	TestBeforeHarryTick();
+
 	EIHarry_Tick( self );
 
 	HookGameWindowProc();
@@ -3970,7 +3941,8 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 	g_harryTickAt = GetTickCount();
 	if ( InterlockedIncrement(&g_harryTicks) == 1 ) {
 		mp_log( "[MP] Harry tick hook is running (this 0x%.8X, global Harry 0x%.8X).\n", self, Gizmod::getHarry() );
-		Toast( "F1 : multiplayer menu" );
+		if ( !g_autotest )
+			Toast( "F1 : multiplayer menu" );
 	}
 
 	// TODO: this is useless at the moment. Though we might spawn actual Harrys in the future.
@@ -4006,6 +3978,7 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 		for ( int i = 0; i < MAX_PEERS; i++ ) {
 			Peer* p = &g_peers[i];
 			if ( p->beast || !p->target || now - p->lastSpawnTry < 1000 ) continue;
+			if ( TestSpawnsPuppet(p) ) continue;
 
 			p->lastSpawnTry = now;
 			mp_log( "[NET] Player %d is in this level : spawning their puppet.\n", i );
@@ -4014,6 +3987,7 @@ static void __stdcall _EIHarry_Tick_Hook( EIHarry* self )
 		}
 	}
 
+	TestAfterHarryTick( self );
 	HandleHotkeys( self );
 }
 MAKE_THISCALL_WRAPPER( EIHarry_Tick_Hook, _EIHarry_Tick_Hook );
@@ -4024,9 +3998,12 @@ static void ApplyPuppetOutfit( EIEvilHarryP* p, Peer* peer )
 {
 	int me = g_transport ? g_transport->PlayerId() : -1;
 	bool ours = peer->id == me || !g_networked;   // It replays us (echo, the loopback).
-	if ( !ours && !g_players[peer->id].present ) return;   // They left : as it is.
+	int testOutfit = TestPuppetOutfit();
+	if ( !ours && !g_players[peer->id].present && testOutfit < 0 ) return;   // They left : as it is.
 
 	int outfit = ours ? g_myWornOutfit : g_players[peer->id].outfit;
+	if ( testOutfit >= 0 )
+		outfit = testOutfit;
 	if ( outfit == peer->shownOutfit ) return;
 
 	uint32_t model = OUTFITS[outfit].model;
@@ -4118,6 +4095,8 @@ static bool HandleOrphan( EIEvilHarryP* self )
 
 static void __stdcall _EIEvilHarryP_Tick_Hook( EIEvilHarryP* self )
 {
+	if ( TestStallsPuppet(self) ) return;
+
 	HookThrownFromWater( self );
 	Peer* peer = FindPeerFromBeast( self );
 	if ( !peer ) peer = ReclaimPuppet( self );
@@ -4129,6 +4108,11 @@ static void __stdcall _EIEvilHarryP_Tick_Hook( EIEvilHarryP* self )
 	}
 	peer->lastTick = GetTickCount();
 	peer->ticks++;
+
+	if ( TestSkipsPuppetAI() ) {
+		DrivePuppet( self, peer );
+		return;
+	}
 
 	// When Harry dies and comes back the game removes the level's loose models, the
 	// puppet's pickaxes among them, and Evil Harry's tick crashes without them
@@ -4354,7 +4338,7 @@ static bool IsKnownGameVersion()
 
 // Our outfit : the game's cheat flag for it (and none of the others). Harry changes
 // when the next level loads.
-static void ApplyMyOutfit()
+void ApplyMyOutfit()
 {
 	for ( int i = 1; i < NUM_OUTFITS; i++ )
 		if ( OUTFITS[i].cheatFlag )
@@ -4384,7 +4368,7 @@ static __declspec(naked) void HarryModel_Hook()
 // The menu's settings, kept in the ini (not the autotests' : they leave it alone).
 static void SaveSettings()
 {
-	if ( !g_iniPath[0] ) return;
+	if ( g_autotest || !g_iniPath[0] ) return;   // (The tests leave the player's settings alone.)
 
 	WritePrivateProfileStringA( "Appearance", "Outfit", g_myOutfit < 0 ? "Default" : OUTFITS[g_myOutfit].name, g_iniPath );
 	WritePrivateProfileStringA( "Gamemodes", "Mode", MODE_NAMES[g_gameMode], g_iniPath );
@@ -4423,7 +4407,7 @@ static void SaveSettings()
 static const int MAX_LIST_ROWS = MAX_PEERS + 3;
 // Hide and seek : a hider's name tag and whereabouts are hidden from everyone else
 // (other hiders too : they'd know where to look once they're seekers).
-static bool HiddenFromMe( int id )
+bool HiddenFromMe( int id )
 {
 	int me = g_transport ? g_transport->PlayerId() : -1;
 	return id != me && g_players[id].role == ROLE_HIDER;
@@ -4493,7 +4477,7 @@ static void SetGameMode( int mode )
 }
 
 // A Windows key's DirectInput code (its scan code, + 0x80 for the extended ones).
-static int VkToDik( int vk )
+int VkToDik( int vk )
 {
 	switch ( vk ) {
 	case VK_UP: return 0xC8; case VK_DOWN: return 0xD0; case VK_LEFT: return 0xCB; case VK_RIGHT: return 0xCD;
@@ -4504,7 +4488,7 @@ static int VkToDik( int vk )
 	return (int) MapVirtualKeyA( vk, MAPVK_VK_TO_VSC ) & 0x7F;
 }
 
-static const char* KeyName( int dik )
+const char* KeyName( int dik )
 {
 	static char name[4][40];
 	static int next = 0;
@@ -4578,7 +4562,7 @@ static void PollBinding()
 // The menu (F1).
 // --------------------------------------------------------------------------------
 
-static Menu g_menu;
+Menu g_menu;
 
 static const char MENU_OUTFIT_DESC[] =
 	"What you look like, to you and to the others. Changes the next time you go to another area. "
@@ -4734,7 +4718,7 @@ static void DrawMenu( float sw, float sh, float h )
 
 	// The mouse, in the overlay's pixels (the window may be scaled).
 	bool cursorShown = true;
-	{
+	if ( !TestMenuInput(&in, pasted, sizeof(pasted)) ) {
 		HWND wnd = *HWND_GAME_WINDOW;
 		POINT p;
 		RECT rc;
@@ -4973,7 +4957,7 @@ static void SyncMenuOpen()
 	mp_log( "[MP] Menu %s.\n", open ? "opened" : "closed" );
 }
 
-static void SetMenuOpen( bool open )
+void SetMenuOpen( bool open )
 {
 	if ( open == g_menu.IsOpen() ) return;
 	if ( open ) {
@@ -5077,7 +5061,7 @@ static void DrawWheel( float sw, float sh, float h )
 // after the last draw, placed again each frame. False : not shown.
 static const uint32_t TAG_GRACE_FRAMES = 12;
 
-static bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, float* y, float* depth )
+bool PlaceNameTag( const Peer& peer, IDirect3DDevice9* dev, float* x, float* y, float* depth )
 {
 	EIEvilHarryP* p = peer.beast;
 	if ( !p || !peer.tagFrame || g_presentCount - peer.tagFrame > TAG_GRACE_FRAMES || g_levelLeaving ) return false;
@@ -5125,6 +5109,8 @@ static uint32_t WithAlpha( uint32_t color, float alpha )
 
 static void DrawOverlay( IDirect3DDevice9* dev )
 {
+	if ( TestAnimSurveyOn() ) return;   // Clean frames.
+
 	uint32_t now = NetNowMs();
 	if ( InterlockedExchange(&g_reqMenu, 0) ) SetMenuOpen( !g_menu.IsOpen() );
 	bool any = g_showList || g_animViewer || g_menu.IsOpen() || PlayingHs() || EmoteWheelShown();
@@ -5250,10 +5236,9 @@ static void DrawOverlay( IDirect3DDevice9* dev )
 // Leaving the room when the game closes, so the others drop our puppet at once
 // instead of after a timeout. The game ends through kernel32's ExitProcess (from
 // its own import table, patched below), and so does the autotest (QuitGame).
-typedef VOID (WINAPI *ExitProcessFunc)( UINT );
-static ExitProcessFunc g_origExitProcess = ExitProcess;
+ExitProcessFunc g_origExitProcess = ExitProcess;
 
-static void LeaveRoom()
+void LeaveRoom()
 {
 	if ( g_transport ) g_transport->Leave();
 }
@@ -5376,6 +5361,8 @@ public:
 		else mp_log( "[MP] Harry's model isn't stored where we expect : no Snowy Harry outfit for us.\n" );
 
 		InstallInputHooks();
+
+		EnableTests();
 
 		mp_log( "[MP] Hooked ticks. F1 menu, F7 delay.\n" );
 	}

@@ -44,5 +44,6 @@ void HsExit();
 
 void FormatHideTime( uint32_t ms, char* out, size_t size );
 
+void HideTimePath( char* path );   // MAX_PATH.
 void LoadHideTime();
 void SaveHideTime();
