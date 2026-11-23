@@ -80,6 +80,14 @@
   <ItemGroup>
     <ClCompile Include="gamemodes\HideAndSeek\HideAndSeek.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="AnimViewer.cpp" />
+    <ClCompile Include="Emotes.cpp" />
+    <ClCompile Include="Input.cpp" />
+    <ClCompile Include="MenuPages.cpp" />
+    <ClCompile Include="Network.cpp" />
+    <ClCompile Include="Outfits.cpp" />
+    <ClCompile Include="Puppets.cpp" />
+    <ClCompile Include="Render.cpp" />
     <ClCompile Include="overlay.cpp" />
     <ClCompile Include="menu.cpp" />
     <ClCompile Include="net\affine.cpp" />
@@ -96,6 +104,13 @@
     <ClInclude Include="gamemodes\HideAndSeek\HideAndSeek.h" />
     <ClInclude Include="tests.h" />
     <ClInclude Include="Multiplayer.h" />
+    <ClInclude Include="AnimViewer.h" />
+    <ClInclude Include="Input.h" />
+    <ClInclude Include="MenuPages.h" />
+    <ClInclude Include="Network.h" />
+    <ClInclude Include="Outfits.h" />
+    <ClInclude Include="Puppets.h" />
+    <ClInclude Include="Render.h" />
     <ClInclude Include="net\affine.h" />
     <ClInclude Include="overlay.h" />
     <ClInclude Include="menu.h" />

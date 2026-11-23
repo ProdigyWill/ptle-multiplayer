@@ -206,3 +206,12 @@ void SaveHideTime()
 	if ( MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING) )
 		g_hideSavedMs = g_hsMyHideMs;
 }
+
+
+// Hide and seek : a hider's name tag and whereabouts are hidden from everyone else
+// (other hiders too : they'd know where to look once they're seekers).
+bool HiddenFromMe( int id )
+{
+	int me = g_transport ? g_transport->PlayerId() : -1;
+	return id != me && g_players[id].role == ROLE_HIDER;
+}

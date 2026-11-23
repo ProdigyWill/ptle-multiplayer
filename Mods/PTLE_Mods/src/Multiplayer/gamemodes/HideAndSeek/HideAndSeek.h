@@ -29,6 +29,7 @@ extern struct HsCaughtOut { int seeker; uint32_t number; int left; uint32_t last
 // Definitions.
 
 bool PlayingHs();   // The game mode is hide and seek.
+bool HiddenFromMe( int id );   // A hider's name tag and whereabouts are hidden from everyone else.
 
 
 void HsSetRole( int role );

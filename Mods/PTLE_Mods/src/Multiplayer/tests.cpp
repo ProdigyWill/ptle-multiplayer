@@ -15,6 +15,13 @@
 #include <string.h>
 
 #include "Multiplayer.h"
+#include "Network.h"
+#include "Puppets.h"
+#include "Render.h"
+#include "Outfits.h"
+#include "Input.h"
+#include "MenuPages.h"
+#include "AnimViewer.h"
 #include "tests.h"
 
 #include "menu.h"
