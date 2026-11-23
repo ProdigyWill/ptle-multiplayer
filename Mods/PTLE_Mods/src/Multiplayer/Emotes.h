@@ -1,6 +1,9 @@
 #pragma once
 
 
+struct DIJOYSTATE2;
+
+
 static const int MAX_WHEELS = 4, WHEEL_SLOTS = 8, WHEEL_NAME_SIZE = 24;
 
 struct EmoteDef
@@ -51,7 +54,56 @@ void LoadEmoteWheels( const char* ini );
 void SaveEmoteWheels( const char* ini );
 
 bool EmoteWheelShown();
-void EmoteWheelOpen( const uint8_t* pad );
+void EmoteWheelOpen( const DIJOYSTATE2* pad );
 
 void RequestPlayEmote( int id );
 
+
+// Emotes.cpp's.
+
+extern int g_wheelCount;
+extern int g_emoteButton;   // DirectInput button held for the wheel : L1 / LB.
+extern bool g_emoteNeedsR1;   // ... with R1 / RB too.
+extern int g_emoteKey;   // DirectInput key code : T.
+extern int g_wheelIndex;   // The wheel up in the game (kept between openings).
+
+void MakeDefaultWheel( int w );
+
+static const int EMOTE_LAYERS[2] = { 254, 255 };   // Spare layers of Harry's (his own go up to 253), taking turns.
+
+void EmoteTick( EIHarry* harry );
+
+static const int PAD_R1 = 5;
+static const int DIK_ARROWS[4] = { 0xC8, 0xD0, 0xCB, 0xCD };   // DirectInput key codes : up, down, left, right.
+
+// The game's controls (its options, kept in the registry) : 20 per controller (0x941020,
+// 0x2C apart; a button is its number + 11) and for the keyboard (0x940FC0, DIK codes).
+// 4 - 7 : the right stick (reaching), 14 - 15 : turning the camera.
+static const uint32_t PAD_BINDINGS = 0x941020, KEY_BINDINGS = 0x940FC0;
+
+struct WheelUi
+{
+	bool open;
+	bool byPad;          // Else the keyboard's.
+	bool shown;          // Pointed at, or flipped : showing whatever the time.
+	bool done;           // Played (1-8, a click) or given up : nothing more until it's let go.
+	uint32_t since;
+	int hover;           // Slot pointed at, -1 : none.
+	uint32_t hoverAt;
+	LONG centre[8];      // The controller's axes when it opened (lX lY lZ lRx lRy lRz, the sliders).
+	POINT mouse;         // Where the cursor's way is measured from.
+	bool r1Was, clickWas;
+};
+
+extern WheelUi g_wheelUi;
+
+void Emote_Gamepad( DIJOYSTATE2* state );
+void Emote_Keyboard( uint8_t* keys );
+void DrawWheel( float sw, float sh, float h );
+
+
+#ifdef PTLE_MP_EMBEDTESTS   // For the tests (tests.cpp).
+
+int FindEmoteByName( const char* name );
+
+#endif

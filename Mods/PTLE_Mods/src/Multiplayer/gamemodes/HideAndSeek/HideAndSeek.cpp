@@ -1,6 +1,7 @@
 #include "HideAndSeek.h"
 
 #include "Multiplayer.h"
+#include "tests.h"
 
 #include "net/transport.h"
 
@@ -19,6 +20,13 @@ int      g_hsMyRole = ROLE_SEEKER;      // Everyone starts as a seeker.
 uint32_t g_hsMyHideMs = 0;              // Total hide time.
 
 HsCaughtOut g_caughtOut = { -1, 0, 0, 0 };
+
+
+bool PlayingHs()
+{
+	return g_gameMode == MODE_HIDE_AND_SEEK;
+}
+
 static uint32_t g_catchNumber = 0;             // Ours (a random start : another session's don't look the same).
 static uint32_t g_lastCatchHeard[MAX_PEERS];   // Each hider's last catch number heard.
 
@@ -30,11 +38,11 @@ static uint32_t g_lastCatchHeard[MAX_PEERS];   // Each hider's last catch number
 // Names : printable ASCII only (the font has nothing else), never empty.
 // The hide time's file : %LOCALAPPDATA%\PTLE Multiplayer\hide-time.txt, the total in
 // milliseconds (the autotests keep theirs in hide-time-autotest.txt).
-static void HideTimePath( char* path )   // MAX_PATH.
+void HideTimePath( char* path )
 {
 	path[0] = 0;
 	if ( GetDataDir(path) )
-		strcat_s( path, MAX_PATH, "\\hide-time.txt" );
+		strcat_s( path, MAX_PATH, g_autotest ? "\\hide-time-autotest.txt" : "\\hide-time.txt" );
 }
 
 static bool g_hideTimeLoaded = false;
@@ -73,6 +81,7 @@ void HsReceiveCaught( int player, int seeker, int seq, int me )
 
 	g_lastCatchHeard[player] = seq;
 	g_players[player].role = ROLE_SEEKER;   // (Their next info says so too.)
+	TestHsHeardCatch( player, seeker );
 
 	const char* playerName = PlayerName( player );
 	const char* seekerName = PlayerName( seeker );
@@ -142,6 +151,7 @@ void HsUpdate( EIHarry* harry )
 {
 	HideTick();
 	CheckCaught( harry );
+	TestHsTick( harry );
 }
 
 void HsEnter()
@@ -195,4 +205,13 @@ void SaveHideTime()
 	fclose( f );
 	if ( MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING) )
 		g_hideSavedMs = g_hsMyHideMs;
+}
+
+
+// Hide and seek : a hider's name tag and whereabouts are hidden from everyone else
+// (other hiders too : they'd know where to look once they're seekers).
+bool HiddenFromMe( int id )
+{
+	int me = g_transport ? g_transport->PlayerId() : -1;
+	return id != me && g_players[id].role == ROLE_HIDER;
 }

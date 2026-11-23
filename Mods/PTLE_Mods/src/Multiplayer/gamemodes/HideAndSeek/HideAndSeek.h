@@ -28,7 +28,8 @@ extern struct HsCaughtOut { int seeker; uint32_t number; int left; uint32_t last
 
 // Definitions.
 
-static inline bool PlayingHs() { return g_hsMyRole != ROLE_NONE; }
+bool PlayingHs();   // The game mode is hide and seek.
+bool HiddenFromMe( int id );   // A hider's name tag and whereabouts are hidden from everyone else.
 
 
 void HsSetRole( int role );
@@ -44,5 +45,6 @@ void HsExit();
 
 void FormatHideTime( uint32_t ms, char* out, size_t size );
 
+void HideTimePath( char* path );   // MAX_PATH.
 void LoadHideTime();
 void SaveHideTime();

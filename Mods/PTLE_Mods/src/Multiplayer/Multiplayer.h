@@ -7,19 +7,26 @@
 
 
 #ifdef _DEBUG
-#	define PTLE_MP_EMBEDTESTS
-#else
-#	define g_autotest
+#	define PTLE_MP_EMBEDTESTS   // The autotests (tests.h).
 #endif
 
 
+class EAnimController;
+class EIBeast;
+class EICharacter;
 class EIEvilHarryP;
+class EIHarry;
+class EItemBase;
+class ERLevel;
+class Matrix4f;
+class Menu;
+
+struct AnimLayer;
+struct IDirect3DDevice9;
+struct ItemStruct;
 
 struct PlayerSnapshot;
 class Transport;
-
-
-enum { RETRO_HAIR, RETRO_SKIN, RETRO_SHIRT, RETRO_TROUSERS, RETRO_PARTS };
 
 
 extern Transport* g_transport;
@@ -78,6 +85,8 @@ static inline bool PeerInLimbo( const Peer* p ) { return p->limboTicks >= 0; }
 
 // Player info.
 
+#include "Outfits.h"
+
 struct PlayerInfo
 {
 	bool present;
@@ -115,3 +124,30 @@ void Toast( const char* fmt, ... );
 void SpawnPuppet( Peer* peer );
 
 bool GameHasFocus();
+
+
+// main.cpp's.
+
+static const uint32_t VTABLE_SLOT_TICK   = 0x2C;     // EInstance::Tick().
+static const uint32_t VTABLE_SLOT_RENDER = 0x34;     // EInstance::Render( context, arg ).
+extern char g_logDir[MAX_PATH];
+
+// Game modes (F1 -> Gamemodes; Multiplayer.ini, [Gamemodes] Mode). Off : just
+// see each other.
+enum { MODE_OFF, MODE_HIDE_AND_SEEK, NUM_MODES };
+
+static const char* const MODE_NAMES[NUM_MODES] = { "Off", "Hide and seek" };
+extern int g_gameMode;
+
+void SaveSettings();
+
+typedef VOID (WINAPI *ExitProcessFunc)( UINT );
+
+
+#ifdef PTLE_MP_EMBEDTESTS   // For the tests (tests.cpp).
+
+extern ExitProcessFunc g_origExitProcess;
+
+void LeaveRoom();
+
+#endif
