@@ -130,27 +130,37 @@ static IDirect3DTexture9* RetroTexture( IDirect3DDevice9* dev, int slot, const u
 
 // Whose piece is about to be drawn : the palette of the Retro character it belongs
 // to (0 : the game's own, they kept its colours). The piece's first bone (constants
-// c44..c46) is one of its character's bone matrices as they are right now, so the
-// character is the one whose pose has that very matrix : no guessing from where
-// players stand, which mixed their colours up when they stood close together. A
-// piece whose bone isn't found (not seen so far) goes to the previous piece's owner :
-// a character's 15 pieces are drawn in a row.
+// c44..c46) is one of its character's bone matrices, so the character is the one
+// whose pose has that matrix : no guessing from where players stand, which mixed
+// their colours up when they stood close together. Usually the pose has that very
+// matrix; but on some long frames (a hitch) the pose has already moved on a little
+// from what is drawn, so the character whose bones are nearest wins, if one is near
+// enough. Without that, Harry was drawn in the game's colours for that frame : he
+// flashed when the game stuttered. A piece whose bone still isn't found goes to the
+// previous piece's owner : a character's 15 pieces are drawn in a row.
 static int g_retroOwner = -1;   // The slot of g_retroTex (-1 : nobody yet since the palette was set).
 static const uint8_t (*g_retroOwnerColors)[3] = 0;
 int g_retroMatched = 0, g_retroUnmatched = 0;          // For the autotest.
 
-static bool HasBoneAt( EICharacter* c, const float bone[3][4] )
-{
-	const float E = 0.01F;
+static const float BONE_SAME = 0.01F;   // A bone this close is the one drawn.
+static const float BONE_NEAR = 0.5F;    // The pose may have moved this far from what is drawn (seen up to 0.25, on a hitch).
 
+// How far the nearest of this character's bones is from the drawn one (the largest
+// of the x, y, z differences).
+static float BoneDistance( EICharacter* c, const float bone[3][4] )
+{
+	float nearest = 1e30F;
 	int bones = 0;
 	const Matrix4f* pose = GetPose( &c->m_animController, &bones );
-	if ( !pose || bones <= 0 || bones > MAX_CHAR_BONES ) return false;
+	if ( !pose || bones <= 0 || bones > MAX_CHAR_BONES ) return nearest;
 	for ( int i = 0; i < bones; i++ ) {
 		const float* t = pose[i].data[3];
-		if ( fabsf(t[0] - bone[0][3]) < E && fabsf(t[1] - bone[1][3]) < E && fabsf(t[2] - bone[2][3]) < E ) return true;
+		float d = fabsf(t[0] - bone[0][3]);
+		if ( fabsf(t[1] - bone[1][3]) > d ) d = fabsf(t[1] - bone[1][3]);
+		if ( fabsf(t[2] - bone[2][3]) > d ) d = fabsf(t[2] - bone[2][3]);
+		if ( d < nearest ) nearest = d;
 	}
-	return false;
+	return nearest;
 }
 
 static IDirect3DTexture9* RetroTextureHere( IDirect3DDevice9* dev )
@@ -159,6 +169,9 @@ static IDirect3DTexture9* RetroTextureHere( IDirect3DDevice9* dev )
 	if ( FAILED( dev->GetVertexShaderConstantF( 44, &bone[0][0], 3 ) ) ) return 0;
 	int me = g_transport ? g_transport->PlayerId() : -1;
 	bool found = false;
+	float nearest = BONE_NEAR;   // The nearest character so far, if no bone is the same.
+	int nearestOwner = -1;
+	const uint8_t (*nearestColors)[3] = 0;
 	for ( int i = -1; i < MAX_PEERS && !found; i++ ) {   // -1 : our own Harry.
 		EICharacter* who;
 		const uint8_t (*c)[3];
@@ -174,9 +187,21 @@ static IDirect3DTexture9* RetroTextureHere( IDirect3DDevice9* dev )
 			who = p.beast;
 			c = (i == me || !g_networked || !g_players[i].present) ? g_myColors : g_players[i].colors;
 		}
-		if ( !HasBoneAt( who, bone ) ) continue;
-		g_retroOwner = i < 0 ? MAX_PEERS : i;
-		g_retroOwnerColors = c;
+		float d = BoneDistance( who, bone );
+		if ( d < BONE_SAME ) {
+			g_retroOwner = i < 0 ? MAX_PEERS : i;
+			g_retroOwnerColors = c;
+			found = true;
+		}
+		else if ( d < nearest ) {
+			nearest = d;
+			nearestOwner = i < 0 ? MAX_PEERS : i;
+			nearestColors = c;
+		}
+	}
+	if ( !found && nearestOwner >= 0 ) {
+		g_retroOwner = nearestOwner;
+		g_retroOwnerColors = nearestColors;
 		found = true;
 	}
 	if ( found ) g_retroMatched++; else g_retroUnmatched++;
