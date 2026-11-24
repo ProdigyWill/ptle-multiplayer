@@ -5,6 +5,11 @@ title; players with another version are marked on its Players page.
 
 ## Unreleased (0.4.0)
 
+### Fixed
+
+- Retro Harry no longer flashes back to his normal colours for a moment when
+  the game stutters.
+
 ## 0.3.0 (2026-11-22)
 
 ### New

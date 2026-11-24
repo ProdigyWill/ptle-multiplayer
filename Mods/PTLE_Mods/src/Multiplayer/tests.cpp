@@ -1539,6 +1539,17 @@ static void AutotestStep( EIHarry* harry )
 			g_retroSwaps = g_retroMatched = g_retroUnmatched = 0;
 			step++; phaseStart = now;
 		}
+		else if ( step == 104 ) {
+			if ( t < 2500 ) break;
+			bool ok = g_retroSwaps > 100 && g_retroUnmatched * 50 < g_retroMatched;
+			mp_log( "[AT] Outfit : walking, still in our colours (%d pieces drawn with them; owner found for %d, not for %d) : %s\n",
+				g_retroSwaps, g_retroMatched, g_retroUnmatched, ok ? "ok" : "WRONG" );
+			if ( !ok ) failures++;
+			g_myOutfit = SNOWY_OUTFIT;   // Then Snowy Harry, in a level that isn't snowy.
+			ApplyMyOutfit();
+			ScheduleWorldLoad( (void*) 0x917028, Gizmod::getCurrentLevelCRC(), false );
+			step = 100; phaseStart = now;
+		}
 		else {
 			if ( t < 3000 ) break;
 			bool ok = b && MainPeer()->shownOutfit == 3 && g_retroSwaps > 100 && g_retroUnmatched * 50 < g_retroMatched;
@@ -1546,10 +1557,9 @@ static void AutotestStep( EIHarry* harry )
 				g_retroSwaps, g_retroMatched, g_retroUnmatched, ok ? "ok" : "WRONG" );
 			if ( !ok ) failures++;
 			RequestSnapshot( "outfit_5_ours" );
-			g_myOutfit = SNOWY_OUTFIT;   // Then Snowy Harry, in a level that isn't snowy.
-			ApplyMyOutfit();
-			ScheduleWorldLoad( (void*) 0x917028, Gizmod::getCurrentLevelCRC(), false );
-			step = 100; phaseStart = now;
+			InterlockedExchange( &g_holdMs, 2500 ); InterlockedExchange( &g_holdKey, 'W' );   // Then the same, walking : Harry's colours flashed back to the game's.
+			g_retroSwaps = g_retroMatched = g_retroUnmatched = 0;
+			step = 104; phaseStart = now;
 		}
 		break;
 	}
